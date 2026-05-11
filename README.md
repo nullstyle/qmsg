@@ -12,7 +12,8 @@ message protocol over QUIC streams and datagrams.
 ## Status
 
 This repository is now a real Zig package skeleton, not only a design folder.
-The public root module exports the core names that workers are filling in:
+The public root module exports the core names that the first implementation
+tranches are building around:
 
 - `Message`, `OutgoingMessage`, `Header`, `Flags`, and `MessageId`;
 - `SubjectFilter` and `SubjectRouter`;
@@ -20,12 +21,14 @@ The public root module exports the core names that workers are filling in:
 - `QueueOptions` and `OnFull` for bounded queues and backpressure policy;
 - `InprocNetwork` and `Endpoint`;
 - `AuthConfig`, `Authorization`, and `SubjectPolicy`;
+- `PasetoAuth` for concrete PASETO/PASERK v4.public verification;
+- `control` for qmsg `HELLO`, `GOAWAY`, `SUBSCRIBE`, `UNSUBSCRIBE`, and
+  `CREDIT` control-frame encoding;
 - `App`, `Context`, and `Session`.
 
-Some implementations are still landing in parallel. The examples contain
-guarded entrypoints for the intended inproc and App facade APIs so integration
-can switch from shape examples to live examples as soon as the socket and app
-workers finish their methods.
+The inproc socket examples build and run against the current public API. The
+App facade can register and dispatch route handlers in memory. Network
+listeners and the QUIC transport adapter are still future work.
 
 ## Package Use
 
@@ -142,9 +145,8 @@ facade route plan and handler shape.
 - Patterns are compile-time selected where practical, e.g. `Socket(.req)`.
 - Blocking/simple loop first, embeddable poll/tick API underneath.
 - Pluggable transports, but QUIC is the reference transport.
-- PASETO/PASERK auth uses `paseto-zig` as the planned dependency; qmsg owns
-  only session policy, key lookup, replay hooks, and subject/pattern
-  authorization.
+- PASETO/PASERK auth targets `paseto-zig` release `0.2.0`; qmsg owns only
+  session policy, key lookup, replay hooks, and subject/pattern authorization.
 
 ## Authentication Surface
 
@@ -159,8 +161,10 @@ const auth = qmsg.AuthConfig{
 ```
 
 `Authorization` is session state exposed to handlers after credentials have
-been validated. The concrete PASETO/PASERK verifier is intentionally outside
-the core until the `paseto-zig` release surface is stable.
+been validated. `qmsg.PasetoAuth` uses
+[`paseto-zig` `0.2.0`](https://github.com/nullstyle/paseto-zig/releases/tag/0.2.0)
+for typed PASERK IDs and bounded fail-closed v4.public token verification,
+while the rest of core keeps auth interfaces transport-independent.
 
 ## Development
 

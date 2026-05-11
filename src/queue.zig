@@ -18,6 +18,17 @@ pub const QueueOptions = struct {
     on_full: OnFull = .block,
 };
 
+pub const QueueStats = struct {
+    enqueued: usize = 0,
+    dropped_newest: usize = 0,
+    dropped_oldest: usize = 0,
+    queue_full: usize = 0,
+    flow_controlled: usize = 0,
+    message_too_large: usize = 0,
+    high_water_messages: usize = 0,
+    high_water_bytes: usize = 0,
+};
+
 pub const Error = error{
     QueueFull,
     FlowControlled,
@@ -53,6 +64,7 @@ pub const Queue = struct {
     head: usize = 0,
     count: usize = 0,
     byte_count: usize = 0,
+    stats_data: QueueStats = .{},
 
     pub fn init(allocator: std.mem.Allocator, options: QueueOptions) std.mem.Allocator.Error!Queue {
         return .{
@@ -83,20 +95,29 @@ pub const Queue = struct {
         const msg_bytes = messageByteSize(msg);
 
         if (msg_bytes > self.options.max_bytes) {
+            self.stats_data.message_too_large += 1;
             return error.MessageTooLarge;
         }
 
         if (self.canFit(msg_bytes)) {
             self.pushBackAssumeCapacity(msg, msg_bytes);
+            self.recordEnqueued();
             return .enqueued;
         }
 
         switch (self.options.on_full) {
-            .block => return error.FlowControlled,
-            .fail => return error.QueueFull,
+            .block => {
+                self.stats_data.flow_controlled += 1;
+                return error.FlowControlled;
+            },
+            .fail => {
+                self.stats_data.queue_full += 1;
+                return error.QueueFull;
+            },
             .drop_newest => {
                 var dropped = msg;
                 deinitOwnedMessage(&dropped);
+                self.stats_data.dropped_newest += 1;
                 return .dropped_newest;
             },
             .drop_oldest => {
@@ -108,10 +129,13 @@ pub const Queue = struct {
                 }
 
                 if (!self.canFit(msg_bytes)) {
+                    self.stats_data.queue_full += 1;
                     return error.QueueFull;
                 }
 
                 self.pushBackAssumeCapacity(msg, msg_bytes);
+                self.stats_data.dropped_oldest += dropped;
+                self.recordEnqueued();
                 return .{ .dropped_oldest = dropped };
             },
         }
@@ -136,6 +160,10 @@ pub const Queue = struct {
 
     pub fn capacityMessages(self: Queue) usize {
         return self.entries.len;
+    }
+
+    pub fn stats(self: Queue) QueueStats {
+        return self.stats_data;
     }
 
     pub fn isEmpty(self: Queue) bool {
@@ -168,6 +196,12 @@ pub const Queue = struct {
         self.count -= 1;
         if (self.count == 0) self.head = 0;
         return msg;
+    }
+
+    fn recordEnqueued(self: *Queue) void {
+        self.stats_data.enqueued += 1;
+        self.stats_data.high_water_messages = @max(self.stats_data.high_water_messages, self.count);
+        self.stats_data.high_water_bytes = @max(self.stats_data.high_water_bytes, self.byte_count);
     }
 };
 
@@ -267,6 +301,10 @@ test "fail policy reports QueueFull and preserves caller ownership" {
     deinitOwnedMessage(&second);
 
     try std.testing.expectEqual(@as(usize, 1), q.len());
+    try std.testing.expectEqual(@as(usize, 1), q.stats().enqueued);
+    try std.testing.expectEqual(@as(usize, 1), q.stats().queue_full);
+    try std.testing.expectEqual(@as(usize, 1), q.stats().high_water_messages);
+    try std.testing.expectEqual(@as(usize, 2), q.stats().high_water_bytes);
 }
 
 test "block policy reports FlowControlled without blocking" {
@@ -284,6 +322,9 @@ test "block policy reports FlowControlled without blocking" {
     var second = try testMessage(allocator, "b", "2", &.{});
     try std.testing.expectError(error.FlowControlled, q.push(second));
     deinitOwnedMessage(&second);
+
+    try std.testing.expectEqual(@as(usize, 1), q.stats().enqueued);
+    try std.testing.expectEqual(@as(usize, 1), q.stats().flow_controlled);
 }
 
 test "drop_oldest frees old messages and keeps byte accounting exact" {
@@ -306,6 +347,10 @@ test "drop_oldest frees old messages and keeps byte accounting exact" {
     try expectPushResult(.{ .dropped_oldest = 1 }, result);
     try std.testing.expectEqual(@as(usize, 2), q.len());
     try std.testing.expectEqual(@as(usize, 10), q.bytes());
+    try std.testing.expectEqual(@as(usize, 3), q.stats().enqueued);
+    try std.testing.expectEqual(@as(usize, 1), q.stats().dropped_oldest);
+    try std.testing.expectEqual(@as(usize, 2), q.stats().high_water_messages);
+    try std.testing.expectEqual(@as(usize, 10), q.stats().high_water_bytes);
 
     var popped = try q.pop();
     defer deinitOwnedMessage(&popped);
@@ -327,6 +372,8 @@ test "drop_newest consumes incoming message and leaves queue unchanged" {
     const second = try testMessage(allocator, "b", "2", &.{});
     try expectPushResult(.dropped_newest, try q.push(second));
     try std.testing.expectEqual(@as(usize, 1), q.len());
+    try std.testing.expectEqual(@as(usize, 1), q.stats().enqueued);
+    try std.testing.expectEqual(@as(usize, 1), q.stats().dropped_newest);
 
     var popped = try q.pop();
     defer deinitOwnedMessage(&popped);
@@ -345,6 +392,7 @@ test "oversized messages are rejected without taking ownership" {
     var msg = try testMessage(allocator, "s", "body", &.{});
     try std.testing.expectError(error.MessageTooLarge, q.push(msg));
     deinitOwnedMessage(&msg);
+    try std.testing.expectEqual(@as(usize, 1), q.stats().message_too_large);
 }
 
 test "pop on empty queue reports WouldBlock" {
@@ -356,6 +404,63 @@ test "pop on empty queue reports WouldBlock" {
     defer q.deinit();
 
     try std.testing.expectError(error.WouldBlock, q.pop());
+}
+
+test "zero capacity queue deterministically rejects or drops without byte drift" {
+    const allocator = std.testing.allocator;
+
+    var fail_queue = try Queue.init(allocator, .{
+        .max_messages = 0,
+        .max_bytes = 1024,
+        .on_full = .fail,
+    });
+    defer fail_queue.deinit();
+
+    var first = try testMessage(allocator, "a", "1", &.{});
+    try std.testing.expectError(error.QueueFull, fail_queue.push(first));
+    deinitOwnedMessage(&first);
+    try std.testing.expectEqual(@as(usize, 0), fail_queue.len());
+    try std.testing.expectEqual(@as(usize, 0), fail_queue.bytes());
+    try std.testing.expectEqual(@as(usize, 1), fail_queue.stats().queue_full);
+
+    var drop_queue = try Queue.init(allocator, .{
+        .max_messages = 0,
+        .max_bytes = 1024,
+        .on_full = .drop_newest,
+    });
+    defer drop_queue.deinit();
+
+    const second = try testMessage(allocator, "b", "2", &.{});
+    try expectPushResult(.dropped_newest, try drop_queue.push(second));
+    try std.testing.expectEqual(@as(usize, 0), drop_queue.len());
+    try std.testing.expectEqual(@as(usize, 0), drop_queue.bytes());
+    try std.testing.expectEqual(@as(usize, 1), drop_queue.stats().dropped_newest);
+}
+
+test "low byte capacity can accept empty messages and reject non-empty messages" {
+    const allocator = std.testing.allocator;
+    var q = try Queue.init(allocator, .{
+        .max_messages = 2,
+        .max_bytes = 0,
+        .on_full = .fail,
+    });
+    defer q.deinit();
+
+    const empty = try testMessage(allocator, "", "", &.{});
+    try expectPushResult(.enqueued, try q.push(empty));
+    try std.testing.expectEqual(@as(usize, 1), q.len());
+    try std.testing.expectEqual(@as(usize, 0), q.bytes());
+    try std.testing.expectEqual(@as(usize, 1), q.stats().high_water_messages);
+    try std.testing.expectEqual(@as(usize, 0), q.stats().high_water_bytes);
+
+    var non_empty = try testMessage(allocator, "a", "", &.{});
+    try std.testing.expectError(error.MessageTooLarge, q.push(non_empty));
+    deinitOwnedMessage(&non_empty);
+    try std.testing.expectEqual(@as(usize, 1), q.stats().message_too_large);
+
+    var popped = try q.pop();
+    defer deinitOwnedMessage(&popped);
+    try std.testing.expectEqualStrings("", popped.subject);
 }
 
 fn expectPushResult(expected: PushResult, actual: PushResult) !void {

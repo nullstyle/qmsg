@@ -56,9 +56,11 @@ pub const PasetoOptions = struct {
 };
 ```
 
-`qmsg` should depend on `paseto-zig` once a release is available. The design was
-validated against the local `paseto-zig` checkout at commit `7471e2c`, whose
-public module is imported as `paseto` and currently targets Zig `0.16.0+`.
+`qmsg` should use
+[`paseto-zig` release `0.2.0`](https://github.com/nullstyle/paseto-zig/releases/tag/0.2.0)
+for the concrete auth kit. The package is imported as `paseto`; qmsg's core
+auth interfaces stay optional so inproc tests and unauthenticated deployments
+do not need to pay for token verification.
 
 Relevant dependency surface:
 
@@ -189,10 +191,11 @@ Recommended policy:
 - Reject raw `local`, `public`, and `secret` PASERKs in untrusted token
   metadata or `HELLO`.
 - Require PASERK version to match PASETO token version.
-- Represent IDs in qmsg as PASERK ID strings (`[]const u8`), not as a dedicated
-  id object. The current `paseto-zig` API exposes ID generation helpers such as
-  `paseto.v4.Public.pid(allocator)` and `paseto.paserk.id.pid(...)`, but not a
-  first-class `paserk.Id` type.
+- Represent key IDs in concrete paseto integration code as the typed
+  `paseto.paserk.Id` value from `paseto-zig` `0.2.0`. Core qmsg session state
+  may still carry borrowed or owned byte strings for issuer, subject, and token
+  IDs, but key lookup should not downgrade PASERK IDs to arbitrary strings once
+  the paseto dependency is available.
 
 Key lookup should be fail-closed:
 
@@ -347,13 +350,14 @@ and patterns, and deciding replay/session policy.
 
 ### Dependency Wiring
 
-Once `paseto-zig` has a release, add it to qmsg's `build.zig.zon`:
+Use the `paseto-zig` `0.2.0` release when wiring the optional auth-kit
+dependency:
 
 ```zig
 .dependencies = .{
     .paseto = .{
-        .url = "https://github.com/nullstyle/paseto-zig/archive/refs/tags/v0.1.0.tar.gz",
-        .hash = "...",
+        .url = "https://github.com/nullstyle/paseto-zig/archive/refs/tags/0.2.0.tar.gz",
+        .hash = "...", // fill with the hash from `zig fetch`
     },
 },
 ```
@@ -422,9 +426,9 @@ verification fails.
 
 ### Phase B: PASETO v4.public
 
-- Wire `paseto-zig` as dependency.
+- Wire `paseto-zig` `0.2.0` as the optional auth-kit dependency.
 - Verify v4 public tokens with `paseto.v4.Public.verifyToken`.
-- Support PASERK `pid` string lookup.
+- Support typed PASERK `pid` lookup with `paseto.paserk.Id`.
 - Validate `iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti` with
   `paseto.Validator`.
 - Parse and enforce the custom `qmsg` claim block in qmsg.

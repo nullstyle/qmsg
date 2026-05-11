@@ -21,8 +21,8 @@ Tasks:
   - open bidi stream;
   - receive stream payload;
   - optional datagram send/receive probe.
-- Track `paseto-zig` as the planned PASETO/PASERK dependency and keep qmsg's
-  auth boundary aligned with its release API.
+- Track `paseto-zig` `0.2.0` as the PASETO/PASERK dependency target and keep
+  qmsg's auth boundary aligned with its release API.
 
 Exit criteria:
 
@@ -247,10 +247,10 @@ core of qmsg.
 
 Tasks:
 
-- Add `paseto-zig` as a dependency once a release is available.
+- Add `paseto-zig` `0.2.0` as the optional auth-kit dependency.
 - Support PASETO v4.public verification for HELLO credentials via
   `paseto.v4.Public.verifyToken`.
-- Support PASERK `pid` key-id string lookup using keys generated or parsed by
+- Support typed PASERK `pid` key-id lookup using keys generated or parsed by
   `paseto-zig`.
 - Add claim validation policy:
   - issuer;

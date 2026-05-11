@@ -20,6 +20,7 @@ pub const InprocEndpoint = struct {
 pub const Error = error{
     InvalidEndpoint,
     InvalidState,
+    EndpointClosed,
     EndpointInUse,
     EndpointNotFound,
     QueueFull,

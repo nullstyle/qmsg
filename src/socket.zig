@@ -39,9 +39,12 @@ pub const SocketError = error{
     InvalidSubject,
     InvalidSubjectFilter,
     MessageTooLarge,
+    NoPeer,
     QueueFull,
     WouldBlock,
     FlowControlled,
+    DuplicateInflightRequest,
+    TooManyInflightRequests,
     PeerClosed,
     UnexpectedFrame,
     UnsupportedTransport,
@@ -111,6 +114,10 @@ pub const PairSocket = struct {
     pub fn recv(self: *PairSocket) !message.Message {
         return self.core.recv();
     }
+
+    pub fn tryRecv(self: *PairSocket) !?message.Message {
+        return self.core.recvOrNull();
+    }
 };
 
 pub const ReqSocket = struct {
@@ -149,7 +156,7 @@ pub const ReqSocket = struct {
     }
 
     pub fn sendRequest(self: *ReqSocket, outgoing: message.OutgoingMessage) !message.MessageId {
-        const id = if (outgoing.id == 0) self.core.nextMessageId() else outgoing.id;
+        const id = if (outgoing.id == 0) self.core.nextAvailableMessageId() else outgoing.id;
         try self.core.addInflight(id);
         errdefer _ = self.core.removeInflight(id);
 
@@ -157,13 +164,52 @@ pub const ReqSocket = struct {
         return id;
     }
 
+    /// Sends a request and immediately attempts to receive its reply.
+    ///
+    /// This is only appropriate when the selected transport/responder can
+    /// produce a reply synchronously. For normal polling or event-loop usage,
+    /// call `sendRequest` and then `recv`/`tryRecv` separately.
     pub fn request(self: *ReqSocket, outgoing: message.OutgoingMessage) !message.Message {
-        _ = try self.sendRequest(outgoing);
-        return self.recv();
+        const id = try self.sendRequest(outgoing);
+        var completed = false;
+        errdefer if (!completed) {
+            _ = self.core.removeInflight(id);
+        };
+
+        const reply = try self.recv();
+        completed = true;
+        return reply;
+    }
+
+    /// Test/helper convenience for synchronous inproc-style responders.
+    ///
+    /// `responder` must provide `respond() !void`; it is invoked after the
+    /// request is sent and before the reply is polled.
+    pub fn requestComplete(self: *ReqSocket, outgoing: message.OutgoingMessage, responder: anytype) !message.Message {
+        const id = try self.sendRequest(outgoing);
+        var completed = false;
+        errdefer if (!completed) {
+            _ = self.core.removeInflight(id);
+        };
+
+        try responder.respond();
+
+        const reply = try self.recv();
+        completed = true;
+        return reply;
     }
 
     pub fn recv(self: *ReqSocket) !message.Message {
         var reply = try self.core.recv();
+        if (!self.core.removeInflight(reply.id)) {
+            reply.deinit();
+            return error.UnexpectedFrame;
+        }
+        return reply;
+    }
+
+    pub fn tryRecv(self: *ReqSocket) !?message.Message {
+        var reply = (try self.core.recvOrNull()) orelse return null;
         if (!self.core.removeInflight(reply.id)) {
             reply.deinit();
             return error.UnexpectedFrame;
@@ -209,6 +255,11 @@ pub const RepSocket = struct {
 
     pub fn recv(self: *RepSocket) !Request {
         return .{ .message = try self.core.recv() };
+    }
+
+    pub fn tryRecv(self: *RepSocket) !?Request {
+        const received = (try self.core.recvOrNull()) orelse return null;
+        return .{ .message = received };
     }
 
     pub fn reply(self: *RepSocket, request_to_answer: Request, outgoing: message.OutgoingMessage) !void {
@@ -306,6 +357,10 @@ pub const SubSocket = struct {
     pub fn recv(self: *SubSocket) !message.Message {
         return self.core.recv();
     }
+
+    pub fn tryRecv(self: *SubSocket) !?message.Message {
+        return self.core.recvOrNull();
+    }
 };
 
 pub const PushSocket = struct {
@@ -385,6 +440,10 @@ pub const PullSocket = struct {
 
     pub fn recv(self: *PullSocket) !message.Message {
         return self.core.recv();
+    }
+
+    pub fn tryRecv(self: *PullSocket) !?message.Message {
+        return self.core.recvOrNull();
     }
 };
 
@@ -466,11 +525,16 @@ fn Core(comptime pattern: Pattern) type {
             return self.inbox.pop();
         }
 
+        fn recvOrNull(self: *Self) !?message.Message {
+            return self.inbox.popOrNull();
+        }
+
         fn sendToFirst(self: *Self, expected_peer: Pattern, outgoing: message.OutgoingMessage, overrides: MessageOverrides) !void {
             try validateOutgoing(outgoing, self.options.max_message_size, overrides.subject);
 
             for (self.peers.items) |peer| {
                 if (peer.pattern != expected_peer) continue;
+
                 const effective_subject = overrides.subject orelse outgoing.subject;
                 if (!peer.accepts(peer.context, effective_subject)) continue;
 
@@ -479,7 +543,7 @@ fn Core(comptime pattern: Pattern) type {
                 return;
             }
 
-            return error.PeerClosed;
+            return error.NoPeer;
         }
 
         fn sendToAll(self: *Self, expected_peer: Pattern, outgoing: message.OutgoingMessage, overrides: MessageOverrides) !void {
@@ -497,10 +561,10 @@ fn Core(comptime pattern: Pattern) type {
 
         fn sendToNext(self: *Self, expected_peer: Pattern, outgoing: message.OutgoingMessage, overrides: MessageOverrides) !void {
             try validateOutgoing(outgoing, self.options.max_message_size, overrides.subject);
-            if (self.peers.items.len == 0) return error.PeerClosed;
+            if (self.peers.items.len == 0) return error.NoPeer;
 
             var attempts: usize = 0;
-            var last_error: anyerror = error.PeerClosed;
+            var last_error: anyerror = error.NoPeer;
             while (attempts < self.peers.items.len) : (attempts += 1) {
                 const index = (self.next_peer + attempts) % self.peers.items.len;
                 const peer = self.peers.items[index];
@@ -524,7 +588,6 @@ fn Core(comptime pattern: Pattern) type {
 
         fn subscribe(self: *Self, filter: []const u8) !void {
             if (pattern != .sub) return error.InvalidPattern;
-            if (self.subscriptions.items.len >= self.options.max_subscriptions) return error.QueueFull;
 
             for (self.subscriptions.items) |subscription| {
                 if (std.mem.eql(u8, subscription.filter.text, filter)) return;
@@ -532,6 +595,8 @@ fn Core(comptime pattern: Pattern) type {
 
             var owned = try subject_mod.Filter.init(self.allocator, filter);
             errdefer owned.deinit();
+
+            if (self.subscriptions.items.len >= self.options.max_subscriptions) return error.QueueFull;
 
             try self.subscriptions.append(self.allocator, .{
                 .filter = owned,
@@ -554,9 +619,9 @@ fn Core(comptime pattern: Pattern) type {
         fn addInflight(self: *Self, id: message.MessageId) !void {
             if (pattern != .req) return error.InvalidPattern;
             if (id == 0) return error.InvalidState;
-            if (self.inflight.items.len >= self.options.max_inflight_requests) return error.FlowControlled;
+            if (self.inflight.items.len >= self.options.max_inflight_requests) return error.TooManyInflightRequests;
             for (self.inflight.items) |existing| {
-                if (existing == id) return error.InvalidState;
+                if (existing == id) return error.DuplicateInflightRequest;
             }
             try self.inflight.append(self.allocator, id);
         }
@@ -577,6 +642,22 @@ fn Core(comptime pattern: Pattern) type {
             self.next_id +%= 1;
             if (self.next_id == 0) self.next_id = 1;
             return id;
+        }
+
+        fn nextAvailableMessageId(self: *Self) message.MessageId {
+            var id = self.nextMessageId();
+            while (self.hasInflight(id)) {
+                id = self.nextMessageId();
+            }
+            return id;
+        }
+
+        fn hasInflight(self: *Self, id: message.MessageId) bool {
+            if (pattern != .req) return false;
+            for (self.inflight.items) |existing| {
+                if (existing == id) return true;
+            }
+            return false;
         }
 
         fn enqueue(context: *anyopaque, msg: message.Message) anyerror!void {
@@ -690,6 +771,30 @@ test "pair sends and receives owned messages over explicit inproc endpoints" {
     try std.testing.expectEqualStrings("hello", received.body);
 }
 
+test "tryRecv returns null instead of WouldBlock for receive-capable sockets" {
+    const allocator = std.testing.allocator;
+
+    var pair_socket = try Socket(.pair).init(allocator, .{});
+    defer pair_socket.deinit();
+    try expectNoMessage(try pair_socket.tryRecv());
+
+    var req_socket = try Socket(.req).init(allocator, .{});
+    defer req_socket.deinit();
+    try expectNoMessage(try req_socket.tryRecv());
+
+    var rep_socket = try Socket(.rep).init(allocator, .{});
+    defer rep_socket.deinit();
+    try expectNoRequest(try rep_socket.tryRecv());
+
+    var sub_socket = try Socket(.sub).init(allocator, .{});
+    defer sub_socket.deinit();
+    try expectNoMessage(try sub_socket.tryRecv());
+
+    var pull_socket = try Socket(.pull).init(allocator, .{});
+    defer pull_socket.deinit();
+    try expectNoMessage(try pull_socket.tryRecv());
+}
+
 test "sockets can bind and dial through explicit inproc network" {
     const allocator = std.testing.allocator;
 
@@ -716,6 +821,30 @@ test "sockets can bind and dial through explicit inproc network" {
     try std.testing.expectEqualStrings("Ada", reply.body);
 }
 
+test "invalid peer patterns and missing peers report socket-level errors" {
+    const allocator = std.testing.allocator;
+
+    var pair_socket = try Socket(.pair).init(allocator, .{});
+    defer pair_socket.deinit();
+    var req_socket = try Socket(.req).init(allocator, .{});
+    defer req_socket.deinit();
+    var rep_socket = try Socket(.rep).init(allocator, .{});
+    defer rep_socket.deinit();
+
+    try std.testing.expectError(error.InvalidPattern, pair_socket.connectInproc(req_socket.inprocEndpoint()));
+    try std.testing.expectError(error.InvalidPattern, req_socket.connectInproc(pair_socket.inprocEndpoint()));
+
+    try std.testing.expectError(error.NoPeer, pair_socket.send(.{ .subject = "control.ping" }));
+    try std.testing.expectError(error.NoPeer, req_socket.sendRequest(.{ .subject = "user.get", .id = 42 }));
+
+    try req_socket.connectInproc(rep_socket.inprocEndpoint());
+    _ = try req_socket.sendRequest(.{ .subject = "user.get", .id = 42 });
+
+    var received = try rep_socket.recv();
+    defer received.deinit();
+    try std.testing.expectEqual(@as(message.MessageId, 42), received.id());
+}
+
 test "bounded receive queue reports backpressure" {
     const allocator = std.testing.allocator;
 
@@ -734,6 +863,36 @@ test "bounded receive queue reports backpressure" {
     var received = try right.recv();
     defer received.deinit();
     try std.testing.expectEqualStrings("one", received.subject);
+}
+
+test "req rejects duplicate explicit ids and max inflight overflows" {
+    const allocator = std.testing.allocator;
+
+    var req = try Socket(.req).init(allocator, .{});
+    defer req.deinit();
+    var rep = try Socket(.rep).init(allocator, .{});
+    defer rep.deinit();
+    try req.connectInproc(rep.inprocEndpoint());
+
+    _ = try req.sendRequest(.{ .subject = "user.get", .id = 7 });
+    try std.testing.expectError(error.DuplicateInflightRequest, req.sendRequest(.{ .subject = "user.get", .id = 7 }));
+
+    var duplicate_source = try rep.recv();
+    defer duplicate_source.deinit();
+    try std.testing.expectEqual(@as(message.MessageId, 7), duplicate_source.id());
+
+    var limited_req = try Socket(.req).init(allocator, .{ .max_inflight_requests = 1 });
+    defer limited_req.deinit();
+    var limited_rep = try Socket(.rep).init(allocator, .{});
+    defer limited_rep.deinit();
+    try limited_req.connectInproc(limited_rep.inprocEndpoint());
+
+    _ = try limited_req.sendRequest(.{ .subject = "user.get", .id = 10 });
+    try std.testing.expectError(error.TooManyInflightRequests, limited_req.sendRequest(.{ .subject = "user.get", .id = 11 }));
+
+    var limited_source = try limited_rep.recv();
+    defer limited_source.deinit();
+    try std.testing.expectEqual(@as(message.MessageId, 10), limited_source.id());
 }
 
 test "req rep preserves correlation id and deadline" {
@@ -764,13 +923,59 @@ test "req rep preserves correlation id and deadline" {
 
     try rep.reply(request, .{ .subject = "user.result", .body = "Ada" });
 
-    var reply = try req.recv();
+    var reply = (try req.tryRecv()) orelse return error.TestExpectedEqual;
     defer reply.deinit();
 
     try std.testing.expectEqual(id, reply.id);
     try std.testing.expectEqual(@as(?u64, 500), reply.deadline_ms);
     try std.testing.expectEqualStrings("user.result", reply.subject);
     try std.testing.expectEqualStrings("Ada", reply.body);
+}
+
+test "request is immediate-only while requestComplete runs a synchronous responder" {
+    const allocator = std.testing.allocator;
+
+    var req = try Socket(.req).init(allocator, .{});
+    defer req.deinit();
+    var rep = try Socket(.rep).init(allocator, .{});
+    defer rep.deinit();
+    try req.connectInproc(rep.inprocEndpoint());
+    try rep.connectInproc(req.inprocEndpoint());
+
+    try std.testing.expectError(error.WouldBlock, req.request(.{
+        .subject = "sync.first",
+        .id = 100,
+        .deadline_ms = 250,
+    }));
+
+    var orphaned_request = try rep.recv();
+    defer orphaned_request.deinit();
+    try std.testing.expectEqual(@as(message.MessageId, 100), orphaned_request.id());
+    try rep.reply(orphaned_request, .{ .subject = "sync.first.ok", .body = "late" });
+    try std.testing.expectError(error.UnexpectedFrame, req.recv());
+
+    const Responder = struct {
+        rep: *Socket(.rep),
+
+        fn respond(self: *@This()) !void {
+            var received = try self.rep.recv();
+            defer received.deinit();
+            try self.rep.reply(received, .{ .subject = "sync.second.ok", .body = "done" });
+        }
+    };
+
+    var responder = Responder{ .rep = &rep };
+    var reply = try req.requestComplete(.{
+        .subject = "sync.second",
+        .deadline_ms = 500,
+        .body = "go",
+    }, &responder);
+    defer reply.deinit();
+
+    try std.testing.expect(reply.id != 0);
+    try std.testing.expectEqual(@as(?u64, 500), reply.deadline_ms);
+    try std.testing.expectEqualStrings("sync.second.ok", reply.subject);
+    try std.testing.expectEqualStrings("done", reply.body);
 }
 
 test "pub sub delivers only matching subscribed subjects" {
@@ -797,6 +1002,7 @@ test "pub sub delivers only matching subscribed subjects" {
     defer second.deinit();
     try std.testing.expectEqualStrings("presence.user.123", second.subject);
 
+    try expectNoMessage(try sub_socket.tryRecv());
     try std.testing.expectError(error.WouldBlock, sub_socket.recv());
 }
 
@@ -837,4 +1043,22 @@ test "subscription filters validate wildcard placement" {
 
     try std.testing.expectError(error.InvalidSubjectFilter, sub_socket.subscribe("metrics*"));
     try std.testing.expectError(error.InvalidSubjectFilter, sub_socket.subscribe("presence.>.extra"));
+
+    var full_sub = try Socket(.sub).init(allocator, .{ .max_subscriptions = 0 });
+    defer full_sub.deinit();
+
+    try std.testing.expectError(error.InvalidSubjectFilter, full_sub.subscribe("bad*"));
+    try std.testing.expectError(error.QueueFull, full_sub.subscribe("still.valid"));
+}
+
+fn expectNoMessage(maybe: ?message.Message) !void {
+    var unexpected = maybe orelse return;
+    defer unexpected.deinit();
+    return error.TestUnexpectedResult;
+}
+
+fn expectNoRequest(maybe: ?Request) !void {
+    var unexpected = maybe orelse return;
+    defer unexpected.deinit();
+    return error.TestUnexpectedResult;
 }

@@ -4,11 +4,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const paseto_dep = b.dependency("paseto", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const paseto_mod = paseto_dep.module("paseto");
+
     const qmsg_mod = b.addModule("qmsg", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    qmsg_mod.addImport("paseto", paseto_mod);
 
     const lib = b.addLibrary(.{
         .name = "qmsg",

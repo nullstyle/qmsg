@@ -11,6 +11,7 @@ pub const Pattern = protocol.Pattern;
 
 pub const Error = error{
     InvalidEndpoint,
+    EndpointClosed,
     EndpointInUse,
     EndpointNotFound,
     QueueFull,
@@ -21,6 +22,13 @@ pub const Error = error{
 
 pub const EndpointOptions = struct {
     queue: QueueOptions = .{},
+};
+
+pub const EndpointStats = struct {
+    queued_messages: usize,
+    queued_bytes: usize,
+    closed: bool,
+    queue: queue.QueueStats,
 };
 
 pub const PatternEndpoint = struct {
@@ -61,6 +69,14 @@ pub const BoundEndpoint = struct {
     pub fn reply(self: BoundEndpoint, delivery: Delivery, msg: Message) (Error || std.mem.Allocator.Error)!PushResult {
         return self.sendTo(delivery.from, msg);
     }
+
+    pub fn close(self: BoundEndpoint) Error!void {
+        try self.network.close(self.id);
+    }
+
+    pub fn stats(self: BoundEndpoint) Error!EndpointStats {
+        return self.network.endpointStats(self.id);
+    }
 };
 
 pub const Connection = struct {
@@ -82,6 +98,14 @@ pub const Connection = struct {
 
     pub fn recv(self: Connection) (Error || std.mem.Allocator.Error)!Delivery {
         return self.network.recv(self.local_id);
+    }
+
+    pub fn close(self: Connection) Error!void {
+        try self.network.close(self.local_id);
+    }
+
+    pub fn stats(self: Connection) Error!EndpointStats {
+        return self.network.endpointStats(self.local_id);
     }
 };
 
@@ -133,6 +157,11 @@ pub const Network = struct {
         };
     }
 
+    pub fn unbind(self: *Network, address: []const u8) Error!void {
+        const id = self.bound.get(address) orelse return error.EndpointNotFound;
+        try self.close(id);
+    }
+
     pub fn bindPattern(self: *Network, address: []const u8, endpoint: PatternEndpoint) (Error || std.mem.Allocator.Error)!void {
         if (address.len == 0) return error.InvalidEndpoint;
         if (self.pattern_bindings.contains(address)) return error.EndpointInUse;
@@ -142,6 +171,10 @@ pub const Network = struct {
         try self.pattern_bindings.put(owned_address, endpoint);
         errdefer _ = self.pattern_bindings.remove(owned_address);
         try self.pattern_binding_keys.append(self.allocator, owned_address);
+    }
+
+    pub fn unbindPattern(self: *Network, address: []const u8) Error!void {
+        if (!self.removePatternBinding(address)) return error.EndpointNotFound;
     }
 
     pub fn dialPattern(self: *Network, address: []const u8, endpoint: PatternEndpoint) anyerror!void {
@@ -156,6 +189,7 @@ pub const Network = struct {
 
     pub fn connect(self: *Network, address: []const u8, options: EndpointOptions) (Error || std.mem.Allocator.Error)!Connection {
         const remote_id = self.bound.get(address) orelse return error.EndpointNotFound;
+        _ = try self.activeEndpointState(remote_id);
         const local_id = try self.addEndpoint(null, options);
         self.endpoints.items[local_id].remote = remote_id;
 
@@ -167,8 +201,8 @@ pub const Network = struct {
     }
 
     pub fn send(self: *Network, from: EndpointId, to: EndpointId, msg: Message) (Error || std.mem.Allocator.Error)!PushResult {
-        _ = try self.endpointState(from);
-        var destination = try self.endpointState(to);
+        _ = try self.activeEndpointState(from);
+        var destination = try self.activeEndpointState(to);
 
         var cloned = try queue.cloneOwnedMessage(self.allocator, msg);
         const result = destination.messages.push(cloned) catch |err| {
@@ -181,18 +215,60 @@ pub const Network = struct {
 
     pub fn recv(self: *Network, id: EndpointId) (Error || std.mem.Allocator.Error)!Delivery {
         var endpoint_state = try self.endpointState(id);
-        const msg = try endpoint_state.messages.pop();
-        const from = endpoint_state.sources.pop();
-        return .{
-            .from = from,
-            .to = id,
-            .message = msg,
-        };
+        if (endpoint_state.messages.popOrNull()) |msg| {
+            const from = endpoint_state.sources.pop();
+            std.debug.assert(endpoint_state.messages.len() == endpoint_state.sources.len());
+            return .{
+                .from = from,
+                .to = id,
+                .message = msg,
+            };
+        }
+
+        if (endpoint_state.closed) return error.EndpointClosed;
+        return error.WouldBlock;
+    }
+
+    pub fn close(self: *Network, id: EndpointId) Error!void {
+        var endpoint_state = try self.endpointState(id);
+        if (endpoint_state.closed) return error.EndpointClosed;
+
+        if (endpoint_state.address) |addr| {
+            _ = self.bound.remove(addr);
+            self.allocator.free(addr);
+            endpoint_state.address = null;
+        }
+
+        endpoint_state.remote = null;
+        endpoint_state.closed = true;
     }
 
     pub fn queueLen(self: *Network, id: EndpointId) Error!usize {
         const endpoint_state = try self.endpointState(id);
         return endpoint_state.messages.len();
+    }
+
+    pub fn endpointStats(self: *Network, id: EndpointId) Error!EndpointStats {
+        const endpoint_state = try self.endpointState(id);
+        return .{
+            .queued_messages = endpoint_state.messages.len(),
+            .queued_bytes = endpoint_state.messages.bytes(),
+            .closed = endpoint_state.closed,
+            .queue = endpoint_state.messages.stats(),
+        };
+    }
+
+    fn removePatternBinding(self: *Network, address: []const u8) bool {
+        if (!self.pattern_bindings.remove(address)) return false;
+
+        for (self.pattern_binding_keys.items, 0..) |key, index| {
+            if (!std.mem.eql(u8, key, address)) continue;
+            const owned_key = self.pattern_binding_keys.orderedRemove(index);
+            self.allocator.free(owned_key);
+            return true;
+        }
+
+        return true;
     }
 
     fn addEndpoint(self: *Network, address: ?[]const u8, options: EndpointOptions) std.mem.Allocator.Error!EndpointId {
@@ -208,11 +284,18 @@ pub const Network = struct {
         if (id >= self.endpoints.items.len) return error.EndpointNotFound;
         return &self.endpoints.items[id];
     }
+
+    fn activeEndpointState(self: *Network, id: EndpointId) Error!*EndpointState {
+        const state = try self.endpointState(id);
+        if (state.closed) return error.EndpointClosed;
+        return state;
+    }
 };
 
 const EndpointState = struct {
     address: ?[]u8,
     remote: ?EndpointId = null,
+    closed: bool = false,
     messages: queue.Queue,
     sources: SourceRing,
 
@@ -275,6 +358,10 @@ const SourceRing = struct {
         self.count -= 1;
         if (self.count == 0) self.head = 0;
         return value;
+    }
+
+    fn len(self: SourceRing) usize {
+        return self.count;
     }
 
     fn dropOldest(self: *SourceRing, count: usize) void {
@@ -380,6 +467,10 @@ test "inproc endpoint queues enforce fail backpressure" {
     try std.testing.expectError(error.QueueFull, client.send(second));
 
     try std.testing.expectEqual(@as(usize, 1), try network.queueLen(server.endpointId()));
+    const stats = try server.stats();
+    try std.testing.expectEqual(@as(usize, 1), stats.queued_messages);
+    try std.testing.expectEqual(@as(usize, 1), stats.queue.enqueued);
+    try std.testing.expectEqual(@as(usize, 1), stats.queue.queue_full);
 }
 
 test "inproc drop_oldest keeps sender metadata aligned with messages" {
@@ -409,6 +500,11 @@ test "inproc drop_oldest keeps sender metadata aligned with messages" {
     defer delivery.deinit();
     try std.testing.expectEqual(second_client.localId(), delivery.from);
     try std.testing.expectEqualStrings("second", delivery.message.body);
+
+    const stats = try server.stats();
+    try std.testing.expectEqual(@as(usize, 2), stats.queue.enqueued);
+    try std.testing.expectEqual(@as(usize, 1), stats.queue.dropped_oldest);
+    try std.testing.expectEqual(@as(usize, 1), stats.queue.high_water_messages);
 }
 
 test "inproc rejects duplicate or missing endpoints and empty receives are nonblocking" {
@@ -421,6 +517,195 @@ test "inproc rejects duplicate or missing endpoints and empty receives are nonbl
     try std.testing.expectError(error.EndpointNotFound, network.connect("svc.missing", .{}));
     try std.testing.expectError(error.WouldBlock, server.recv());
 }
+
+test "inproc unbind closes bound endpoint and permits rebinding address" {
+    const allocator = std.testing.allocator;
+    var network = Network.init(allocator);
+    defer network.deinit();
+
+    const old_server = try network.bind("svc.rebind", .{});
+    const old_client = try network.connect("svc.rebind", .{});
+
+    try network.unbind("svc.rebind");
+    try std.testing.expectError(error.EndpointNotFound, network.connect("svc.rebind", .{}));
+
+    var msg = try testMessage(allocator, "event", "old", &.{});
+    defer queue.deinitOwnedMessage(&msg);
+    try std.testing.expectError(error.EndpointClosed, old_client.send(msg));
+    try std.testing.expectError(error.EndpointClosed, old_server.recv());
+
+    const old_stats = try old_server.stats();
+    try std.testing.expect(old_stats.closed);
+
+    const new_server = try network.bind("svc.rebind", .{});
+    const new_client = try network.connect("svc.rebind", .{});
+    try expectPushResult(.enqueued, try new_client.send(msg));
+
+    var delivery = try new_server.recv();
+    defer delivery.deinit();
+    try std.testing.expectEqual(new_client.localId(), delivery.from);
+    try std.testing.expectEqualStrings("old", delivery.message.body);
+}
+
+test "inproc close drains queued deliveries then reports EndpointClosed" {
+    const allocator = std.testing.allocator;
+    var network = Network.init(allocator);
+    defer network.deinit();
+
+    const server = try network.bind("svc.close", .{});
+    const client = try network.connect("svc.close", .{});
+
+    var first = try testMessage(allocator, "event", "first", &.{});
+    defer queue.deinitOwnedMessage(&first);
+    try expectPushResult(.enqueued, try client.send(first));
+
+    try server.close();
+
+    var second = try testMessage(allocator, "event", "second", &.{});
+    defer queue.deinitOwnedMessage(&second);
+    try std.testing.expectError(error.EndpointClosed, client.send(second));
+
+    var delivery = try server.recv();
+    defer delivery.deinit();
+    try std.testing.expectEqual(client.localId(), delivery.from);
+    try std.testing.expectEqualStrings("first", delivery.message.body);
+    try std.testing.expectError(error.EndpointClosed, server.recv());
+
+    const stats = try server.stats();
+    try std.testing.expect(stats.closed);
+    try std.testing.expectEqual(@as(usize, 0), stats.queued_messages);
+    try std.testing.expectEqual(@as(usize, 1), stats.queue.enqueued);
+}
+
+test "inproc close rejects sends from closed local connection" {
+    const allocator = std.testing.allocator;
+    var network = Network.init(allocator);
+    defer network.deinit();
+
+    _ = try network.bind("svc.local-close", .{});
+    const client = try network.connect("svc.local-close", .{});
+    try client.close();
+
+    var msg = try testMessage(allocator, "event", "body", &.{});
+    defer queue.deinitOwnedMessage(&msg);
+    try std.testing.expectError(error.EndpointClosed, client.send(msg));
+    try std.testing.expectError(error.EndpointClosed, client.recv());
+
+    const stats = try client.stats();
+    try std.testing.expect(stats.closed);
+}
+
+test "inproc drop_newest keeps sender metadata and counters aligned" {
+    const allocator = std.testing.allocator;
+    var network = Network.init(allocator);
+    defer network.deinit();
+
+    const server = try network.bind("svc.drop-newest", .{
+        .queue = .{
+            .max_messages = 1,
+            .max_bytes = 1024,
+            .on_full = .drop_newest,
+        },
+    });
+    const first_client = try network.connect("svc.drop-newest", .{});
+    const second_client = try network.connect("svc.drop-newest", .{});
+
+    var first = try testMessage(allocator, "event", "first", &.{});
+    defer queue.deinitOwnedMessage(&first);
+    try expectPushResult(.enqueued, try first_client.send(first));
+
+    var second = try testMessage(allocator, "event", "second", &.{});
+    defer queue.deinitOwnedMessage(&second);
+    try expectPushResult(.dropped_newest, try second_client.send(second));
+
+    const stats = try server.stats();
+    try std.testing.expectEqual(@as(usize, 1), stats.queued_messages);
+    try std.testing.expectEqual(@as(usize, 1), stats.queue.enqueued);
+    try std.testing.expectEqual(@as(usize, 1), stats.queue.dropped_newest);
+
+    var delivery = try server.recv();
+    defer delivery.deinit();
+    try std.testing.expectEqual(first_client.localId(), delivery.from);
+    try std.testing.expectEqualStrings("first", delivery.message.body);
+}
+
+test "inproc zero-capacity fail queue reports pressure without sender metadata drift" {
+    const allocator = std.testing.allocator;
+    var network = Network.init(allocator);
+    defer network.deinit();
+
+    const server = try network.bind("svc.zero", .{
+        .queue = .{
+            .max_messages = 0,
+            .max_bytes = 1024,
+            .on_full = .fail,
+        },
+    });
+    const client = try network.connect("svc.zero", .{});
+
+    var msg = try testMessage(allocator, "event", "body", &.{});
+    defer queue.deinitOwnedMessage(&msg);
+    try std.testing.expectError(error.QueueFull, client.send(msg));
+    try std.testing.expectError(error.WouldBlock, server.recv());
+
+    const stats = try server.stats();
+    try std.testing.expectEqual(@as(usize, 0), stats.queued_messages);
+    try std.testing.expectEqual(@as(usize, 0), stats.queued_bytes);
+    try std.testing.expectEqual(@as(usize, 1), stats.queue.queue_full);
+}
+
+test "inproc pattern bindings can be unbound and rebound" {
+    const allocator = std.testing.allocator;
+    var network = Network.init(allocator);
+    defer network.deinit();
+
+    var left = PatternHarness{};
+    var right = PatternHarness{};
+
+    try network.bindPattern("pair.pattern", left.endpoint(.pair));
+    try std.testing.expectError(error.EndpointInUse, network.bindPattern("pair.pattern", left.endpoint(.pair)));
+    try network.dialPattern("pair.pattern", right.endpoint(.pair));
+    try std.testing.expectEqual(@as(usize, 1), left.connected);
+    try std.testing.expectEqual(@as(usize, 1), right.connected);
+
+    try network.unbindPattern("pair.pattern");
+    try std.testing.expectError(error.EndpointNotFound, network.dialPattern("pair.pattern", right.endpoint(.pair)));
+
+    try network.bindPattern("pair.pattern", right.endpoint(.pair));
+    try network.unbindPattern("pair.pattern");
+}
+
+const PatternHarness = struct {
+    connected: usize = 0,
+
+    fn endpoint(self: *PatternHarness, pattern: Pattern) PatternEndpoint {
+        return .{
+            .pattern = pattern,
+            .context = @ptrCast(self),
+            .enqueue = enqueue,
+            .accepts = accepts,
+            .connect_peer = connectPeer,
+        };
+    }
+
+    fn enqueue(context: *anyopaque, msg: Message) anyerror!void {
+        _ = context;
+        var owned = msg;
+        queue.deinitOwnedMessage(&owned);
+    }
+
+    fn accepts(context: *anyopaque, subject: []const u8) bool {
+        _ = context;
+        _ = subject;
+        return true;
+    }
+
+    fn connectPeer(context: *anyopaque, peer: PatternEndpoint) anyerror!void {
+        _ = peer;
+        const self: *PatternHarness = @ptrCast(@alignCast(context));
+        self.connected += 1;
+    }
+};
 
 fn expectPushResult(expected: PushResult, actual: PushResult) !void {
     switch (expected) {

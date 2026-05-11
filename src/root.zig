@@ -14,10 +14,12 @@ pub const queue = @import("queue.zig");
 pub const transport = @import("transport/root.zig");
 pub const socket = @import("socket.zig");
 pub const auth = @import("auth.zig");
+pub const auth_paseto = @import("auth_paseto.zig");
 pub const session = @import("session.zig");
 pub const node = @import("node.zig");
 pub const app = @import("app.zig");
 pub const protocol = @import("protocol/root.zig");
+pub const control = @import("control.zig");
 
 pub const Message = message.Message;
 pub const OutgoingMessage = message.OutgoingMessage;
@@ -42,6 +44,7 @@ pub const TransportKind = transport.Kind;
 pub const AuthConfig = auth.AuthConfig;
 pub const Authorization = auth.Authorization;
 pub const SubjectPolicy = auth.SubjectPolicy;
+pub const PasetoAuth = auth_paseto;
 
 pub const Session = session.Session;
 pub const SessionId = session.SessionId;
@@ -57,20 +60,34 @@ pub const Error = error{
     InvalidEndpoint,
     EndpointInUse,
     EndpointNotFound,
+    EndpointClosed,
     InvalidState,
     InvalidMessage,
+    NoRoute,
     HeaderLimitExceeded,
     HeaderBytesLimitExceeded,
     MessageTooLarge,
     QueueFull,
     FlowControlled,
     WouldBlock,
+    NoPeer,
+    DuplicateInflightRequest,
+    TooManyInflightRequests,
     DeadlineExceeded,
     Canceled,
     PeerClosed,
     ConnectionLost,
     StreamReset,
     MalformedFrame,
+    UnknownControlFrame,
+    InvalidControlFrame,
+    FrameTooLarge,
+    PeerIdTooLarge,
+    AuthSchemeTooLarge,
+    CredentialTooLarge,
+    KeyIdHintTooLarge,
+    SubjectFilterTooLarge,
+    GoawayReasonTooLarge,
     UnexpectedFrame,
     VersionMismatch,
     UnsupportedTransport,

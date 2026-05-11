@@ -1,6 +1,9 @@
 const std = @import("std");
 const qmsg = @import("qmsg");
 
+// This example is intentionally inproc-only. The same socket pattern API is the
+// shape QUIC should use later, but no QUIC listener is implied here.
+
 pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();

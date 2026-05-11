@@ -1,18 +1,30 @@
 const std = @import("std");
 const qmsg = @import("qmsg");
 
+// Route registration and in-memory dispatch work today. QUIC listeners are the
+// next integration layer, so this example keeps auth as an explicit session
+// policy plan without requiring a network transport.
+
 pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
 
     const allocator = gpa.allocator();
+    const auth_plan = qmsg.AuthConfig{
+        .required = true,
+        .max_token_bytes = 4096,
+        .max_clock_skew_ms = 30_000,
+    };
 
     var app = try qmsg.App.init(allocator, .{});
     defer app.deinit();
 
     if (comptime appFacadeReady()) {
         try installRoutes(&app);
-        std.debug.print("qmsg app facade routes registered\n", .{});
+        std.debug.print(
+            "qmsg app facade routes registered (auth plan required={}, token cap={d} bytes)\n",
+            .{ auth_plan.required, auth_plan.max_token_bytes },
+        );
     } else {
         printRoutePlan(&.{
             .{
@@ -33,11 +45,7 @@ pub fn main() !void {
                 .handler_name = "observeMetric",
                 .queue = .{ .max_messages = 256, .max_bytes = 2 * 1024 * 1024, .on_full = .drop_oldest },
             },
-        }, .{
-            .required = true,
-            .max_token_bytes = 4096,
-            .max_clock_skew_ms = 30_000,
-        });
+        }, auth_plan);
     }
 }
 
@@ -95,6 +103,10 @@ fn installRoutes(app: *qmsg.App) !void {
 fn getUser(ctx: *qmsg.Context, msg: qmsg.Message) !void {
     var owned = msg;
     defer owned.deinit();
+
+    // Next auth tranche: require the cached session authorization before reply.
+    // try ctx.requirePattern(.rep);
+    // try ctx.requireSubject("user.get");
 
     try ctx.reply(.{
         .subject = "user.get",
