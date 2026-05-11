@@ -1,0 +1,19 @@
+.{
+    .name = .qmsg,
+    .version = "0.1.0",
+    .fingerprint = 0x650c9e5831497a83,
+    .minimum_zig_version = "0.17.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "docs",
+        "README.md",
+        "DESIGN.md",
+        "WIRE.md",
+        "AUTH.md",
+        "ROADMAP.md",
+    },
+    .dependencies = .{},
+}
