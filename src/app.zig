@@ -548,6 +548,13 @@ pub const App = struct {
         });
     }
 
+    pub fn dialQuic(self: *App, addr: []const u8, options: node.QuicDialOptions) !node.QuicSessionId {
+        const id = try self.node.dialQuic(addr, options);
+        const runtime = self.node.quicSession(id) orelse return error.EndpointNotFound;
+        try self.dispatchConnectHandler(runtime.appSession());
+        return id;
+    }
+
     pub fn openQuicSession(self: *App, options: node.QuicSessionOptions) !*node.QuicSessionRuntime {
         const runtime = try self.node.openQuicSession(options);
         try self.dispatchConnectHandler(runtime.appSession());
@@ -673,6 +680,55 @@ fn messageSize(msg: message.Message) usize {
         total += header.name.len + header.value.len;
     }
     return total;
+}
+
+fn readyQuicRuntimeForTest(
+    runtime: *node.QuicSessionRuntime,
+    peer_id: []const u8,
+    datagram_enabled: bool,
+) !void {
+    try runtime.runtime.onQuicReady();
+
+    const allocator = runtime.runtime.allocator;
+    const peer_hello = try transport.quic.encodeHelloControlStream(allocator, .{
+        .peer_id = peer_id,
+        .datagram_enabled = datagram_enabled,
+    });
+    defer allocator.free(peer_hello);
+
+    try runtime.runtime.session.acceptPeerControl(peer_hello);
+}
+
+fn queueReliableForTest(
+    runtime: *node.QuicSessionRuntime,
+    stream_id: u64,
+    outgoing: message.OutgoingMessage,
+) !void {
+    const allocator = runtime.runtime.allocator;
+    var incoming = try message.Message.init(allocator, outgoing);
+    var owns_incoming = true;
+    errdefer if (owns_incoming) incoming.deinit();
+
+    try runtime.runtime.inbox.append(allocator, .{
+        .stream_id = stream_id,
+        .message = incoming,
+    });
+    owns_incoming = false;
+}
+
+fn queueDatagramForTest(
+    runtime: *node.QuicSessionRuntime,
+    outgoing: message.OutgoingMessage,
+) !void {
+    const allocator = runtime.runtime.allocator;
+    var incoming = try message.Message.init(allocator, outgoing);
+    var owns_incoming = true;
+    errdefer if (owns_incoming) incoming.deinit();
+
+    try runtime.datagram_inbox.append(allocator, .{
+        .message = incoming,
+    });
+    owns_incoming = false;
 }
 
 test {
@@ -1266,6 +1322,126 @@ test "App listenQuic validates config and QUIC session hooks prepare runtime sta
     try std.testing.expectEqual(@as(usize, 2), try app.node.poll(&events));
     try std.testing.expectEqual(id, events[0].connected);
     try std.testing.expectEqual(id, events[1].closed);
+}
+
+test "App runOnce and tick dispatch queued QUIC reliable messages through RuntimeDispatcher" {
+    const allocator = std.testing.allocator;
+
+    var app = try App.init(allocator, .{});
+    defer app.deinit();
+
+    const Handler = struct {
+        fn getUser(ctx: *Context, msg: message.Message) !void {
+            var owned = msg;
+            defer owned.deinit();
+
+            try std.testing.expectEqual(session.TransportKind.quic, ctx.session.?.transport);
+            try ctx.reply(.{
+                .subject = "",
+                .body = "Ada",
+            });
+        }
+    };
+
+    try app.rep("user.*", Handler.getUser);
+
+    const runtime = try app.openQuicSession(.{
+        .role = .server,
+        .transport = .{ .peer_id = "server-a" },
+    });
+    try readyQuicRuntimeForTest(runtime, "client-a", false);
+
+    try queueReliableForTest(runtime, 0, .{
+        .subject = "user.get",
+        .id = 42,
+        .deadline_ms = 250,
+        .body = "user-42",
+    });
+
+    const run_once_result = try app.runOnce();
+    try std.testing.expect(run_once_result.didWork());
+    try std.testing.expectEqual(@as(usize, 0), runtime.runtime.inboxLen());
+    try std.testing.expectEqual(@as(usize, 1), runtime.runtime.pendingReliableSenders());
+
+    const first_sender = runtime.runtime.reliable_senders.getPtr(0) orelse return error.StreamNotFound;
+    try std.testing.expect(!first_sender.options.open_bidi);
+    var first_reply = try transport.quic.decodeReliableMessage(allocator, first_sender.bytes, .{});
+    defer first_reply.deinit();
+    try std.testing.expectEqualStrings("user.get", first_reply.subject);
+    try std.testing.expectEqual(@as(message.MessageId, 42), first_reply.id);
+    try std.testing.expectEqual(@as(?u64, 250), first_reply.deadline_ms);
+    try std.testing.expectEqualStrings("Ada", first_reply.body);
+
+    try queueReliableForTest(runtime, 4, .{
+        .subject = "user.get",
+        .id = 43,
+        .body = "user-43",
+    });
+
+    const tick_result = try app.tick(1_000);
+    try std.testing.expect(tick_result.didWork());
+    try std.testing.expectEqual(@as(usize, 0), runtime.runtime.inboxLen());
+    try std.testing.expectEqual(@as(usize, 2), runtime.runtime.pendingReliableSenders());
+
+    const second_sender = runtime.runtime.reliable_senders.getPtr(4) orelse return error.StreamNotFound;
+    try std.testing.expect(!second_sender.options.open_bidi);
+    var second_reply = try transport.quic.decodeReliableMessage(allocator, second_sender.bytes, .{});
+    defer second_reply.deinit();
+    try std.testing.expectEqualStrings("user.get", second_reply.subject);
+    try std.testing.expectEqual(@as(message.MessageId, 43), second_reply.id);
+    try std.testing.expectEqualStrings("Ada", second_reply.body);
+}
+
+test "App runOnce dispatches queued QUIC datagrams through RuntimeDispatcher" {
+    const allocator = std.testing.allocator;
+
+    var app = try App.init(allocator, .{});
+    defer app.deinit();
+
+    const Handler = struct {
+        fn presence(ctx: *Context, msg: message.Message) !void {
+            var owned = msg;
+            defer owned.deinit();
+
+            try std.testing.expect(ctx.pattern == null);
+            try std.testing.expectEqual(RouteKind.datagram, ctx.route_kind.?);
+            try ctx.requireRouteAccess();
+            try ctx.publish(.{
+                .subject = "presence.seen",
+                .body = owned.body,
+            });
+        }
+    };
+
+    try app.datagram("presence.*", Handler.presence);
+
+    const runtime = try app.openQuicSession(.{
+        .role = .server,
+        .transport = .{
+            .peer_id = "server-a",
+            .datagram_enabled = true,
+        },
+    });
+    try readyQuicRuntimeForTest(runtime, "client-a", true);
+    try runtime.appSession().replaceAuthorization(allocator, .{
+        .subject = "service:presence",
+        .issuer = "test",
+        .allowed_subjects = .{ .filters = &.{"presence.*"} },
+        .datagram_allowed = true,
+    });
+
+    try queueDatagramForTest(runtime, .{
+        .subject = "presence.ada",
+        .body = "online",
+        .flags = .{ .unreliable = true },
+    });
+
+    const result = try app.runOnce();
+    try std.testing.expect(result.didWork());
+    try std.testing.expectEqual(@as(usize, 0), runtime.datagramInboxLen());
+    try std.testing.expectEqual(@as(usize, 1), runtime.pendingDatagrams());
+    try std.testing.expectEqualStrings("presence.seen", runtime.datagram_outbox.items[0].subject);
+    try std.testing.expectEqualStrings("online", runtime.datagram_outbox.items[0].body);
 }
 
 test "App runOnce serves real req rep through inproc facade with handler auth check" {

@@ -7,6 +7,13 @@ const quic = qmsg.transport.quic;
 const quic_runtime = qmsg.transport.quic_runtime;
 const quic_streams = qmsg.transport.quic_streams;
 
+const loopback_client_addr: quic_runtime.Address = .{
+    .ipv4 = .{
+        .addr = .{ 127, 0, 0, 1 },
+        .port = 55_555,
+    },
+};
+
 const test_cert_pem =
     \\-----BEGIN CERTIFICATE-----
     \\MIIBnjCCAUOgAwIBAgIUFt1GU+R4bofYqJSYwkrpkAV20a8wCgYIKoZIzj0EAwIw
@@ -65,12 +72,11 @@ fn driveHandshake(
     listener: *quic_runtime.ListenerRuntime,
 ) !void {
     var rx: [8192]u8 = undefined;
-    const client_addr: quic_runtime.Address = .{ .bytes = @splat(0x71) };
 
     var step: u32 = 0;
     while (step < 32) : (step += 1) {
         const now_us: u64 = @as(u64, step + 1) * 1_000;
-        try drive(client, listener, &rx, client_addr, now_us);
+        try drive(client, listener, &rx, loopback_client_addr, now_us);
         if (client.connection().handshakeDone() and listener.connectionCount() == 1 and
             listener.connection(0).?.handshakeDone()) return;
     }
@@ -101,14 +107,13 @@ fn exchangeHello(
     try server_session.onQuicReady();
 
     var rx: [8192]u8 = undefined;
-    const client_addr: quic_runtime.Address = .{ .bytes = @splat(0x72) };
 
     _ = try client_session.sendLocalHelloOnStream(client.connection());
-    try drive(client, listener, &rx, client_addr, 100_000);
+    try drive(client, listener, &rx, loopback_client_addr, 100_000);
     try server_session.acceptPeerControlFromStream(listener.connection(0).?, quic.peerControlStreamId(.server), 64 * 1024);
 
     _ = try server_session.sendLocalHelloOnStream(listener.connection(0).?);
-    try drive(client, listener, &rx, client_addr, 101_000);
+    try drive(client, listener, &rx, loopback_client_addr, 101_000);
     try client_session.acceptPeerControlFromStream(client.connection(), quic.peerControlStreamId(.client), 64 * 1024);
 
     if (client_session.state() != .ready or server_session.state() != .ready) return error.InvalidState;
@@ -139,13 +144,12 @@ fn exchangeReqRep(
     defer request_receiver.deinit();
 
     var rx: [8192]u8 = undefined;
-    const client_addr: quic_runtime.Address = .{ .bytes = @splat(0x73) };
 
     var got_request: ?message.Message = null;
     var step: u32 = 0;
     while (step < 20_000 and got_request == null) : (step += 1) {
         _ = try request_sender.pump(&client_adapter);
-        try drive(client, listener, &rx, client_addr, 200_000 + @as(u64, step) * 1_000);
+        try drive(client, listener, &rx, loopback_client_addr, 200_000 + @as(u64, step) * 1_000);
         if (listener.connection(0).?.stream(stream_id) != null) {
             got_request = try request_receiver.pump(&server_adapter);
         }
@@ -170,7 +174,7 @@ fn exchangeReqRep(
     step = 0;
     while (step < 20_000 and got_reply == null) : (step += 1) {
         _ = try reply_sender.pump(&server_adapter);
-        try drive(client, listener, &rx, client_addr, 300_000 + @as(u64, step) * 1_000);
+        try drive(client, listener, &rx, loopback_client_addr, 300_000 + @as(u64, step) * 1_000);
         if (client.connection().stream(stream_id) != null) {
             got_reply = try reply_receiver.pump(&client_adapter);
         }

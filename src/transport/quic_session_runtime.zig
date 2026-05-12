@@ -4,12 +4,42 @@ const quic_zig = @import("quic_zig");
 const control = @import("../control.zig");
 const envelope = @import("../envelope.zig");
 const message = @import("../message.zig");
+const protocol = @import("../protocol/root.zig");
+const queue = @import("../queue.zig");
 const session_mod = @import("../session.zig");
 const quic = @import("quic.zig");
+const quic_cancel = @import("quic_cancel.zig");
+const quic_control = @import("quic_control.zig");
+const quic_datagram = @import("quic_datagram.zig");
 const quic_streams = @import("quic_streams.zig");
+
+const pushpull = protocol.pushpull;
+
+pub const Error = std.mem.Allocator.Error || error{
+    Canceled,
+    DeadlineExceeded,
+    EndpointClosed,
+    FlowControlled,
+    InvalidState,
+    MalformedFrame,
+    MessageTooLarge,
+    PeerClosed,
+    QueueFull,
+    StreamAlreadyOpen,
+    StreamNotFound,
+    StreamReset,
+    ConnectionLost,
+    UnsupportedTransport,
+};
+
+pub const DatagramSendOptions = quic_datagram.SendOptions;
+pub const DatagramReceiveOptions = quic_datagram.ReceiveOptions;
+pub const DatagramSendResult = quic_datagram.SendResult;
+pub const ReceivedDatagram = quic_datagram.ReceivedDatagram;
 
 pub const PumpResult = struct {
     control_frames_read: usize = 0,
+    control_flush_complete: usize = 0,
     reliable_sent_complete: usize = 0,
     reliable_received: usize = 0,
 };
@@ -35,6 +65,7 @@ pub const QuicSessionRuntime = struct {
     session: quic.QuicSession,
     stream_ids: quic_streams.StreamIdAllocator,
     control_sender: ?quic_streams.ControlStreamSender = null,
+    control_flush_sender: ?quic_control.FlushSender = null,
     control_receiver: ?quic_streams.ControlStreamReceiver = null,
     reliable_senders: std.AutoHashMap(u64, quic_streams.ReliableMessageSender),
     reliable_receivers: std.AutoHashMap(u64, quic_streams.ReliableMessageReceiver),
@@ -47,10 +78,14 @@ pub const QuicSessionRuntime = struct {
         role: quic.Role,
         options: quic.QuicOptions,
     ) !QuicSessionRuntime {
+        var stream_ids = quic_streams.StreamIdAllocator.init(streamRole(role));
+        const hello_stream_id = try stream_ids.nextUni();
+        std.debug.assert(hello_stream_id == quic.localControlStreamId(role));
+
         return .{
             .allocator = allocator,
             .session = try quic.QuicSession.init(allocator, session_id, role, options),
-            .stream_ids = quic_streams.StreamIdAllocator.init(streamRole(role)),
+            .stream_ids = stream_ids,
             .reliable_senders = std.AutoHashMap(u64, quic_streams.ReliableMessageSender).init(allocator),
             .reliable_receivers = std.AutoHashMap(u64, quic_streams.ReliableMessageReceiver).init(allocator),
             .envelope_codec = envelopeCodecFromOptions(options),
@@ -59,6 +94,7 @@ pub const QuicSessionRuntime = struct {
 
     pub fn deinit(self: *QuicSessionRuntime) void {
         if (self.control_sender) |*sender| sender.deinit();
+        if (self.control_flush_sender) |*sender| sender.deinit();
         if (self.control_receiver) |*receiver| receiver.deinit();
 
         var senders = self.reliable_senders.valueIterator();
@@ -88,6 +124,39 @@ pub const QuicSessionRuntime = struct {
         return self.session.state();
     }
 
+    pub fn isClosing(self: QuicSessionRuntime) bool {
+        return self.session.state() == .closing;
+    }
+
+    pub fn isClosed(self: QuicSessionRuntime) bool {
+        return self.session.state() == .closed;
+    }
+
+    pub fn isClosingOrClosed(self: QuicSessionRuntime) bool {
+        return self.isClosing() or self.isClosed();
+    }
+
+    pub fn ensureOpen(self: QuicSessionRuntime) Error!void {
+        if (self.isClosingOrClosed()) return error.EndpointClosed;
+    }
+
+    pub fn beginClosing(self: *QuicSessionRuntime) void {
+        if (!self.isClosed()) self.session.state_value = .closing;
+    }
+
+    pub fn markClosed(self: *QuicSessionRuntime) void {
+        self.session.close();
+    }
+
+    pub fn closeConnection(
+        self: *QuicSessionRuntime,
+        conn: anytype,
+        intent: quic_cancel.CloseIntent,
+    ) void {
+        self.beginClosing();
+        quic_cancel.closeConnection(conn, intent);
+    }
+
     pub fn peerId(self: QuicSessionRuntime) []const u8 {
         return self.session.peerId();
     }
@@ -99,7 +168,7 @@ pub const QuicSessionRuntime = struct {
     }
 
     pub fn queueReliable(self: *QuicSessionRuntime, outgoing: message.OutgoingMessage) !u64 {
-        if (self.session.state() != .ready) return error.InvalidState;
+        try self.ensureReadyForApplicationData();
 
         const stream_id = try self.stream_ids.nextBidi();
         try self.queueReliableOnStream(stream_id, outgoing, .{});
@@ -116,7 +185,7 @@ pub const QuicSessionRuntime = struct {
         outgoing: message.OutgoingMessage,
         options: quic_streams.ReliableWriteOptions,
     ) !void {
-        if (self.session.state() != .ready) return error.InvalidState;
+        try self.ensureReadyForApplicationData();
         if (self.reliable_senders.contains(stream_id)) return error.StreamAlreadyOpen;
 
         var sender = try quic_streams.ReliableMessageSender.init(
@@ -140,7 +209,7 @@ pub const QuicSessionRuntime = struct {
     }
 
     pub fn acceptReliableStream(self: *QuicSessionRuntime, stream_id: u64) !void {
-        if (self.session.state() != .ready) return error.InvalidState;
+        try self.ensureReadyForApplicationData();
         if (self.reliable_receivers.contains(stream_id)) return error.StreamAlreadyOpen;
 
         const receiver = quic_streams.ReliableMessageReceiver.init(
@@ -149,6 +218,102 @@ pub const QuicSessionRuntime = struct {
             self.envelope_codec,
         );
         try self.reliable_receivers.put(stream_id, receiver);
+    }
+
+    pub fn queueSubscribe(
+        self: *QuicSessionRuntime,
+        control_state: *quic_control.State,
+        filter: []const u8,
+        options: queue.QueueOptions,
+    ) !void {
+        try self.ensureReadyForApplicationData();
+        try control_state.queueSubscribe(filter, options);
+    }
+
+    pub fn queueUnsubscribe(
+        self: *QuicSessionRuntime,
+        control_state: *quic_control.State,
+        filter: []const u8,
+    ) !void {
+        try self.ensureReadyForApplicationData();
+        try control_state.queueUnsubscribe(filter);
+    }
+
+    pub fn queueCredit(
+        self: *QuicSessionRuntime,
+        control_state: *quic_control.State,
+        subject_filter: []const u8,
+        credit: pushpull.Credit,
+    ) !void {
+        try self.ensureReadyForApplicationData();
+        try control_state.queueCredit(subject_filter, credit);
+    }
+
+    pub fn flushQueuedControl(
+        self: *QuicSessionRuntime,
+        control_state: *quic_control.State,
+    ) !?u64 {
+        try self.ensureReadyForApplicationData();
+        if (self.control_sender != null) return error.InvalidState;
+        if (control_state.queuedFrameCount() == 0) return null;
+        if (self.control_flush_sender != null) return error.InvalidState;
+
+        const stream_id = try self.stream_ids.nextUni();
+        var sender = try control_state.initFlushSender(
+            stream_id,
+            self.session.options.control_codec,
+            .{},
+        );
+        errdefer sender.deinit();
+
+        self.control_flush_sender = sender;
+        return stream_id;
+    }
+
+    pub fn sendDatagram(
+        self: *QuicSessionRuntime,
+        conn: anytype,
+        outgoing: message.OutgoingMessage,
+        options: DatagramSendOptions,
+    ) !DatagramSendResult {
+        try self.ensureReadyForApplicationData();
+        if (!self.session.session.datagram_enabled) {
+            if (quic_datagram.shouldUseReliableFallback(error.DatagramUnavailable, options.fallback)) {
+                return .use_reliable_fallback;
+            }
+            return error.UnsupportedTransport;
+        }
+
+        const payload = quic_datagram.encode(self.allocator, outgoing, options.codec) catch |err| {
+            if (quic_datagram.shouldUseReliableFallback(err, options.fallback)) return .use_reliable_fallback;
+            return mapDatagramError(err);
+        };
+        defer self.allocator.free(payload);
+
+        conn.sendDatagram(payload) catch |err| {
+            if (quic_datagram.shouldUseReliableFallback(err, options.fallback)) return .use_reliable_fallback;
+            return mapDatagramError(quic_datagram.mapSendError(err, options.queue_full_mapping));
+        };
+
+        return .sent_datagram;
+    }
+
+    pub fn receiveDatagram(
+        self: *QuicSessionRuntime,
+        conn: anytype,
+        options: DatagramReceiveOptions,
+    ) !?ReceivedDatagram {
+        try self.ensureReadyForApplicationData();
+        if (!self.session.session.datagram_enabled) return error.UnsupportedTransport;
+
+        const scratch_len = try quic_datagram.receiveScratchLen(options.codec);
+        const scratch = try self.allocator.alloc(u8, scratch_len);
+        defer self.allocator.free(scratch);
+
+        const info = conn.receiveDatagramInfo(scratch) orelse return null;
+        return quic_datagram.decodeIncomingDatagram(self.allocator, info, scratch, options) catch |err| {
+            return mapDatagramError(err);
+        };
     }
 
     pub fn acceptPeerBidiStreamsConnection(self: *QuicSessionRuntime, conn: *quic_zig.Connection) !usize {
@@ -189,6 +354,14 @@ pub const QuicSessionRuntime = struct {
             if (try sender.pump(transport) == .complete) {
                 sender.deinit();
                 self.control_sender = null;
+            }
+        }
+
+        if (self.control_flush_sender) |*sender| {
+            if (try sender.pump(transport) == .complete) {
+                sender.deinit();
+                self.control_flush_sender = null;
+                result.control_flush_complete += 1;
             }
         }
 
@@ -241,6 +414,15 @@ pub const QuicSessionRuntime = struct {
 
     pub fn hasControlReceiver(self: QuicSessionRuntime) bool {
         return self.control_receiver != null;
+    }
+
+    pub fn hasControlFlushSender(self: QuicSessionRuntime) bool {
+        return self.control_flush_sender != null;
+    }
+
+    fn ensureReadyForApplicationData(self: QuicSessionRuntime) Error!void {
+        try self.ensureOpen();
+        if (self.session.state() != .ready) return error.InvalidState;
     }
 
     fn armPeerControlReceiver(self: *QuicSessionRuntime) !void {
@@ -335,6 +517,50 @@ pub const QuicSessionRuntime = struct {
         return received_count;
     }
 };
+
+pub fn mapStreamError(err: anyerror) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Canceled => error.Canceled,
+        error.DeadlineExceeded => error.DeadlineExceeded,
+        error.EndpointClosed => error.EndpointClosed,
+        error.FlowControlled => error.FlowControlled,
+        error.StreamLimitExceeded => error.FlowControlled,
+        error.InvalidState => error.InvalidState,
+        error.MessageTooLarge => error.MessageTooLarge,
+        error.PeerClosed => error.PeerClosed,
+        error.QueueFull => error.QueueFull,
+        error.StreamAlreadyOpen => error.StreamAlreadyOpen,
+        error.StreamNotFound => error.StreamNotFound,
+        error.StreamReset => error.StreamReset,
+        error.ConnectionLost => error.ConnectionLost,
+        else => error.InvalidState,
+    };
+}
+
+pub fn mapDatagramError(err: anyerror) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.DatagramUnavailable,
+        error.UnsupportedTransport,
+        => error.UnsupportedTransport,
+        error.DatagramTooLarge,
+        error.HeaderBytesLimitExceeded,
+        error.HeaderLimitExceeded,
+        error.MessageTooLarge,
+        => error.MessageTooLarge,
+        error.DatagramQueueFull,
+        error.QueueFull,
+        => error.QueueFull,
+        error.FlowControlled => error.FlowControlled,
+        error.InvalidMessage,
+        error.InvalidSubject,
+        error.MalformedFrame,
+        => error.MalformedFrame,
+        error.EndpointClosed => error.EndpointClosed,
+        else => error.InvalidState,
+    };
+}
 
 fn streamRole(role: quic.Role) quic_streams.Role {
     return switch (role) {
@@ -474,6 +700,69 @@ const FakeTransport = struct {
     }
 };
 
+const FakeCloseConn = struct {
+    close_is_transport: bool = false,
+    close_code: u64 = 0,
+    close_reason: []const u8 = "",
+
+    pub fn close(self: *FakeCloseConn, is_transport: bool, code: u64, reason: []const u8) void {
+        self.close_is_transport = is_transport;
+        self.close_code = code;
+        self.close_reason = reason;
+    }
+};
+
+const FakeDatagramInfo = struct {
+    len: usize,
+    arrived_in_early_data: bool = false,
+};
+
+const FakeDatagramConn = struct {
+    allocator: std.mem.Allocator,
+    sent: std.ArrayList(u8) = .empty,
+    send_mode: SendMode = .ok,
+    incoming: []const u8 = &.{},
+    incoming_early: bool = false,
+    incoming_read: bool = false,
+
+    const SendMode = enum {
+        ok,
+        unavailable,
+        too_large,
+        queue_full,
+    };
+
+    fn deinit(self: *FakeDatagramConn) void {
+        self.sent.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn sendDatagram(
+        self: *FakeDatagramConn,
+        payload: []const u8,
+    ) error{ OutOfMemory, DatagramUnavailable, DatagramTooLarge, DatagramQueueFull }!void {
+        switch (self.send_mode) {
+            .ok => {},
+            .unavailable => return error.DatagramUnavailable,
+            .too_large => return error.DatagramTooLarge,
+            .queue_full => return error.DatagramQueueFull,
+        }
+        try self.sent.appendSlice(self.allocator, payload);
+    }
+
+    pub fn receiveDatagramInfo(self: *FakeDatagramConn, dst: []u8) ?FakeDatagramInfo {
+        if (self.incoming_read or self.incoming.len == 0) return null;
+        self.incoming_read = true;
+
+        const copied = @min(dst.len, self.incoming.len);
+        @memcpy(dst[0..copied], self.incoming[0..copied]);
+        return .{
+            .len = self.incoming.len,
+            .arrived_in_early_data = self.incoming_early,
+        };
+    }
+};
+
 fn pumpBoth(
     client: *QuicSessionRuntime,
     client_io: *FakeTransport,
@@ -486,6 +775,19 @@ fn pumpBoth(
     try server_io.takeWrites(quic.localControlStreamId(.server), client_io);
     _ = try client.pump(client_io);
     _ = try server.pump(server_io);
+}
+
+fn readyRuntimePair(
+    client: *QuicSessionRuntime,
+    client_io: *FakeTransport,
+    server: *QuicSessionRuntime,
+    server_io: *FakeTransport,
+) !void {
+    try client.onQuicReady();
+    try server.onQuicReady();
+    try pumpBoth(client, client_io, server, server_io);
+    try std.testing.expectEqual(quic.State.ready, client.state());
+    try std.testing.expectEqual(quic.State.ready, server.state());
 }
 
 test "session runtime exchanges HELLO and reaches ready" {
@@ -514,6 +816,90 @@ test "session runtime exchanges HELLO and reaches ready" {
     try std.testing.expectEqualStrings("client-a", server.peerId());
     try std.testing.expect(!client.hasControlSender());
     try std.testing.expect(!client.hasControlReceiver());
+}
+
+test "session runtime flushes queued pubsub and credit frames on follow-up control stream" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .client, .{ .peer_id = "client-a" });
+    defer runtime.deinit();
+    var peer = try QuicSessionRuntime.init(allocator, 2, .server, .{ .peer_id = "server-a" });
+    defer peer.deinit();
+    var io = FakeTransport.init(allocator);
+    defer io.deinit();
+    var peer_io = FakeTransport.init(allocator);
+    defer peer_io.deinit();
+    try readyRuntimePair(&runtime, &io, &peer, &peer_io);
+
+    var registry = protocol.pubsub.Registry.init(allocator);
+    defer registry.deinit();
+    var ledger = pushpull.CreditLedger.init(allocator);
+    defer ledger.deinit();
+    var control_state = quic_control.State.init(allocator, &registry, &ledger, .{});
+    defer control_state.deinit();
+
+    try runtime.queueSubscribe(&control_state, "jobs.*", .{ .on_full = .drop_newest });
+    try runtime.queueUnsubscribe(&control_state, "jobs.old");
+    try runtime.queueCredit(&control_state, "pull.*", .{ .messages = 4, .bytes = 512 });
+
+    const stream_id = (try runtime.flushQueuedControl(&control_state)).?;
+    try std.testing.expectEqual(@as(u64, quic.localControlStreamId(.client) + 4), stream_id);
+    try std.testing.expect(runtime.hasControlFlushSender());
+
+    try runtime.queueSubscribe(&control_state, "later.*", .{});
+    const result = try runtime.pump(&io);
+
+    try std.testing.expectEqual(@as(usize, 1), result.control_flush_complete);
+    try std.testing.expect(!runtime.hasControlFlushSender());
+    try std.testing.expectEqual(@as(usize, 1), control_state.queuedFrameCount());
+    try std.testing.expectEqual(control.Tag.subscribe, std.meta.activeTag(control_state.queuedFrames()[0]));
+    try std.testing.expectEqualStrings("later.*", control_state.queuedFrames()[0].subscribe.filter);
+
+    const stream = io.streams.get(stream_id) orelse return error.StreamNotFound;
+    try std.testing.expect(stream.opened_uni);
+    try std.testing.expect(stream.finished);
+
+    try io.takeWrites(stream_id, &peer_io);
+    var receiver = quic_streams.ControlStreamReceiver.init(allocator, stream_id, .{});
+    defer receiver.deinit();
+
+    var frames: std.ArrayList(control.Frame) = .empty;
+    defer {
+        for (frames.items) |*frame| frame.deinit();
+        frames.deinit(allocator);
+    }
+
+    const read = try receiver.pump(&peer_io, &frames);
+    try std.testing.expect(read.stream_complete);
+    try std.testing.expectEqual(@as(usize, 3), frames.items.len);
+    try std.testing.expectEqual(control.Tag.subscribe, std.meta.activeTag(frames.items[0]));
+    try std.testing.expectEqualStrings("jobs.*", frames.items[0].subscribe.filter);
+    try std.testing.expectEqual(control.Tag.unsubscribe, std.meta.activeTag(frames.items[1]));
+    try std.testing.expectEqualStrings("jobs.old", frames.items[1].unsubscribe.filter);
+    try std.testing.expectEqual(control.Tag.credit, std.meta.activeTag(frames.items[2]));
+    try std.testing.expectEqualStrings("pull.*", frames.items[2].credit.subject_filter);
+    try std.testing.expectEqual(@as(u64, 4), frames.items[2].credit.messages);
+    try std.testing.expectEqual(@as(u64, 512), frames.items[2].credit.bytes);
+}
+
+test "session runtime control flush is gated until ready and idle" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .client, .{ .peer_id = "client-a" });
+    defer runtime.deinit();
+
+    var registry = protocol.pubsub.Registry.init(allocator);
+    defer registry.deinit();
+    var ledger = pushpull.CreditLedger.init(allocator);
+    defer ledger.deinit();
+    var control_state = quic_control.State.init(allocator, &registry, &ledger, .{});
+    defer control_state.deinit();
+
+    try std.testing.expectError(error.InvalidState, runtime.queueSubscribe(&control_state, "jobs.*", .{}));
+
+    try runtime.onQuicReady();
+    try control_state.queueSubscribe("jobs.*", .{});
+    try std.testing.expectError(error.InvalidState, runtime.flushQueuedControl(&control_state));
 }
 
 test "session runtime cleans up completed reliable sender" {
@@ -637,6 +1023,149 @@ test "session runtime replies on an accepted peer stream" {
     var owned = received.takeMessage();
     defer owned.deinit();
     try std.testing.expectEqualStrings("jobs.run", owned.subject);
+}
+
+test "session runtime datagram helpers encode decode and map send backpressure" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .client, .{
+        .peer_id = "client-a",
+        .datagram_enabled = true,
+    });
+    defer runtime.deinit();
+    var peer = try QuicSessionRuntime.init(allocator, 2, .server, .{
+        .peer_id = "server-a",
+        .datagram_enabled = true,
+    });
+    defer peer.deinit();
+    var io = FakeTransport.init(allocator);
+    defer io.deinit();
+    var peer_io = FakeTransport.init(allocator);
+    defer peer_io.deinit();
+    try readyRuntimePair(&runtime, &io, &peer, &peer_io);
+    try std.testing.expect(runtime.appSession().datagram_enabled);
+
+    var datagrams: FakeDatagramConn = .{ .allocator = allocator };
+    defer datagrams.deinit();
+
+    try std.testing.expectEqual(
+        DatagramSendResult.sent_datagram,
+        try runtime.sendDatagram(&datagrams, .{
+            .subject = "presence.ada",
+            .id = 7,
+            .flags = .{ .unreliable = true },
+            .body = "online",
+        }, .{ .codec = .{ .max_payload_size = 256 } }),
+    );
+
+    var sent = try quic_datagram.decode(allocator, datagrams.sent.items, .{ .max_payload_size = 256 });
+    defer sent.deinit();
+    try std.testing.expectEqual(@as(message.MessageId, 7), sent.id);
+    try std.testing.expect(sent.flags.unreliable);
+    try std.testing.expectEqualStrings("presence.ada", sent.subject);
+    try std.testing.expectEqualStrings("online", sent.body);
+
+    const encoded = try quic_datagram.encode(allocator, .{
+        .subject = "presence.bob",
+        .id = 8,
+        .flags = .{ .unreliable = true },
+        .body = "away",
+    }, .{ .max_payload_size = 256 });
+    defer allocator.free(encoded);
+
+    datagrams.incoming = encoded;
+    datagrams.incoming_early = true;
+    var received = (try runtime.receiveDatagram(&datagrams, .{
+        .codec = .{ .max_payload_size = 256 },
+    })).?;
+    defer received.deinit();
+    try std.testing.expect(received.arrived_in_early_data);
+    try std.testing.expectEqual(@as(message.MessageId, 8), received.message.id);
+    try std.testing.expectEqualStrings("presence.bob", received.message.subject);
+    try std.testing.expectEqualStrings("away", received.message.body);
+
+    datagrams.send_mode = .queue_full;
+    try std.testing.expectError(error.FlowControlled, runtime.sendDatagram(&datagrams, .{
+        .subject = "presence.ada",
+        .flags = .{ .unreliable = true },
+    }, .{
+        .codec = .{ .max_payload_size = 256 },
+        .queue_full_mapping = .flow_controlled,
+    }));
+}
+
+test "session runtime datagram helpers honor negotiated support and fallback policy" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .client, .{
+        .peer_id = "client-a",
+        .datagram_enabled = false,
+    });
+    defer runtime.deinit();
+    var peer = try QuicSessionRuntime.init(allocator, 2, .server, .{
+        .peer_id = "server-a",
+        .datagram_enabled = false,
+    });
+    defer peer.deinit();
+    var io = FakeTransport.init(allocator);
+    defer io.deinit();
+    var peer_io = FakeTransport.init(allocator);
+    defer peer_io.deinit();
+    try readyRuntimePair(&runtime, &io, &peer, &peer_io);
+
+    var datagrams: FakeDatagramConn = .{ .allocator = allocator };
+    defer datagrams.deinit();
+
+    try std.testing.expectError(error.UnsupportedTransport, runtime.sendDatagram(&datagrams, .{
+        .subject = "presence.ada",
+        .flags = .{ .unreliable = true },
+    }, .{}));
+
+    try std.testing.expectEqual(
+        DatagramSendResult.use_reliable_fallback,
+        try runtime.sendDatagram(&datagrams, .{
+            .subject = "presence.ada",
+            .flags = .{ .unreliable = true },
+        }, .{ .fallback = .allow_reliable }),
+    );
+}
+
+test "session runtime lifecycle helpers reject new application work while closing" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .client, .{ .peer_id = "client-a" });
+    defer runtime.deinit();
+
+    runtime.beginClosing();
+    try std.testing.expect(runtime.isClosing());
+    try std.testing.expect(runtime.isClosingOrClosed());
+    try std.testing.expectError(error.EndpointClosed, runtime.queueReliable(.{
+        .subject = "pair.echo",
+        .body = "ping",
+    }));
+
+    var conn: FakeCloseConn = .{};
+    runtime.closeConnection(&conn, .graceful_shutdown);
+    try std.testing.expect(!conn.close_is_transport);
+    try std.testing.expectEqual(quic_cancel.AppErrorCode.graceful_shutdown, conn.close_code);
+    try std.testing.expectEqualStrings("qmsg shutdown", conn.close_reason);
+
+    runtime.markClosed();
+    try std.testing.expect(runtime.isClosed());
+    try std.testing.expectError(error.EndpointClosed, runtime.ensureOpen());
+}
+
+test "session runtime exposes stable stream and datagram error mapping" {
+    try std.testing.expectEqual(error.StreamNotFound, mapStreamError(error.StreamNotFound));
+    try std.testing.expectEqual(error.StreamReset, mapStreamError(error.StreamReset));
+    try std.testing.expectEqual(error.ConnectionLost, mapStreamError(error.ConnectionLost));
+    try std.testing.expectEqual(error.FlowControlled, mapStreamError(error.StreamLimitExceeded));
+
+    try std.testing.expectEqual(error.UnsupportedTransport, mapDatagramError(error.DatagramUnavailable));
+    try std.testing.expectEqual(error.MessageTooLarge, mapDatagramError(error.DatagramTooLarge));
+    try std.testing.expectEqual(error.MessageTooLarge, mapDatagramError(error.HeaderLimitExceeded));
+    try std.testing.expectEqual(error.QueueFull, mapDatagramError(error.DatagramQueueFull));
+    try std.testing.expectEqual(error.MalformedFrame, mapDatagramError(error.InvalidMessage));
 }
 
 test "session runtime gates reliable streams until ready" {

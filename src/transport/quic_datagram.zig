@@ -274,7 +274,7 @@ fn decodePayloadWithEarlyData(
     };
 }
 
-fn receiveScratchLen(options: CodecOptions) ReceiveError!usize {
+pub fn receiveScratchLen(options: CodecOptions) ReceiveError!usize {
     return addSize(options.max_payload_size, 1) catch error.MessageTooLarge;
 }
 

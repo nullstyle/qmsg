@@ -54,12 +54,14 @@ across qmsg-owned transport modules:
 - bounded HELLO challenge encode/decode and validation hooks;
 - hermetic tests that drive quic-zig handshake, qmsg HELLO, pair-style
   streams, and req/rep over a qmsg runtime wrapper;
-- a one-process `quic-runtime-reqrep` smoke example.
+- one-process `quic-runtime-reqrep` and `quic-app-dispatch` smoke examples;
+- an environment-dependent Node/App UDP localhost smoke example.
 
 This is still not the final network transport. qmsg has the low-level UDP and
-session-driver pieces and `Node` now owns listener/client tick wiring, but it
-does not yet expose public QUIC socket convenience APIs, provide live-UDP
-examples, or automatically flush SUBSCRIBE/CREDIT state over live sessions.
+session-driver pieces and `Node` now owns listener/client tick wiring, socket
+attachment helpers, reliable message dispatch, and decoded datagram queues.
+It does not yet expose public QUIC socket convenience APIs or automatically
+flush SUBSCRIBE/CREDIT state over live sessions.
 
 ## Current Embedding Examples
 
@@ -76,11 +78,30 @@ They show the library surfaces that are present today:
 - `examples/app_ergonomics.zig` shows the handler facade over inproc req/rep.
   The same handler dispatch shape is available to QUIC drivers through
   `App.dispatchQuic` after they have decoded a qmsg message.
+- `examples/quic_app_dispatch.zig` shows that decoded reliable stream and
+  datagram messages can be dispatched through `App` without any live socket.
+- `examples/quic_node_localhost.zig` exercises `App.listenQuic`,
+  `Node.dialQuic`, and the Node-owned UDP tick loop on localhost. It queues a
+  reliable request directly on the current session runtime. It is opt-in via
+  `QMSG_RUN_LIVE_UDP=1` because some sandboxes deny UDP binds and Zig's bind
+  path may print diagnostics before returning the denial.
 
-Actual UDP localhost examples for `App.listenQuic` or `Socket.listen(.quic)`
-remain pending. `Node.listenQuic`/`dialQuic` now own UDP sockets and session
-drivers, but `Socket.listen(.quic)`/`dial(.quic)` are still explicit
+These are library examples, not `qmsg-server`/`qmsg-client` product binaries.
+`Socket.listen(.quic)`/`dial(.quic)` are still explicit
 `UnsupportedTransport` paths until the public convenience spelling is chosen.
+
+Node/socket attachment now uses a borrowed socket endpoint:
+
+```zig
+const session_id = try node.dialQuic("127.0.0.1:4433", .{
+    .server_name = "localhost",
+});
+
+try node.attachQuicSocket(session_id, req_socket.quicEndpoint());
+```
+
+`Node` owns UDP/session polling and supplies the outbound session driver.
+Sockets own pattern state, deadlines, queues, and request correlation.
 
 ## Build Integration
 

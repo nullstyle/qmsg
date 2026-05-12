@@ -71,7 +71,12 @@ pub const QuicSendFn = socket.QuicSendFn;
 pub const QuicAcceptsFn = socket.QuicAcceptsFn;
 pub const QuicPeer = socket.QuicPeer;
 pub const QuicSessionDriver = socket.QuicSessionDriver;
+pub const QuicSocketEndpoint = socket.QuicSocketEndpoint;
 pub const QuicSocketSession = socket.QuicSession;
+pub const QuicSocketAttachment = node.QuicSocketAttachment;
+pub const HelloChallengeConfig = auth.HelloChallengeConfig;
+pub const HelloChallengeBinding = auth.HelloChallengeBinding;
+pub const HelloChallengeState = auth.HelloChallengeState;
 
 pub const Error = error{
     InvalidSubject,

@@ -46,9 +46,11 @@ incremental control/reliable stream pumps, cancellation/error mapping,
 compact DATAGRAM envelope helpers, and hermetic tests that drive quic-zig
 handshake, qmsg HELLO, and reliable req/rep over QUIC streams. Wiring these
 pieces into `Node.listenQuic`/`dialQuic` runtime loops has started: `Node`
-owns UDP listener/client sockets, per-session drivers, and tick-driven
-reliable stream pumping. Public `Socket.listen(.quic)`/`dial(.quic)`
-convenience APIs and live UDP examples remain future work.
+owns UDP listener/client sockets, per-session drivers, socket attachment
+helpers, tick-driven reliable stream pumping, and decoded datagram dispatch
+queues. An opt-in Node/App localhost example exercises the live UDP loop by
+queuing a reliable message directly on the current session runtime. Public
+`Socket.listen(.quic)`/`dial(.quic)` convenience APIs remain future work.
 
 ## Package Use
 
@@ -191,13 +193,19 @@ var reply = try req.recv();
 
 For App embedding, a session driver that has already decoded a reliable stream
 or datagram can call `dispatchQuic`, `dispatchQuicReliable`, or
-`dispatchQuicDatagram` and encode any returned replies/publications. See
-[examples/quic_socket_hooks.zig](examples/quic_socket_hooks.zig) for a
-buildable fake-driver req/rep flow using the current socket hooks.
+`dispatchQuicDatagram` and encode any returned replies/publications.
+
+See [examples/quic_socket_hooks.zig](examples/quic_socket_hooks.zig) for a
+buildable fake-driver req/rep flow using the current socket hooks, and
+[examples/quic_app_dispatch.zig](examples/quic_app_dispatch.zig) for the
+decoded App reliable/datagram dispatch surface.
 
 ## QUIC Runtime Smoke
 
-The current QUIC smoke example is intentionally one process: it drives
+The current QUIC examples are library examples, not `qmsg-server` or
+`qmsg-client` binaries.
+
+The hermetic runtime smoke is intentionally one process: it drives
 `quic_zig.Client` and `quic_zig.Server` through qmsg's runtime wrappers, then
 exchanges qmsg HELLO and one reliable req/rep stream.
 
@@ -207,15 +215,31 @@ zig build examples
 ```
 
 That path proves the qmsg protocol mapping without requiring live UDP sockets.
-The lower-level `transport.quic_udp` owner and
-`transport.quic_session_runtime` driver are now wired into the `Node` tick
-surface for listeners/dialers, while the public socket convenience APIs still
-stay explicit about unsupported direct `.quic` endpoints.
 
-A real UDP localhost App/Socket example is pending until the Node loop is
-covered in an environment that permits UDP binds and the public socket
-convenience API is chosen. Until then, examples stay scoped to embeddable
-runtime pieces, Node-owned transport plumbing, and public hook contracts.
+The decoded App dispatch smoke stays hermetic as well:
+
+```sh
+./zig-out/bin/quic-app-dispatch
+```
+
+The live localhost smoke uses `App.listenQuic`, `Node.dialQuic`, and the
+Node-owned UDP tick loop. It is opt-in because some CI/sandboxed environments
+do not permit UDP binds. When enabled, it queues one reliable message directly
+on the session runtime and lets `App.runOnce` dispatch the server-side request.
+
+```sh
+QMSG_RUN_LIVE_UDP=1 ./zig-out/bin/quic-node-localhost
+```
+
+Without the environment variable, the example exits cleanly without opening a
+socket:
+
+```sh
+./zig-out/bin/quic-node-localhost
+```
+
+The public socket convenience APIs still stay explicit about unsupported
+direct `.quic` endpoints.
 
 ## Design Tenets
 

@@ -156,12 +156,23 @@ challenge-bound credentials but no nonce/challenge was installed. The purpose is
 to stop a token minted for one protocol, listener, or audience from being
 replayed as a valid `qmsg` credential somewhere else.
 
+`auth.HelloChallengeConfig` is the listener-side template for server challenges:
+it carries the per-listener `HelloAuthContext`, challenge length, and hard
+maximum, and exposes stable `HelloChallengeError` / `HelloBindingError` results
+for minting and installation failures. `mintState()` returns the lower-level
+`auth.HelloChallengeState`; `mintBinding()` returns an
+`auth.HelloChallengeBinding` that keeps the state and installed `AuthConfig`
+together.
+
 `auth.HelloChallengeState` is the transport-independent pre-auth helper for
 server-side challenges. It mints and owns bounded challenge bytes, exposes
 `challenge()` for advertisement in HELLO/auth negotiation, installs a
 `require_challenge` binding into an `AuthConfig`, and invalidates the bytes with
 `consume()` or `discard()`. After invalidation, `install()` and
 `bindingPolicy()` fail closed with `ChallengeRequired`.
+`auth.HelloChallengeBinding.consume()` / `.discard()` also clear the installed
+config's challenge context and leave `AuthConfig.hello_binding` requiring a
+missing challenge, so accidental reuse through `authConfig()` fails closed.
 
 `control.Hello.auth.challenge` is an advertisement/propagation hook for
 transports. It is encoded only when non-empty and bounded by
@@ -325,8 +336,12 @@ For service-to-service deployments, the clean model is:
 The core API now carries this hook in the HELLO auth surface:
 
 - mint bounded bytes with `auth.allocHelloChallenge` or `auth.fillHelloChallenge`;
-- or hold the per-session nonce in `auth.HelloChallengeState`, which can mint
-  the bytes, install `AuthConfig.hello_binding`, and later consume/discard them;
+- or configure a listener with `auth.HelloChallengeConfig` and call
+  `mintBinding()` per accepted session to get both the advertised bytes and an
+  `AuthConfig` copy with `hello_binding` installed;
+- or hold the per-session nonce directly in `auth.HelloChallengeState`, which
+  can mint the bytes, install `AuthConfig.hello_binding`, and later
+  consume/discard them;
 - advertise them in the outgoing `control.Hello.auth.challenge`;
 - retain the same bytes in local pre-auth state and install them as
   `AuthConfig.hello_binding.context.challenge` before verifying the peer's
@@ -334,7 +349,9 @@ The core API now carries this hook in the HELLO auth surface:
 - pass the decoded peer `hello.auth.challenge` to the local token provider when
   minting an outbound credential for that peer;
 - consume or discard the local challenge after `Session.authenticateHello`
-  succeeds or fails.
+  succeeds or fails. If using `auth.HelloChallengeBinding`, call
+  `consume()`/`discard()` on the binding so the installed config is invalidated
+  with the challenge.
 
 The QUIC adapter still needs to wire those hooks into its per-connection state.
 

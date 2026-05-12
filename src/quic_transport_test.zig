@@ -23,6 +23,13 @@ fn defaultParams() quic_zig.tls.TransportParams {
     };
 }
 
+fn testAddress(octet: u8, port: u16) quic_runtime.Address {
+    return .{ .ipv4 = .{
+        .addr = .{ 127, 0, 0, octet },
+        .port = port,
+    } };
+}
+
 fn pumpClientToServer(
     cli: *quic_zig.Client,
     srv: *quic_zig.Server,
@@ -107,7 +114,7 @@ fn driveRuntimeReady(
     listener: *quic_runtime.ListenerRuntime,
 ) !void {
     var rx: [8192]u8 = undefined;
-    const client_addr: quic_runtime.Address = .{ .bytes = @splat(0x61) };
+    const client_addr = testAddress(0x61, 4433);
 
     var step: u32 = 0;
     while (step < 32) : (step += 1) {
@@ -145,7 +152,7 @@ fn driveHermeticQuicReady(
     defer cli.deinit();
 
     var rx: [4096]u8 = undefined;
-    const peer_addr: quic_zig.conn.path.Address = .{ .bytes = @splat(0x51) };
+    const peer_addr = testAddress(0x51, 4433);
     try cli.conn.advance();
 
     var rounds_to_handshake: u32 = 0;
@@ -183,7 +190,7 @@ fn driveHermeticQuicReady(
 const HermeticQuicPair = struct {
     srv: quic_zig.Server,
     cli: quic_zig.Client,
-    peer_addr: quic_zig.conn.path.Address = .{ .bytes = @splat(0x53) },
+    peer_addr: quic_zig.conn.path.Address = testAddress(0x53, 4433),
 
     fn init(allocator: std.mem.Allocator) !HermeticQuicPair {
         const protos = [_][]const u8{quic.alpn};
@@ -304,7 +311,7 @@ test "qmsg QUIC sessions exchange HELLO over real QUIC uni streams" {
     defer cli.deinit();
 
     var rx: [8192]u8 = undefined;
-    const peer_addr: quic_zig.conn.path.Address = .{ .bytes = @splat(0x52) };
+    const peer_addr = testAddress(0x52, 4433);
     try cli.conn.advance();
 
     var step: u32 = 0;
@@ -546,7 +553,7 @@ test "runtime wrappers drive qmsg HELLO and reliable req rep with stream adapter
     try server_session.onQuicReady();
 
     var rx: [8192]u8 = undefined;
-    const client_addr: quic_runtime.Address = .{ .bytes = @splat(0x62) };
+    const client_addr = testAddress(0x62, 4433);
 
     _ = try client_session.sendLocalHelloOnStream(client.connection());
     try driveRuntime(&client, &listener, &rx, client_addr, 100_000);

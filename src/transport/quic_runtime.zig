@@ -123,48 +123,31 @@ pub fn mapQuicError(err: anyerror) Error {
 }
 
 pub fn ipAddressToPathAddress(addr: Net.IpAddress) Address {
-    var out: Address = .{};
-    switch (addr) {
-        .ip4 => |ip4| {
-            out.bytes[0] = 4;
-            @memcpy(out.bytes[1..5], &ip4.bytes);
-            std.mem.writeInt(u16, out.bytes[5..7], ip4.port, .big);
-        },
-        .ip6 => |ip6| {
-            out.bytes[0] = 6;
-            @memcpy(out.bytes[1..17], &ip6.bytes);
-            std.mem.writeInt(u16, out.bytes[17..19], ip6.port, .big);
-            out.bytes[19] = @truncate(ip6.flow >> 16);
-            out.bytes[20] = @truncate(ip6.flow >> 8);
-            out.bytes[21] = @truncate(ip6.flow);
-        },
-    }
-    return out;
+    return switch (addr) {
+        .ip4 => |ip4| .{ .ipv4 = .{
+            .addr = ip4.bytes,
+            .port = ip4.port,
+        } },
+        .ip6 => |ip6| .{ .ipv6 = .{
+            .addr = ip6.bytes,
+            .port = ip6.port,
+            .flow = ip6.flow,
+        } },
+    };
 }
 
 pub fn pathAddressToIpAddress(addr: Address) ?Net.IpAddress {
-    return switch (addr.bytes[0]) {
-        4 => blk: {
-            var ip4_bytes: [4]u8 = undefined;
-            @memcpy(&ip4_bytes, addr.bytes[1..5]);
-            break :blk .{ .ip4 = .{
-                .bytes = ip4_bytes,
-                .port = std.mem.readInt(u16, addr.bytes[5..7], .big),
-            } };
-        },
-        6 => blk: {
-            var ip6_bytes: [16]u8 = undefined;
-            @memcpy(&ip6_bytes, addr.bytes[1..17]);
-            const flow: u32 = (@as(u32, addr.bytes[19]) << 16) |
-                (@as(u32, addr.bytes[20]) << 8) |
-                @as(u32, addr.bytes[21]);
-            break :blk .{ .ip6 = .{
-                .bytes = ip6_bytes,
-                .port = std.mem.readInt(u16, addr.bytes[17..19], .big),
-                .flow = flow,
-            } };
-        },
-        else => null,
+    return switch (addr) {
+        .unspecified => null,
+        .ipv4 => |ip4| .{ .ip4 = .{
+            .bytes = ip4.addr,
+            .port = ip4.port,
+        } },
+        .ipv6 => |ip6| .{ .ip6 = .{
+            .bytes = ip6.addr,
+            .port = ip6.port,
+            .flow = ip6.flow,
+        } },
     };
 }
 
@@ -488,11 +471,11 @@ const test_key_pem = @embedFile("../testdata/test_key.pem");
 test "QUIC runtime parses endpoint literals and schemes" {
     const v4 = try parseEndpoint("127.0.0.1:4433");
     try std.testing.expectEqual(@as(u16, 4433), v4.port());
-    try std.testing.expectEqual(@as(u8, 4), v4.path_address.bytes[0]);
+    try std.testing.expectEqual(std.meta.Tag(Address).ipv4, std.meta.activeTag(v4.path_address));
 
     const v6 = try parseEndpoint("quic://[::1]:8443");
     try std.testing.expectEqual(@as(u16, 8443), v6.port());
-    try std.testing.expectEqual(@as(u8, 6), v6.path_address.bytes[0]);
+    try std.testing.expectEqual(std.meta.Tag(Address).ipv6, std.meta.activeTag(v6.path_address));
 
     const udp = try parseEndpoint("udp://0.0.0.0:0");
     try std.testing.expectEqual(@as(u16, 0), udp.port());
@@ -533,7 +516,7 @@ test "QUIC runtime client lifecycle emits initial datagram and timer without net
     const first = (try client.drainOutbound(&out, 1_000)) orelse return error.WouldBlock;
     try std.testing.expect(first.len > 0);
     try std.testing.expect(first.to != null);
-    try std.testing.expectEqual(@as(u8, 4), first.to.?.bytes[0]);
+    try std.testing.expectEqual(std.meta.Tag(Address).ipv4, std.meta.activeTag(first.to.?));
     try std.testing.expect(client.nextTimer(1_000) != null);
 }
 

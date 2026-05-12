@@ -110,6 +110,8 @@ pub const QuicClientRuntime = struct {
 pub const QuicSessionRuntime = struct {
     runtime: transport.quic_session_runtime.QuicSessionRuntime,
     transport_ready: bool = false,
+    datagram_inbox: std.ArrayList(transport.quic_datagram.ReceivedDatagram) = .empty,
+    datagram_outbox: std.ArrayList(message.Message) = .empty,
 
     pub fn id(self: QuicSessionRuntime) QuicSessionId {
         return self.runtime.id();
@@ -131,10 +133,81 @@ pub const QuicSessionRuntime = struct {
         try self.runtime.replyReliableOnStream(stream_id, outgoing);
     }
 
+    pub fn socketDriver(self: *QuicSessionRuntime) socket.QuicSessionDriver {
+        return .{
+            .context = @ptrCast(self),
+            .send = sendSocketMessage,
+        };
+    }
+
+    pub fn queueDatagram(self: *QuicSessionRuntime, outgoing: message.OutgoingMessage) !void {
+        _ = try transport.quic_datagram.encodedSize(outgoing, datagramCodecOptions(self.runtime.session.options));
+        var owned = try message.Message.init(self.runtime.allocator, outgoing);
+        errdefer owned.deinit();
+        try self.datagram_outbox.append(self.runtime.allocator, owned);
+    }
+
+    pub fn recvDatagram(self: *QuicSessionRuntime) ?transport.quic_datagram.ReceivedDatagram {
+        if (self.datagram_inbox.items.len == 0) return null;
+        return self.datagram_inbox.orderedRemove(0);
+    }
+
+    pub fn datagramInboxLen(self: QuicSessionRuntime) usize {
+        return self.datagram_inbox.items.len;
+    }
+
+    pub fn pendingDatagrams(self: QuicSessionRuntime) usize {
+        return self.datagram_outbox.items.len;
+    }
+
+    fn pumpDatagramOutbox(self: *QuicSessionRuntime, conn: *transport.quic_runtime.Connection) !usize {
+        if (self.runtime.state() != .ready) return 0;
+        if (!self.runtime.appSession().datagram_enabled) return 0;
+
+        var sent: usize = 0;
+        var index: usize = 0;
+        while (index < self.datagram_outbox.items.len) {
+            const out = self.datagram_outbox.items[index].outgoing();
+            const result = transport.quic_datagram.send(conn, self.runtime.allocator, out, .{
+                .codec = datagramCodecOptions(self.runtime.session.options),
+                .fallback = .datagram_only,
+                .queue_full_mapping = .flow_controlled,
+            }) catch |err| switch (err) {
+                error.FlowControlled, error.QueueFull, error.WouldBlock => return sent,
+                else => return err,
+            };
+
+            switch (result) {
+                .sent_datagram => {
+                    var owned = self.datagram_outbox.orderedRemove(index);
+                    owned.deinit();
+                    sent += 1;
+                },
+                .use_reliable_fallback => {
+                    index += 1;
+                },
+            }
+        }
+        return sent;
+    }
+
     fn deinit(self: *QuicSessionRuntime) void {
+        for (self.datagram_outbox.items) |*msg| {
+            msg.deinit();
+        }
+        self.datagram_outbox.deinit(self.runtime.allocator);
+        for (self.datagram_inbox.items) |*received| {
+            received.deinit();
+        }
+        self.datagram_inbox.deinit(self.runtime.allocator);
         self.runtime.deinit();
         self.* = undefined;
     }
+};
+
+pub const QuicSocketAttachment = struct {
+    session_id: QuicSessionId,
+    endpoint: socket.QuicSocketEndpoint,
 };
 
 pub const ListenerConnection = struct {
@@ -150,6 +223,7 @@ pub const Node = struct {
     quic_listeners: std.ArrayList(*QuicListenerRuntime) = .empty,
     quic_clients: std.ArrayList(*QuicClientRuntime) = .empty,
     quic_sessions: std.ArrayList(*QuicSessionRuntime) = .empty,
+    quic_socket_attachments: std.ArrayList(QuicSocketAttachment) = .empty,
     now_us: u64 = 0,
     next_session_id: session.SessionId = 1,
 
@@ -171,6 +245,7 @@ pub const Node = struct {
             self.allocator.destroy(runtime);
         }
         self.quic_sessions.deinit(self.allocator);
+        self.quic_socket_attachments.deinit(self.allocator);
         for (self.quic_listeners.items) |runtime| {
             runtime.deinit(self.allocator);
             self.allocator.destroy(runtime);
@@ -286,6 +361,27 @@ pub const Node = struct {
         return null;
     }
 
+    pub fn attachQuicSocket(self: *Node, id: QuicSessionId, endpoint: socket.QuicSocketEndpoint) !void {
+        const runtime = self.quicSession(id) orelse return error.EndpointNotFound;
+        if (!quicSocketAttachmentSupported(endpoint.pattern)) return error.UnsupportedTransport;
+
+        for (self.quic_socket_attachments.items) |attachment| {
+            if (attachment.session_id == id and attachment.endpoint.context == endpoint.context) return;
+        }
+
+        try self.quic_socket_attachments.append(self.allocator, .{
+            .session_id = id,
+            .endpoint = endpoint,
+        });
+        var appended = true;
+        errdefer if (appended) {
+            _ = self.quic_socket_attachments.pop();
+        };
+
+        try endpoint.attach(endpoint.context, runtime.socketDriver());
+        appended = false;
+    }
+
     pub fn closeQuicSession(self: *Node, id: QuicSessionId) !void {
         for (self.quic_clients.items, 0..) |client, index| {
             if (client.id() != id) continue;
@@ -302,6 +398,7 @@ pub const Node = struct {
             try self.emit(.{ .closed = id });
             _ = self.quic_sessions.orderedRemove(index);
             self.removeListenerSessionRefs(runtime);
+            self.removeSocketSessionRefs(id);
             runtime.deinit();
             self.allocator.destroy(runtime);
             return;
@@ -354,20 +451,38 @@ pub const Node = struct {
     }
 
     pub fn runOnce(self: *Node, dispatcher: anytype) !RunOnceResult {
-        for (self.inproc_rep_endpoints.items) |endpoint| {
-            if (try dispatcher.dispatchInprocRep(endpoint)) {
+        if (comptime dispatcherHas(@TypeOf(dispatcher), "dispatchInprocRep")) {
+            for (self.inproc_rep_endpoints.items) |endpoint| {
+                if (try dispatcher.dispatchInprocRep(endpoint)) {
+                    return .{
+                        .messages = 1,
+                        .events_pending = self.eventCount(),
+                    };
+                }
+            }
+        }
+
+        for (self.quic_sessions.items) |runtime| {
+            const attachment = self.quicSocketAttachment(runtime.id());
+            const can_dispatch_reliable = comptime dispatcherHas(@TypeOf(dispatcher), "dispatchQuicReliable");
+            if (attachment == null and !can_dispatch_reliable) continue;
+
+            var received = runtime.runtime.recvReliable() orelse continue;
+            const stream_id = received.stream_id;
+            var incoming = received.takeMessage();
+
+            if (attachment) |endpoint| {
+                endpoint.receive(endpoint.context, incoming) catch |err| {
+                    incoming.deinit();
+                    return err;
+                };
                 return .{
                     .messages = 1,
                     .events_pending = self.eventCount(),
                 };
             }
-        }
 
-        if (comptime dispatcherHas(@TypeOf(dispatcher), "dispatchQuicReliable")) {
-            for (self.quic_sessions.items) |runtime| {
-                var received = runtime.runtime.recvReliable() orelse continue;
-                const stream_id = received.stream_id;
-                const incoming = received.takeMessage();
+            if (comptime dispatcherHas(@TypeOf(dispatcher), "dispatchQuicReliable")) {
                 var result = try dispatcher.dispatchQuicReliable(.rep, incoming, runtime.appSession());
                 defer result.deinit();
 
@@ -375,10 +490,54 @@ pub const Node = struct {
                     try runtime.replyReliableOnStream(stream_id, reply.outgoing());
                 }
 
+                for (result.publications.items) |publication| {
+                    try runtime.queueDatagram(publication.outgoing());
+                }
+
                 return .{
                     .messages = 1,
                     .events_pending = self.eventCount(),
                 };
+            } else {
+                incoming.deinit();
+                return error.InvalidState;
+            }
+        }
+
+        for (self.quic_sessions.items) |runtime| {
+            const attachment = self.quicSocketAttachment(runtime.id());
+            const can_dispatch_datagram = comptime dispatcherHas(@TypeOf(dispatcher), "dispatchQuicDatagram");
+            if (attachment == null and !can_dispatch_datagram) continue;
+
+            var received = runtime.recvDatagram() orelse continue;
+            var incoming = received.takeMessage();
+
+            if (attachment) |endpoint| {
+                endpoint.receive(endpoint.context, incoming) catch |err| {
+                    incoming.deinit();
+                    return err;
+                };
+                return .{
+                    .messages = 1,
+                    .events_pending = self.eventCount(),
+                };
+            }
+
+            if (comptime dispatcherHas(@TypeOf(dispatcher), "dispatchQuicDatagram")) {
+                var result = try dispatcher.dispatchQuicDatagram(incoming, runtime.appSession());
+                defer result.deinit();
+
+                for (result.publications.items) |publication| {
+                    try runtime.queueDatagram(publication.outgoing());
+                }
+
+                return .{
+                    .messages = 1,
+                    .events_pending = self.eventCount(),
+                };
+            } else {
+                incoming.deinit();
+                return error.InvalidState;
             }
         }
 
@@ -466,30 +625,65 @@ pub const Node = struct {
         try client.runtime.runtime.onQuicReady();
     }
 
-    fn pumpListenerSessions(_: *Node, listener: *QuicListenerRuntime) !void {
+    fn pumpListenerSessions(self: *Node, listener: *QuicListenerRuntime) !void {
         for (listener.sessions.items) |entry| {
             const conn = listener.listener.runtime.connection(entry.connection_index) orelse continue;
-            if (entry.runtime.runtime.state() == .ready) {
-                _ = try entry.runtime.runtime.acceptPeerBidiStreamsConnection(conn);
-            }
-            _ = try entry.runtime.runtime.pumpConnection(conn);
-            if (entry.runtime.runtime.state() == .ready) {
-                _ = try entry.runtime.runtime.acceptPeerBidiStreamsConnection(conn);
-                _ = try entry.runtime.runtime.pumpConnection(conn);
-            }
+            try self.pumpQuicSessionConnection(entry.runtime, conn);
         }
     }
 
-    fn pumpClientSession(_: *Node, client: *QuicClientRuntime) !void {
+    fn pumpClientSession(self: *Node, client: *QuicClientRuntime) !void {
         if (!client.runtime.transport_ready) return;
         const conn = client.client.runtime.connection();
-        if (client.runtime.runtime.state() == .ready) {
-            _ = try client.runtime.runtime.acceptPeerBidiStreamsConnection(conn);
+        try self.pumpQuicSessionConnection(client.runtime, conn);
+    }
+
+    fn pumpQuicSessionConnection(
+        self: *Node,
+        runtime: *QuicSessionRuntime,
+        conn: *transport.quic_runtime.Connection,
+    ) !void {
+        if (runtime.runtime.state() == .ready) {
+            _ = try runtime.runtime.acceptPeerBidiStreamsConnection(conn);
         }
-        _ = try client.runtime.runtime.pumpConnection(conn);
-        if (client.runtime.runtime.state() == .ready) {
-            _ = try client.runtime.runtime.acceptPeerBidiStreamsConnection(conn);
-            _ = try client.runtime.runtime.pumpConnection(conn);
+        _ = try runtime.runtime.pumpConnection(conn);
+        if (runtime.runtime.state() == .ready) {
+            _ = try runtime.runtime.acceptPeerBidiStreamsConnection(conn);
+            _ = try runtime.runtime.pumpConnection(conn);
+            try self.receiveDatagrams(runtime, conn);
+            _ = try runtime.pumpDatagramOutbox(conn);
+        }
+    }
+
+    fn receiveDatagrams(
+        self: *Node,
+        runtime: *QuicSessionRuntime,
+        conn: *transport.quic_runtime.Connection,
+    ) !void {
+        if (!runtime.runtime.appSession().datagram_enabled) return;
+
+        while (true) {
+            var received = transport.quic_datagram.receiveDatagram(conn, self.allocator, .{
+                .codec = datagramCodecOptions(runtime.runtime.session.options),
+            }) catch |err| switch (err) {
+                error.MalformedFrame => {
+                    try self.emit(.{ .message_dropped = .{
+                        .session_id = runtime.id(),
+                        .bytes = 0,
+                    } });
+                    continue;
+                },
+                error.MessageTooLarge => {
+                    try self.emit(.{ .message_dropped = .{
+                        .session_id = runtime.id(),
+                        .bytes = datagramCodecOptions(runtime.runtime.session.options).max_payload_size +| 1,
+                    } });
+                    continue;
+                },
+                else => return err,
+            } orelse return;
+            errdefer received.deinit();
+            try runtime.datagram_inbox.append(self.allocator, received);
         }
     }
 
@@ -529,6 +723,7 @@ pub const Node = struct {
             break;
         }
         self.removeListenerSessionRefs(runtime);
+        self.removeSocketSessionRefs(runtime.id());
         runtime.deinit();
         self.allocator.destroy(runtime);
     }
@@ -546,6 +741,24 @@ pub const Node = struct {
         }
     }
 
+    fn removeSocketSessionRefs(self: *Node, id: QuicSessionId) void {
+        var index: usize = 0;
+        while (index < self.quic_socket_attachments.items.len) {
+            if (self.quic_socket_attachments.items[index].session_id == id) {
+                _ = self.quic_socket_attachments.orderedRemove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn quicSocketAttachment(self: *Node, id: QuicSessionId) ?socket.QuicSocketEndpoint {
+        for (self.quic_socket_attachments.items) |attachment| {
+            if (attachment.session_id == id) return attachment.endpoint;
+        }
+        return null;
+    }
+
     fn nextInprocSession(self: *Node) session.Session {
         return .{
             .id = self.nextSessionId(),
@@ -560,6 +773,38 @@ pub const Node = struct {
         return id;
     }
 };
+
+fn sendSocketMessage(context: *anyopaque, msg: message.Message, meta: socket.QuicSendMeta) anyerror!void {
+    var owned = msg;
+    defer owned.deinit();
+
+    const runtime: *QuicSessionRuntime = @ptrCast(@alignCast(context));
+    switch (meta.delivery) {
+        .reliable => _ = try runtime.queueReliable(owned.outgoing()),
+        .unreliable => try runtime.queueDatagram(owned.outgoing()),
+    }
+}
+
+fn datagramCodecOptions(options: transport.quic.QuicOptions) transport.quic_datagram.CodecOptions {
+    const default_datagram_codec = transport.quic_datagram.CodecOptions{};
+    const negotiated_max = if (options.max_datagram_frame_size == 0)
+        default_datagram_codec.max_payload_size
+    else
+        std.math.cast(usize, options.max_datagram_frame_size) orelse std.math.maxInt(usize);
+
+    return .{
+        .max_payload_size = @min(options.max_message_size, negotiated_max),
+        .max_headers = options.max_header_count,
+        .max_header_bytes = options.max_header_bytes,
+    };
+}
+
+fn quicSocketAttachmentSupported(pattern: socket.Pattern) bool {
+    return switch (pattern) {
+        .pair, .req, .rep => true,
+        .@"pub", .sub, .push, .pull => false,
+    };
+}
 
 fn listenerSession(listener: *QuicListenerRuntime, connection_index: usize) ?*QuicSessionRuntime {
     for (listener.sessions.items) |entry| {
@@ -578,6 +823,40 @@ fn dispatcherHas(comptime Dispatcher: type, comptime name: []const u8) bool {
 
 fn bestTimer(best: *?u64, candidate: u64) void {
     if (best.* == null or candidate < best.*.?) best.* = candidate;
+}
+
+fn readyQuicRuntimeForTest(
+    runtime: *QuicSessionRuntime,
+    peer_id: []const u8,
+    datagram_enabled: bool,
+) !void {
+    try runtime.runtime.onQuicReady();
+
+    const allocator = runtime.runtime.allocator;
+    const peer_hello = try transport.quic.encodeHelloControlStream(allocator, .{
+        .peer_id = peer_id,
+        .datagram_enabled = datagram_enabled,
+    });
+    defer allocator.free(peer_hello);
+
+    try runtime.runtime.session.acceptPeerControl(peer_hello);
+}
+
+fn queueReliableForTest(
+    runtime: *QuicSessionRuntime,
+    stream_id: u64,
+    outgoing: message.OutgoingMessage,
+) !void {
+    const allocator = runtime.runtime.allocator;
+    var incoming = try message.Message.init(allocator, outgoing);
+    var owns_incoming = true;
+    errdefer if (owns_incoming) incoming.deinit();
+
+    try runtime.runtime.inbox.append(allocator, .{
+        .stream_id = stream_id,
+        .message = incoming,
+    });
+    owns_incoming = false;
 }
 
 test {
@@ -652,6 +931,135 @@ test "Node prepares QUIC session lifecycle without opening UDP" {
     var rest: [1]Event = undefined;
     try std.testing.expectEqual(@as(usize, 1), try n.poll(&rest));
     try std.testing.expectEqual(id, rest[0].closed);
+}
+
+test "Node attaches QUIC socket endpoint and queues outbound socket messages" {
+    const allocator = std.testing.allocator;
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    const runtime = try n.openQuicSession(.{
+        .role = .client,
+        .transport = .{ .peer_id = "client-a" },
+    });
+    try readyQuicRuntimeForTest(runtime, "server-a", false);
+
+    var pair_socket = try socket.Socket(.pair).init(allocator, .{});
+    defer pair_socket.deinit();
+    try n.attachQuicSocket(runtime.id(), pair_socket.quicEndpoint());
+
+    try pair_socket.send(.{
+        .subject = "control.ping",
+        .body = "hello",
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.runtime.pendingReliableSenders());
+}
+
+test "Node runOnce delivers queued QUIC reliable message to attached socket" {
+    const allocator = std.testing.allocator;
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    const runtime = try n.openQuicSession(.{
+        .role = .server,
+        .transport = .{ .peer_id = "server-a" },
+    });
+    try readyQuicRuntimeForTest(runtime, "client-a", false);
+
+    var pair_socket = try socket.Socket(.pair).init(allocator, .{});
+    defer pair_socket.deinit();
+    try n.attachQuicSocket(runtime.id(), pair_socket.quicEndpoint());
+
+    try queueReliableForTest(runtime, 0, .{
+        .subject = "control.ping",
+        .body = "hello",
+    });
+
+    const Dispatcher = struct {};
+    var dispatcher = Dispatcher{};
+    const result = try n.runOnce(&dispatcher);
+    try std.testing.expect(result.didWork());
+
+    var received = try pair_socket.recv();
+    defer received.deinit();
+    try std.testing.expectEqualStrings("control.ping", received.subject);
+    try std.testing.expectEqualStrings("hello", received.body);
+}
+
+test "Node runOnce dispatches queued QUIC datagram and queues publication datagram" {
+    const allocator = std.testing.allocator;
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    const runtime = try n.openQuicSession(.{
+        .role = .server,
+        .transport = .{
+            .peer_id = "server-a",
+            .datagram_enabled = true,
+        },
+    });
+    try readyQuicRuntimeForTest(runtime, "client-a", true);
+
+    const incoming = try message.Message.init(allocator, .{
+        .subject = "presence.ada",
+        .flags = .{ .unreliable = true },
+        .body = "online",
+    });
+    try runtime.datagram_inbox.append(allocator, .{ .message = incoming });
+
+    const Dispatcher = struct {
+        calls: usize = 0,
+
+        const Result = struct {
+            allocator: std.mem.Allocator,
+            replies: std.ArrayList(message.Message) = .empty,
+            publications: std.ArrayList(message.Message) = .empty,
+
+            fn init(alloc: std.mem.Allocator) Result {
+                return .{ .allocator = alloc };
+            }
+
+            fn deinit(self: *Result) void {
+                for (self.replies.items) |*msg| msg.deinit();
+                self.replies.deinit(self.allocator);
+                for (self.publications.items) |*msg| msg.deinit();
+                self.publications.deinit(self.allocator);
+            }
+        };
+
+        fn dispatchQuicDatagram(self: *@This(), msg: message.Message, sess: *session.Session) !Result {
+            var owned = msg;
+            defer owned.deinit();
+
+            try std.testing.expectEqual(session.TransportKind.quic, sess.transport);
+            try std.testing.expectEqualStrings("presence.ada", owned.subject);
+            self.calls += 1;
+
+            var result = Result.init(owned.allocator);
+            errdefer result.deinit();
+            const publication = try message.Message.init(owned.allocator, .{
+                .subject = "presence.seen",
+                .flags = .{ .unreliable = true },
+                .body = owned.body,
+            });
+            errdefer {
+                var cleanup = publication;
+                cleanup.deinit();
+            }
+            try result.publications.append(owned.allocator, publication);
+            return result;
+        }
+    };
+
+    var dispatcher = Dispatcher{};
+    const result = try n.runOnce(&dispatcher);
+    try std.testing.expect(result.didWork());
+    try std.testing.expectEqual(@as(usize, 1), dispatcher.calls);
+    try std.testing.expectEqual(@as(usize, 1), runtime.pendingDatagrams());
 }
 
 test "Node runOnce dispatches one inproc rep request through dispatcher" {
