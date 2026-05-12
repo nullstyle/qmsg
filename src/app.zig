@@ -8,6 +8,8 @@ const socket = @import("socket.zig");
 const transport = @import("transport/root.zig");
 
 pub const TlsConfig = struct {
+    cert_pem: []const u8 = "",
+    key_pem: []const u8 = "",
     quic: transport.quic.QuicOptions = .{},
 };
 
@@ -59,6 +61,29 @@ pub const DispatchOptions = struct {
 pub const QuicDispatchOptions = struct {
     reply_hook: ?EmitHandler = null,
     publish_hook: ?EmitHandler = null,
+};
+
+/// Socket-free adapter for transport drivers that already decoded QUIC frames.
+pub const QuicDispatcher = struct {
+    app: *App,
+    options: QuicDispatchOptions = .{},
+
+    pub fn dispatchReliable(
+        self: *@This(),
+        kind: RouteKind,
+        incoming: message.Message,
+        sess: *session.Session,
+    ) !DispatchResult {
+        return self.app.dispatchQuicReliable(kind, incoming, sess, self.options);
+    }
+
+    pub fn dispatchDatagram(
+        self: *@This(),
+        incoming: message.Message,
+        sess: *session.Session,
+    ) !DispatchResult {
+        return self.app.dispatchQuicDatagram(incoming, sess, self.options);
+    }
 };
 
 pub const InprocRepOptions = struct {
@@ -326,6 +351,10 @@ pub const App = struct {
         return self.dispatchMessage(.datagram, incoming, options);
     }
 
+    pub fn quicDispatcher(self: *App, options: QuicDispatchOptions) QuicDispatcher {
+        return .{ .app = self, .options = options };
+    }
+
     pub fn dispatchOutgoing(self: *App, kind: RouteKind, outgoing: message.OutgoingMessage, options: DispatchOptions) !DispatchResult {
         const incoming = try message.Message.init(self.allocator, outgoing);
         return self.dispatchMessage(kind, incoming, options);
@@ -334,7 +363,8 @@ pub const App = struct {
     /// QUIC integration hook for already-decoded reliable stream or datagram
     /// messages. Node/session transport code supplies the route kind it derived
     /// from stream/datagram context, and this facade returns any app replies or
-    /// publications in a socket-free ResponseSink for the QUIC writer to encode.
+    /// publications either through hooks or in a ResponseSink for the QUIC
+    /// writer to encode.
     pub fn dispatchQuic(
         self: *App,
         kind: RouteKind,
@@ -367,11 +397,37 @@ pub const App = struct {
             .publish_hook = options.publish_hook,
         }) catch |err| try self.dispatchRepErrorResult(
             kind,
+            sess,
             error_subject orelse "",
             request_id,
             request_deadline_ms,
+            options,
             err,
         );
+    }
+
+    pub fn dispatchQuicReliable(
+        self: *App,
+        kind: RouteKind,
+        incoming: message.Message,
+        sess: *session.Session,
+        options: QuicDispatchOptions,
+    ) !DispatchResult {
+        if (kind == .datagram) {
+            var owned = incoming;
+            owned.deinit();
+            return error.InvalidPattern;
+        }
+        return self.dispatchQuic(kind, incoming, sess, options);
+    }
+
+    pub fn dispatchQuicDatagram(
+        self: *App,
+        incoming: message.Message,
+        sess: *session.Session,
+        options: QuicDispatchOptions,
+    ) !DispatchResult {
+        return self.dispatchQuic(.datagram, incoming, sess, options);
     }
 
     pub fn runQuicMessage(
@@ -420,9 +476,11 @@ pub const App = struct {
     fn dispatchRepErrorResult(
         self: *App,
         kind: RouteKind,
+        sess: *session.Session,
         request_subject: []const u8,
         request_id: message.MessageId,
         request_deadline_ms: ?u64,
+        options: QuicDispatchOptions,
         err: anyerror,
     ) !DispatchResult {
         switch (self.error_policy) {
@@ -432,7 +490,19 @@ pub const App = struct {
 
                 var result = ResponseSink.init(self.allocator);
                 errdefer result.deinit();
-                try appendRepError(&result, request_subject, request_id, request_deadline_ms, err);
+                var ctx = Context{
+                    .app = self,
+                    .session = sess,
+                    .pattern = .rep,
+                    .route_kind = .rep,
+                    .request_subject = request_subject,
+                    .request_id = request_id,
+                    .request_deadline_ms = request_deadline_ms,
+                    .response_sink = &result,
+                    .reply_hook = options.reply_hook orelse self.reply_hook,
+                    .publish_hook = options.publish_hook orelse self.publish_hook,
+                };
+                try replyRepError(&ctx, err);
                 return result;
             },
         }
@@ -471,7 +541,11 @@ pub const App = struct {
     }
 
     pub fn listenQuic(self: *App, addr: []const u8, tls: TlsConfig) !node.QuicListenerId {
-        return self.node.listenQuic(addr, .{ .transport = tls.quic });
+        return self.node.listenQuic(addr, .{
+            .tls_cert_pem = tls.cert_pem,
+            .tls_key_pem = tls.key_pem,
+            .transport = tls.quic,
+        });
     }
 
     pub fn openQuicSession(self: *App, options: node.QuicSessionOptions) !*node.QuicSessionRuntime {
@@ -499,7 +573,7 @@ pub const App = struct {
     }
 
     pub fn runOnce(self: *App) !RunOnceResult {
-        var dispatcher = InprocDispatcher{ .app = self };
+        var dispatcher = RuntimeDispatcher{ .app = self };
         return self.node.runOnce(&dispatcher);
     }
 
@@ -516,7 +590,7 @@ pub const App = struct {
     }
 };
 
-const InprocDispatcher = struct {
+const RuntimeDispatcher = struct {
     app: *App,
 
     pub fn dispatchInprocRep(self: *@This(), endpoint: *node.InprocRepEndpoint) !bool {
@@ -538,6 +612,23 @@ const InprocDispatcher = struct {
 
         return true;
     }
+
+    pub fn dispatchQuicReliable(
+        self: *@This(),
+        kind: RouteKind,
+        incoming: message.Message,
+        sess: *session.Session,
+    ) !DispatchResult {
+        return self.app.dispatchQuicReliable(kind, incoming, sess, .{});
+    }
+
+    pub fn dispatchQuicDatagram(
+        self: *@This(),
+        incoming: message.Message,
+        sess: *session.Session,
+    ) !DispatchResult {
+        return self.app.dispatchQuicDatagram(incoming, sess, .{});
+    }
 };
 
 fn handleRepError(self: *App, rep_socket: *socket.Socket(.rep), request: socket.Request, err: anyerror) !void {
@@ -550,22 +641,14 @@ fn handleRepError(self: *App, rep_socket: *socket.Socket(.rep), request: socket.
     }
 }
 
-fn appendRepError(
-    sink: *ResponseSink,
-    request_subject: []const u8,
-    request_id: message.MessageId,
-    request_deadline_ms: ?u64,
-    err: anyerror,
-) !void {
+fn replyRepError(ctx: *Context, err: anyerror) !void {
     const headers = [_]message.Header{
         .{ .name = socket.ErrorReply.code_header, .value = @errorName(err) },
         .{ .name = socket.ErrorReply.message_header, .value = @errorName(err) },
     };
 
-    try sink.appendReply(.{
-        .subject = request_subject,
-        .id = request_id,
-        .deadline_ms = request_deadline_ms,
+    try ctx.reply(.{
+        .subject = "",
         .flags = .{ .err = true },
         .headers = &headers,
         .body = @errorName(err),
@@ -859,6 +942,158 @@ test "App dispatchQuic datagram route captures publications" {
     try std.testing.expectEqualStrings("online", result.publications.items[0].body);
 }
 
+test "App QUIC dispatcher writes replies and publications through hooks" {
+    const allocator = std.testing.allocator;
+
+    var app = try App.init(allocator, .{});
+    defer app.deinit();
+
+    const Recorder = struct {
+        replies: usize = 0,
+        publications: usize = 0,
+
+        fn replyHook(ctx: *Context, outgoing: message.OutgoingMessage) !void {
+            const recorder: *@This() = @ptrCast(@alignCast(ctx.session.?.user_data.?));
+            recorder.replies += 1;
+            try std.testing.expectEqual(session.TransportKind.quic, ctx.session.?.transport);
+            try std.testing.expectEqualStrings("user.get", outgoing.subject);
+            try std.testing.expectEqual(@as(message.MessageId, 7), outgoing.id);
+            try std.testing.expectEqualStrings("Ada", outgoing.body);
+        }
+
+        fn publishHook(ctx: *Context, outgoing: message.OutgoingMessage) !void {
+            const recorder: *@This() = @ptrCast(@alignCast(ctx.session.?.user_data.?));
+            recorder.publications += 1;
+            try std.testing.expectEqual(session.TransportKind.quic, ctx.session.?.transport);
+            try std.testing.expectEqualStrings("presence.seen", outgoing.subject);
+            try std.testing.expectEqualStrings("online", outgoing.body);
+        }
+
+        fn getUser(ctx: *Context, msg: message.Message) !void {
+            var owned = msg;
+            defer owned.deinit();
+
+            try ctx.reply(.{ .subject = "", .body = "Ada" });
+        }
+
+        fn presence(ctx: *Context, msg: message.Message) !void {
+            var owned = msg;
+            defer owned.deinit();
+
+            try ctx.publish(.{ .subject = "presence.seen", .body = owned.body });
+        }
+    };
+
+    var recorder = Recorder{};
+    var sess = session.Session{
+        .id = 25,
+        .transport = .quic,
+        .user_data = @ptrCast(&recorder),
+    };
+
+    try app.rep("user.*", Recorder.getUser);
+    try app.datagram("presence.*", Recorder.presence);
+
+    var dispatcher = app.quicDispatcher(.{
+        .reply_hook = Recorder.replyHook,
+        .publish_hook = Recorder.publishHook,
+    });
+
+    const request = try message.Message.init(allocator, .{
+        .subject = "user.get",
+        .id = 7,
+    });
+    var reply_result = try dispatcher.dispatchReliable(.rep, request, &sess);
+    defer reply_result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), reply_result.replies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), reply_result.publications.items.len);
+
+    const datagram = try message.Message.init(allocator, .{
+        .subject = "presence.ada",
+        .body = "online",
+        .flags = .{ .unreliable = true },
+    });
+    var publish_result = try dispatcher.dispatchDatagram(datagram, &sess);
+    defer publish_result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), publish_result.replies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), publish_result.publications.items.len);
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.replies);
+    try std.testing.expectEqual(@as(usize, 1), recorder.publications);
+}
+
+test "App QUIC dispatcher sends REP error replies through hooks" {
+    const allocator = std.testing.allocator;
+
+    var app = try App.init(allocator, .{});
+    defer app.deinit();
+
+    const Recorder = struct {
+        errors: usize = 0,
+
+        fn replyHook(ctx: *Context, outgoing: message.OutgoingMessage) !void {
+            const recorder: *@This() = @ptrCast(@alignCast(ctx.session.?.user_data.?));
+            recorder.errors += 1;
+            try std.testing.expect(outgoing.flags.err);
+            try std.testing.expectEqualStrings("user.get", outgoing.subject);
+            try std.testing.expectEqual(@as(message.MessageId, 700), outgoing.id);
+            try std.testing.expectEqual(@as(?u64, 1500), outgoing.deadline_ms);
+            try std.testing.expectEqualStrings("AuthenticationRequired", outgoing.body);
+            try std.testing.expectEqual(@as(usize, 2), outgoing.headers.len);
+            try std.testing.expectEqualStrings(socket.ErrorReply.code_header, outgoing.headers[0].name);
+            try std.testing.expectEqualStrings("AuthenticationRequired", outgoing.headers[0].value);
+        }
+
+        fn needsAuth(ctx: *Context, msg: message.Message) !void {
+            var owned = msg;
+            defer owned.deinit();
+            try ctx.requireRouteAccess();
+        }
+    };
+
+    var recorder = Recorder{};
+    var sess = session.Session{
+        .id = 26,
+        .transport = .quic,
+        .user_data = @ptrCast(&recorder),
+    };
+
+    try app.rep("user.*", Recorder.needsAuth);
+
+    var dispatcher = app.quicDispatcher(.{ .reply_hook = Recorder.replyHook });
+    const incoming = try message.Message.init(allocator, .{
+        .subject = "user.get",
+        .id = 700,
+        .deadline_ms = 1500,
+        .body = "leak-check",
+    });
+    var result = try dispatcher.dispatchReliable(.rep, incoming, &sess);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.errors);
+    try std.testing.expectEqual(@as(usize, 0), result.replies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), result.publications.items.len);
+}
+
+test "App QUIC reliable dispatcher rejects datagram kind and owns message cleanup" {
+    const allocator = std.testing.allocator;
+
+    var app = try App.init(allocator, .{});
+    defer app.deinit();
+
+    var sess = session.Session{
+        .id = 27,
+        .transport = .quic,
+    };
+
+    var dispatcher = app.quicDispatcher(.{});
+    const incoming = try message.Message.init(allocator, .{
+        .subject = "presence.ada",
+        .body = "online",
+    });
+    try std.testing.expectError(error.InvalidPattern, dispatcher.dispatchReliable(.datagram, incoming, &sess));
+}
+
 test "App dispatchQuic no-route behavior follows reply error policy" {
     const allocator = std.testing.allocator;
 
@@ -981,7 +1216,7 @@ test "App connect and close dispatch handlers through node events" {
     try std.testing.expectEqual(@as(session.SessionId, 11), events[1].closed);
 }
 
-test "App listenQuic and QUIC session hooks are socket-free" {
+test "App listenQuic validates config and QUIC session hooks prepare runtime state" {
     const allocator = std.testing.allocator;
 
     var app = try App.init(allocator, .{});
@@ -1004,11 +1239,9 @@ test "App listenQuic and QUIC session hooks are socket-free" {
         }
     };
 
-    const listener_id = try app.listenQuic("127.0.0.1:4433", .{
+    try std.testing.expectError(error.InvalidEndpoint, app.listenQuic("127.0.0.1:0", .{
         .quic = .{ .peer_id = "server-a" },
-    });
-    try std.testing.expectEqual(@as(node.QuicListenerId, 0), listener_id);
-    try std.testing.expectEqual(transport.quic.State.listening, app.node.quic_listeners.items[listener_id].listener.state());
+    }));
 
     var recorder = Recorder{};
     app.onConnect(Recorder.onConnect);

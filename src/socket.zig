@@ -28,7 +28,7 @@ pub const QuicSendMeta = struct {
     subject: []const u8,
 };
 
-/// Sends one owned message through an attached QUIC peer/session.
+/// Sends one owned message through an attached QUIC peer/session driver.
 ///
 /// On success the callback has consumed `msg` and must eventually deinit it.
 /// On error the socket will deinit `msg`, so the callback must not retain it.
@@ -37,6 +37,11 @@ pub const QuicSendFn = *const fn (context: *anyopaque, msg: message.Message, met
 /// Optional subject gate for attachment drivers with local routing knowledge.
 pub const QuicAcceptsFn = *const fn (context: *anyopaque, subject: []const u8) bool;
 
+/// A socket-facing handle for one already-open QUIC peer.
+///
+/// The socket uses this only to hand owned messages to the driver callback.
+/// The driver still owns UDP, QUIC connection/session state, stream ids,
+/// encoding, and write progress.
 pub const QuicPeer = struct {
     pattern: Pattern,
     context: *anyopaque,
@@ -44,11 +49,29 @@ pub const QuicPeer = struct {
     accepts: ?QuicAcceptsFn = null,
 };
 
-pub const QuicSession = struct {
+/// A socket-facing handle for one attached QUIC session driver.
+///
+/// Use this when the peer pattern is implied by the local socket:
+/// pair -> pair, req -> rep, rep -> req. For less common routing cases, attach
+/// a `QuicPeer` directly with the exact peer pattern. The driver must outlive
+/// the socket attachment; the socket stores this handle but does not own it.
+pub const QuicSessionDriver = struct {
     context: *anyopaque,
     send: QuicSendFn,
     accepts: ?QuicAcceptsFn = null,
+
+    pub fn peer(self: QuicSessionDriver, peer_pattern: Pattern) QuicPeer {
+        return .{
+            .pattern = peer_pattern,
+            .context = self.context,
+            .send = self.send,
+            .accepts = self.accepts,
+        };
+    }
 };
+
+/// Compatibility spelling for the socket-side QUIC driver handle.
+pub const QuicSession = QuicSessionDriver;
 
 pub const Request = struct {
     message: message.Message,
@@ -144,8 +167,16 @@ pub const PairSocket = struct {
         try self.core.attachQuicPeer(peer);
     }
 
+    /// Attaches an already-open QUIC session driver as the pair peer.
+    ///
+    /// The socket owns pattern state only; the driver owns UDP, QUIC streams,
+    /// encoding, retransmit/write queues, and flow control.
+    pub fn attachQuicSessionDriver(self: *PairSocket, driver: QuicSessionDriver) !void {
+        try self.attachQuicPeer(quicPeerFromSession(.pair, driver));
+    }
+
     pub fn attachQuicSession(self: *PairSocket, session: QuicSession) !void {
-        try self.attachQuicPeer(quicPeerFromSession(.pair, session));
+        try self.attachQuicSessionDriver(session);
     }
 
     /// Hands an owned, decoded QUIC message to the socket receive queue.
@@ -207,8 +238,16 @@ pub const ReqSocket = struct {
         try self.core.attachQuicPeer(peer);
     }
 
+    /// Attaches an already-open QUIC session driver as the rep peer.
+    ///
+    /// The socket owns request correlation and deadlines only; the driver owns
+    /// UDP, QUIC streams, encoding, retransmit/write queues, and flow control.
+    pub fn attachQuicSessionDriver(self: *ReqSocket, driver: QuicSessionDriver) !void {
+        try self.attachQuicPeer(quicPeerFromSession(.rep, driver));
+    }
+
     pub fn attachQuicSession(self: *ReqSocket, session: QuicSession) !void {
-        try self.attachQuicPeer(quicPeerFromSession(.rep, session));
+        try self.attachQuicSessionDriver(session);
     }
 
     /// Hands an owned, decoded QUIC reply to the request state machine.
@@ -348,8 +387,16 @@ pub const RepSocket = struct {
         try self.core.attachQuicPeer(peer);
     }
 
+    /// Attaches an already-open QUIC session driver as the req peer.
+    ///
+    /// The socket owns request/reply pattern state only; the driver owns UDP,
+    /// QUIC streams, encoding, retransmit/write queues, and flow control.
+    pub fn attachQuicSessionDriver(self: *RepSocket, driver: QuicSessionDriver) !void {
+        try self.attachQuicPeer(quicPeerFromSession(.req, driver));
+    }
+
     pub fn attachQuicSession(self: *RepSocket, session: QuicSession) !void {
-        try self.attachQuicPeer(quicPeerFromSession(.req, session));
+        try self.attachQuicSessionDriver(session);
     }
 
     /// Hands an owned, decoded QUIC request to the reply state machine.
@@ -1084,13 +1131,8 @@ fn deliverQuic(local_pattern: Pattern, peer: QuicPeer, msg: message.Message) !vo
     };
 }
 
-fn quicPeerFromSession(peer_pattern: Pattern, session: QuicSession) QuicPeer {
-    return .{
-        .pattern = peer_pattern,
-        .context = session.context,
-        .send = session.send,
-        .accepts = session.accepts,
-    };
+fn quicPeerFromSession(peer_pattern: Pattern, driver: QuicSessionDriver) QuicPeer {
+    return driver.peer(peer_pattern);
 }
 
 fn quicAttachmentSupported(comptime pattern: Pattern) bool {
@@ -1187,11 +1229,15 @@ const FakeQuicPeer = struct {
         };
     }
 
-    fn session(self: *FakeQuicPeer) QuicSession {
+    fn driver(self: *FakeQuicPeer) QuicSessionDriver {
         return .{
             .context = self,
             .send = FakeQuicPeer.send,
         };
+    }
+
+    fn session(self: *FakeQuicPeer) QuicSession {
+        return self.driver();
     }
 
     fn send(context: *anyopaque, msg: message.Message, meta: QuicSendMeta) anyerror!void {
@@ -1225,7 +1271,7 @@ test "pair sends and receives owned messages over explicit inproc endpoints" {
     try std.testing.expectEqualStrings("hello", received.body);
 }
 
-test "pair sends over attached QUIC session callback" {
+test "pair sends and receives through attached QUIC session driver" {
     const allocator = std.testing.allocator;
 
     var left = try Socket(.pair).init(allocator, .{});
@@ -1233,7 +1279,7 @@ test "pair sends over attached QUIC session callback" {
     var quic_peer = FakeQuicPeer.init(allocator);
     defer quic_peer.deinit();
 
-    try left.attachQuicSession(quic_peer.session());
+    try left.attachQuicSessionDriver(quic_peer.driver());
     try left.send(.{ .subject = "control.ping", .body = "hello" });
 
     try std.testing.expectEqual(@as(usize, 1), quic_peer.sent.items.len);
@@ -1246,9 +1292,20 @@ test "pair sends over attached QUIC session callback" {
     try std.testing.expectEqualStrings("control.ping", captured.meta.subject);
     try std.testing.expectEqualStrings("control.ping", captured.msg.subject);
     try std.testing.expectEqualStrings("hello", captured.msg.body);
+
+    const inbound = try message.Message.init(allocator, .{
+        .subject = "control.pong",
+        .body = "world",
+    });
+    try left.receiveQuicMessage(inbound);
+
+    var received = try left.recv();
+    defer received.deinit();
+    try std.testing.expectEqualStrings("control.pong", received.subject);
+    try std.testing.expectEqualStrings("world", received.body);
 }
 
-test "req rep use QUIC callbacks while preserving id deadline and reply correlation" {
+test "req rep use QUIC session drivers while preserving id deadline and reply correlation" {
     const allocator = std.testing.allocator;
 
     var req = try Socket(.req).init(allocator, .{});
@@ -1261,8 +1318,8 @@ test "req rep use QUIC callbacks while preserving id deadline and reply correlat
     var rep_to_req = FakeQuicPeer.init(allocator);
     defer rep_to_req.deinit();
 
-    try req.attachQuicSession(req_to_rep.session());
-    try rep.attachQuicSession(rep_to_req.session());
+    try req.attachQuicSessionDriver(req_to_rep.driver());
+    try rep.attachQuicSessionDriver(rep_to_req.driver());
 
     const id = try req.sendRequestAt(.{
         .subject = "user.get",
@@ -1317,7 +1374,7 @@ test "QUIC send callback pressure rolls back rejected req inflight" {
     var quic_peer = FakeQuicPeer.initLimited(allocator, 1);
     defer quic_peer.deinit();
 
-    try req.attachQuicSession(quic_peer.session());
+    try req.attachQuicSessionDriver(quic_peer.driver());
 
     _ = try req.sendRequestAt(.{
         .subject = "user.get",
@@ -1336,13 +1393,15 @@ test "QUIC send callback pressure rolls back rejected req inflight" {
     try std.testing.expectEqual(@as(usize, 1), quic_peer.sent.items.len);
 }
 
-test "unsupported QUIC socket patterns and peers stay explicit" {
+test "unsupported QUIC socket patterns peers and listen dial stay explicit" {
     const allocator = std.testing.allocator;
 
     var pair_socket = try Socket(.pair).init(allocator, .{});
     defer pair_socket.deinit();
     var req_socket = try Socket(.req).init(allocator, .{});
     defer req_socket.deinit();
+    var rep_socket = try Socket(.rep).init(allocator, .{});
+    defer rep_socket.deinit();
     var quic_peer = FakeQuicPeer.init(allocator);
     defer quic_peer.deinit();
 
@@ -1353,6 +1412,12 @@ test "unsupported QUIC socket patterns and peers stay explicit" {
     defer pub_socket.deinit();
     try std.testing.expectError(error.UnsupportedTransport, pub_socket.listen(.{ .quic = "127.0.0.1:4433" }));
     try std.testing.expectError(error.UnsupportedTransport, pub_socket.dial(.{ .quic = "127.0.0.1:4433" }));
+    try std.testing.expectError(error.UnsupportedTransport, pair_socket.listen(.{ .quic = "127.0.0.1:4433" }));
+    try std.testing.expectError(error.UnsupportedTransport, pair_socket.dial(.{ .quic = "127.0.0.1:4433" }));
+    try std.testing.expectError(error.UnsupportedTransport, req_socket.listen(.{ .quic = "127.0.0.1:4433" }));
+    try std.testing.expectError(error.UnsupportedTransport, req_socket.dial(.{ .quic = "127.0.0.1:4433" }));
+    try std.testing.expectError(error.UnsupportedTransport, rep_socket.listen(.{ .quic = "127.0.0.1:4433" }));
+    try std.testing.expectError(error.UnsupportedTransport, rep_socket.dial(.{ .quic = "127.0.0.1:4433" }));
 }
 
 test "tryRecv returns null instead of WouldBlock for receive-capable sockets" {

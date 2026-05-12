@@ -18,6 +18,12 @@ pub const ReceivedReliable = struct {
     stream_id: u64,
     message: message.Message,
 
+    pub fn takeMessage(self: *ReceivedReliable) message.Message {
+        const msg = self.message;
+        self.* = undefined;
+        return msg;
+    }
+
     pub fn deinit(self: *ReceivedReliable) void {
         self.message.deinit();
         self.* = undefined;
@@ -96,21 +102,41 @@ pub const QuicSessionRuntime = struct {
         if (self.session.state() != .ready) return error.InvalidState;
 
         const stream_id = try self.stream_ids.nextBidi();
-        var sender = try quic_streams.ReliableMessageSender.init(
-            self.allocator,
-            stream_id,
-            outgoing,
-            self.envelope_codec,
-            .{},
-        );
-        errdefer sender.deinit();
-
-        try self.reliable_senders.put(stream_id, sender);
+        try self.queueReliableOnStream(stream_id, outgoing, .{});
         return stream_id;
     }
 
     pub fn sendReliable(self: *QuicSessionRuntime, outgoing: message.OutgoingMessage) !u64 {
         return self.queueReliable(outgoing);
+    }
+
+    pub fn queueReliableOnStream(
+        self: *QuicSessionRuntime,
+        stream_id: u64,
+        outgoing: message.OutgoingMessage,
+        options: quic_streams.ReliableWriteOptions,
+    ) !void {
+        if (self.session.state() != .ready) return error.InvalidState;
+        if (self.reliable_senders.contains(stream_id)) return error.StreamAlreadyOpen;
+
+        var sender = try quic_streams.ReliableMessageSender.init(
+            self.allocator,
+            stream_id,
+            outgoing,
+            self.envelope_codec,
+            options,
+        );
+        errdefer sender.deinit();
+
+        try self.reliable_senders.put(stream_id, sender);
+    }
+
+    pub fn replyReliableOnStream(
+        self: *QuicSessionRuntime,
+        stream_id: u64,
+        outgoing: message.OutgoingMessage,
+    ) !void {
+        try self.queueReliableOnStream(stream_id, outgoing, .{ .open_bidi = false });
     }
 
     pub fn acceptReliableStream(self: *QuicSessionRuntime, stream_id: u64) !void {
@@ -123,6 +149,32 @@ pub const QuicSessionRuntime = struct {
             self.envelope_codec,
         );
         try self.reliable_receivers.put(stream_id, receiver);
+    }
+
+    pub fn acceptPeerBidiStreamsConnection(self: *QuicSessionRuntime, conn: *quic_zig.Connection) !usize {
+        if (self.session.state() != .ready) return 0;
+
+        var accepted: usize = 0;
+        var stream_ids: std.ArrayList(u64) = .empty;
+        defer stream_ids.deinit(self.allocator);
+
+        var it = conn.streamIterator();
+        while (it.next()) |entry| {
+            const stream_id = entry.key_ptr.*;
+            if (!isPeerBidiStreamId(self.session.role, stream_id)) continue;
+            if (self.reliable_receivers.contains(stream_id)) continue;
+            try stream_ids.append(self.allocator, stream_id);
+        }
+
+        for (stream_ids.items) |stream_id| {
+            self.acceptReliableStream(stream_id) catch |err| switch (err) {
+                error.StreamAlreadyOpen => continue,
+                else => return err,
+            };
+            accepted += 1;
+        }
+
+        return accepted;
     }
 
     pub fn pumpConnection(self: *QuicSessionRuntime, conn: *quic_zig.Connection) !PumpResult {
@@ -311,6 +363,15 @@ fn helloFromOptions(options: quic.QuicOptions) control.Hello {
         .datagram_enabled = options.datagram_enabled,
         .heartbeat_interval_ms = options.heartbeat_interval_ms,
         .auth = options.auth,
+    };
+}
+
+pub fn isPeerBidiStreamId(role: quic.Role, stream_id: u64) bool {
+    if ((stream_id & 0x2) != 0) return false;
+    const initiated_by_server = (stream_id & 0x1) != 0;
+    return switch (role) {
+        .client => initiated_by_server,
+        .server => !initiated_by_server,
     };
 }
 
@@ -528,6 +589,56 @@ test "session runtime transfers receiver ownership to inbox" {
     try std.testing.expectEqual(@as(usize, 0), runtime.inboxLen());
 }
 
+test "session runtime replies on an accepted peer stream" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .server, .{ .peer_id = "server-a" });
+    defer runtime.deinit();
+    var peer = try QuicSessionRuntime.init(allocator, 2, .client, .{ .peer_id = "client-a" });
+    defer peer.deinit();
+    var io = FakeTransport.init(allocator);
+    defer io.deinit();
+    var peer_io = FakeTransport.init(allocator);
+    defer peer_io.deinit();
+    try runtime.onQuicReady();
+    try peer.onQuicReady();
+    try pumpBoth(&peer, &peer_io, &runtime, &io);
+
+    const stream_id: u64 = 0;
+    try runtime.replyReliableOnStream(stream_id, .{
+        .subject = "user.get",
+        .id = 7,
+        .body = "Ada",
+    });
+
+    while (runtime.pendingReliableSenders() != 0) {
+        _ = try runtime.pump(&io);
+    }
+
+    const stream = io.streams.get(stream_id) orelse return error.StreamNotFound;
+    try std.testing.expect(!stream.opened_bidi);
+    try std.testing.expect(stream.finished);
+
+    const encoded = try quic_streams.encodeReliableMessage(allocator, .{
+        .subject = "jobs.run",
+        .id = 9,
+        .body = "now",
+    }, .{});
+    defer allocator.free(encoded);
+
+    const entry = try io.getOrPutStream(stream_id);
+    try entry.value_ptr.incoming.appendSlice(allocator, encoded);
+    entry.value_ptr.final_size = encoded.len;
+
+    try runtime.acceptReliableStream(stream_id);
+    _ = try runtime.pump(&io);
+
+    var received = runtime.recvReliable().?;
+    var owned = received.takeMessage();
+    defer owned.deinit();
+    try std.testing.expectEqualStrings("jobs.run", owned.subject);
+}
+
 test "session runtime gates reliable streams until ready" {
     const allocator = std.testing.allocator;
 
@@ -539,4 +650,13 @@ test "session runtime gates reliable streams until ready" {
         .body = "ping",
     }));
     try std.testing.expectError(error.InvalidState, runtime.acceptReliableStream(0));
+}
+
+test "peer bidi stream id helper follows QUIC low bits" {
+    try std.testing.expect(isPeerBidiStreamId(.server, 0));
+    try std.testing.expect(!isPeerBidiStreamId(.server, 1));
+    try std.testing.expect(!isPeerBidiStreamId(.server, 2));
+    try std.testing.expect(isPeerBidiStreamId(.client, 1));
+    try std.testing.expect(!isPeerBidiStreamId(.client, 0));
+    try std.testing.expect(!isPeerBidiStreamId(.client, 3));
 }

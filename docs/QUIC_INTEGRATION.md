@@ -39,7 +39,7 @@ across qmsg-owned transport modules:
 - qmsg control-stream marker plus length-prefixed control-frame encoding;
 - HELLO encode/decode and session readiness after QUIC readiness plus peer
   HELLO exchange;
-- `Node`/`App` lifecycle placeholders for QUIC listeners and sessions;
+- `Node`/`App` lifecycle hooks for QUIC listeners and sessions;
 - socket-free runtime wrappers for `quic_zig.Server` and `quic_zig.Client`;
 - low-level UDP socket owners for embeddable listener/client loops;
 - a per-session driver that queues local HELLO, pumps control streams, and
@@ -57,9 +57,30 @@ across qmsg-owned transport modules:
 - a one-process `quic-runtime-reqrep` smoke example.
 
 This is still not the final network transport. qmsg has the low-level UDP and
-session-driver pieces, but `Node` does not yet wire them into a complete
-listener/dialer loop, expose public QUIC socket convenience APIs, or
-automatically flush SUBSCRIBE/CREDIT state over live sessions.
+session-driver pieces and `Node` now owns listener/client tick wiring, but it
+does not yet expose public QUIC socket convenience APIs, provide live-UDP
+examples, or automatically flush SUBSCRIBE/CREDIT state over live sessions.
+
+## Current Embedding Examples
+
+The current examples intentionally avoid qmsg-server/qmsg-client binaries.
+They show the library surfaces that are present today:
+
+- `examples/quic_runtime_reqrep.zig` drives `quic_zig.Client` and
+  `quic_zig.Server` through qmsg runtime wrappers in one process, exchanges
+  qmsg HELLO, and moves one req/rep over a reliable stream.
+- `examples/quic_socket_hooks.zig` shows the public socket hook contract:
+  sockets attach a driver callback with `attachQuicSession`, the driver accepts
+  owned messages plus `QuicSendMeta`, and decoded inbound messages are handed
+  back with `receiveQuicMessage`.
+- `examples/app_ergonomics.zig` shows the handler facade over inproc req/rep.
+  The same handler dispatch shape is available to QUIC drivers through
+  `App.dispatchQuic` after they have decoded a qmsg message.
+
+Actual UDP localhost examples for `App.listenQuic` or `Socket.listen(.quic)`
+remain pending. `Node.listenQuic`/`dialQuic` now own UDP sockets and session
+drivers, but `Socket.listen(.quic)`/`dial(.quic)` are still explicit
+`UnsupportedTransport` paths until the public convenience spelling is chosen.
 
 ## Build Integration
 
@@ -377,14 +398,16 @@ the QUIC adapter.
    echo over the hermetic transport.
 6. Implement req/rep over one bidi stream, including deadline cancellation via
    reset/stop-sending and stable qmsg error mapping.
-7. Wire qmsg's UDP owner and per-session driver into `Node` listen/dial loops,
-   borrowing the shape of `quic_zig.transport.udp_server` / `udp_client` but
-   keeping qmsg dispatch in the same loop.
+7. Continue hardening qmsg's UDP owner and per-session driver inside `Node`
+   listen/dial loops, borrowing the shape of `quic_zig.transport.udp_server` /
+   `udp_client` while keeping qmsg dispatch in the same loop.
 8. Add public socket convenience APIs over that loop:
    `listen(.quic)`/`dial(.quic)` or the equivalent Zig-native spelling.
-9. Add optional DATAGRAM support for `Flags.unreliable`; test too-large,
+9. Add actual UDP localhost library examples for App and Socket req/rep once
+   the Node loop above is runnable.
+10. Add optional DATAGRAM support for `Flags.unreliable`; test too-large,
    disabled, queue-full, and ack/loss event paths.
-10. Add production hardening knobs: Retry, NEW_TOKEN, stateless reset,
+11. Add production hardening knobs: Retry, NEW_TOKEN, stateless reset,
    listener/source rate limits, qlog callback, keylog callback, and migration
    callback.
 

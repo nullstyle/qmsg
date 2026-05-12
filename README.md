@@ -37,7 +37,7 @@ tranches are building around:
 
 The inproc socket examples build and run against the current public API. The
 App facade can now serve inproc REP routes through `runOnce`, and can prepare
-QUIC listener/session placeholders for lifecycle plumbing. QUIC currently has
+QUIC listener/session runtime plumbing. QUIC currently has
 a compiled `quic-zig` dependency, option wrappers, transport-parameter
 mapping, socket-free runtime wrappers around `quic_zig.Server`/`Client`,
 Node-embeddable UDP socket owners, per-session QUIC drivers, socket QUIC
@@ -45,8 +45,10 @@ attachment callbacks, App dispatch for already-decoded QUIC messages,
 incremental control/reliable stream pumps, cancellation/error mapping,
 compact DATAGRAM envelope helpers, and hermetic tests that drive quic-zig
 handshake, qmsg HELLO, and reliable req/rep over QUIC streams. Wiring these
-pieces into `Node.listenQuic`/`openQuicSession` runtime loops and public
-`Socket.listen(.quic)`/`dial(.quic)` convenience APIs remains future work.
+pieces into `Node.listenQuic`/`dialQuic` runtime loops has started: `Node`
+owns UDP listener/client sockets, per-session drivers, and tick-driven
+reliable stream pumping. Public `Socket.listen(.quic)`/`dial(.quic)`
+convenience APIs and live UDP examples remain future work.
 
 ## Package Use
 
@@ -134,8 +136,8 @@ The high-level facade is route-like, but the routes are qmsg patterns and
 subjects, not HTTP methods and paths. The current runnable facade path is
 inproc REP through `listenInprocRep` and `runOnce`; QUIC message dispatch is
 available for session drivers that deliver decoded messages into
-`dispatchQuic`, while the full `listenQuic`/`openQuicSession` node event loop
-is still being assembled.
+`dispatchQuic`, and `listenQuic`/`dialQuic` expose Node-owned listener/client
+tick plumbing for embedders.
 
 ```zig
 const qmsg = @import("qmsg");
@@ -157,6 +159,42 @@ pub fn main() !void {
 See [examples/app_ergonomics.zig](examples/app_ergonomics.zig) for the current
 facade handler shape over inproc req/rep.
 
+## Embeddable QUIC Hooks
+
+The current public QUIC hooks are deliberately library-level. A runtime driver
+owns UDP, stream ids, stream encoding, and flow control. Sockets own pattern
+state, request ids, deadlines, and receive queues.
+
+For socket embedding, attach a session callback and let the driver consume
+owned messages:
+
+```zig
+try req.attachQuicSession(.{
+    .context = driver,
+    .send = sendThroughDriver,
+});
+
+const id = try req.sendRequest(.{
+    .subject = "user.get",
+    .deadline_ms = 250,
+    .body = "user-42",
+});
+```
+
+When the driver decodes an inbound qmsg message from QUIC, hand ownership back
+to the socket:
+
+```zig
+try req.receiveQuicMessage(decoded_reply);
+var reply = try req.recv();
+```
+
+For App embedding, a session driver that has already decoded a reliable stream
+or datagram can call `dispatchQuic`, `dispatchQuicReliable`, or
+`dispatchQuicDatagram` and encode any returned replies/publications. See
+[examples/quic_socket_hooks.zig](examples/quic_socket_hooks.zig) for a
+buildable fake-driver req/rep flow using the current socket hooks.
+
 ## QUIC Runtime Smoke
 
 The current QUIC smoke example is intentionally one process: it drives
@@ -168,10 +206,16 @@ zig build examples
 ./zig-out/bin/quic-runtime-reqrep
 ```
 
-That path proves the qmsg protocol mapping without requiring the App/Node loop
-to own sockets yet. The lower-level `transport.quic_udp` owner and
-`transport.quic_session_runtime` driver are available for embedding; the next
-step is wiring them into the high-level library runtime.
+That path proves the qmsg protocol mapping without requiring live UDP sockets.
+The lower-level `transport.quic_udp` owner and
+`transport.quic_session_runtime` driver are now wired into the `Node` tick
+surface for listeners/dialers, while the public socket convenience APIs still
+stay explicit about unsupported direct `.quic` endpoints.
+
+A real UDP localhost App/Socket example is pending until the Node loop is
+covered in an environment that permits UDP binds and the public socket
+convenience API is chosen. Until then, examples stay scoped to embeddable
+runtime pieces, Node-owned transport plumbing, and public hook contracts.
 
 ## Design Tenets
 

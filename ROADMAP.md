@@ -13,10 +13,10 @@ phase.
 | 0 Decisions and spikes | Complete enough to proceed | Package, ALPN, envelope, inproc, auth boundary, local `quic-zig` dependency, transport-parameter mapping, QUIC HELLO, reliable stream, DATAGRAM, and cancellation spikes exist. |
 | 1 Core package skeleton | Complete | Core message, envelope, subject, queue, transport boundary, and inproc transport are implemented and tested. |
 | 2 Pair and req/rep over inproc | Complete for inproc MVP | Pair and req/rep work over inproc with ids, deadlines, cancellation, queue pressure tests, and error replies. |
-| 3 QUIC transport MVP | In progress | `quic-zig` is wired locally. qmsg now has socket-free runtime wrappers, Node-embeddable UDP socket owners, qmsg HELLO over control streams, a per-session QUIC driver, reliable stream pumps, req/rep over hermetic QUIC runtime tests, and a one-process `quic-runtime-reqrep` smoke example. Node/App event-loop wiring and public QUIC socket convenience APIs remain. |
-| 4 App facade | Partial | Route registration, `Context`, in-memory dispatch, inproc REP `runOnce`, auth checks, default REP error replies, QUIC listener/session lifecycle placeholders, and decoded QUIC message dispatch exist. Full QUIC listener/session loop integration remains. |
+| 3 QUIC transport MVP | In progress | `quic-zig` is wired locally. qmsg now has socket-free runtime wrappers, Node-embeddable UDP socket owners, qmsg HELLO over control streams, a per-session QUIC driver, Node listener/client tick wiring, reliable stream pumps, req/rep over hermetic QUIC runtime tests, and a one-process `quic-runtime-reqrep` smoke example. Public QUIC socket convenience APIs and real UDP smoke coverage remain. |
+| 4 App facade | Partial | Route registration, `Context`, in-memory dispatch, inproc REP `runOnce`, auth checks, default REP error replies, QUIC listener/session lifecycle hooks, decoded QUIC message dispatch, and socket hook examples exist. Full App-over-live-UDP examples remain. |
 | 5 Pub/sub reliable | Partial | Inproc pub/sub, source-side subscription registry, replay/update, slow-consumer behavior, transport-agnostic SUBSCRIBE/UNSUBSCRIBE helpers, and QUIC control-frame queue/apply state are implemented. Automatic live-session emission remains. |
-| 6 QUIC datagrams | Started | HELLO carries datagram capability and qmsg has compact datagram envelope plus send/receive/error-mapping helpers, and App datagram handlers can run through decoded QUIC dispatch. Runtime datagram ingestion remains. |
+| 6 QUIC datagrams | Started | HELLO carries datagram capability and qmsg has compact datagram envelope plus send/receive/error-mapping helpers, and App datagram handlers can run through decoded QUIC dispatch. Node-level datagram polling and handler emission remain. |
 | 7 Push/pull | Partial | Inproc push/pull has fair selection, puller credit, queue policy handling, at-most-once semantics, transport-agnostic CREDIT helpers, and QUIC control-frame queue/apply state. Automatic live-session emission remains. |
 | 8 Survey/respondent and bus | Not started | No public API or state machines yet. |
 | 9 Typed codecs and ergonomics | Not started | Raw bytes remain first-class; typed helpers are future work. |
@@ -150,7 +150,8 @@ Tasks:
   - `onConnect`;
   - `onClose`.
 - Implement `Context`.
-- Add QUIC listener/session lifecycle placeholders without promising UDP I/O.
+- Add QUIC listener/session lifecycle hooks and initial UDP tick wiring without
+  promising the final public socket convenience API.
 - Add app-owned scratch allocator or per-handler temporary arena option.
 - Add default error handling policy.
 - Add auth hooks and session authorization plumbing, initially independent of
@@ -318,8 +319,8 @@ Integration tests:
 - hermetic QUIC runtime req/rep tests over `quic_zig.Server`/`Client`;
 - QUIC close/reset/cancel helper tests;
 - datagram envelope/error-mapping tests;
-- future real-UDP localhost pair/req/rep once Node wires the UDP owner into
-  socket dispatch.
+- future real-UDP localhost pair/req/rep once the environment permits UDP binds
+  and public socket dispatch is wired.
 
 Fuzz/property tests:
 
@@ -330,8 +331,10 @@ Fuzz/property tests:
 Interop tests:
 
 - current one-process `quic-runtime-reqrep` example;
-- future library-embedding localhost examples once Node wires UDP transport
-  into App/Socket dispatch;
+- current fake-driver `quic-socket-hooks` example for the public socket
+  attachment contract;
+- future library-embedding localhost examples once App/Socket dispatch over
+  live UDP is wired;
 - scripted smoke tests for each pattern;
 - packet loss/reorder tests once transport hooks support them.
 

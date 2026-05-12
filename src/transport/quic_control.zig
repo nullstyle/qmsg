@@ -43,6 +43,7 @@ pub const State = struct {
     credit_ledger: *pushpull.CreditLedger,
     default_queue: queue.QueueOptions = .{},
     outgoing: std.ArrayList(control.Frame) = .empty,
+    queue_epoch: u64 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -87,11 +88,17 @@ pub const State = struct {
         return self.outgoing.items;
     }
 
+    pub fn queuedFrameCount(self: State) usize {
+        return self.outgoing.items.len;
+    }
+
     pub fn clearQueuedFrames(self: *State) void {
+        const had_frames = self.outgoing.items.len != 0;
         for (self.outgoing.items) |*frame| {
             frame.deinit();
         }
         self.outgoing.clearRetainingCapacity();
+        if (had_frames) self.bumpQueueEpoch();
     }
 
     /// Builds the existing QUIC control-stream sender from currently queued
@@ -111,6 +118,18 @@ pub const State = struct {
             codec_options,
             write_options,
         );
+    }
+
+    /// Builds a sender tied to the current queued-frame prefix. The queue is
+    /// left intact until the sender is acked or pumped to completion; frames
+    /// appended after this sender is built are preserved for the next flush.
+    pub fn initFlushSender(
+        self: *State,
+        stream_id: u64,
+        codec_options: control.CodecOptions,
+        write_options: quic_streams.ControlWriteOptions,
+    ) !FlushSender {
+        return FlushSender.init(self, stream_id, codec_options, write_options);
     }
 
     pub fn applyReceived(self: *State, peer_id: pubsub.PeerId, frame: control.Frame) !ApplyResult {
@@ -142,6 +161,71 @@ pub const State = struct {
         var owned = try cloneQueuedFrame(self.allocator, frame);
         errdefer owned.deinit();
         try self.outgoing.append(self.allocator, owned);
+    }
+
+    fn clearQueuedFramePrefix(self: *State, frame_count: usize, queue_epoch: u64) void {
+        if (queue_epoch != self.queue_epoch) return;
+
+        const count = @min(frame_count, self.outgoing.items.len);
+        if (count == 0) return;
+
+        for (self.outgoing.items[0..count]) |*frame| {
+            frame.deinit();
+        }
+
+        const remaining = self.outgoing.items.len - count;
+        std.mem.copyForwards(
+            control.Frame,
+            self.outgoing.items[0..remaining],
+            self.outgoing.items[count..],
+        );
+        self.outgoing.shrinkRetainingCapacity(remaining);
+        self.bumpQueueEpoch();
+    }
+
+    fn bumpQueueEpoch(self: *State) void {
+        self.queue_epoch +%= 1;
+    }
+};
+
+pub const FlushSender = struct {
+    state: *State,
+    sender: quic_streams.ControlStreamSender,
+    frame_count: usize,
+    queue_epoch: u64,
+    completed: bool = false,
+
+    fn init(
+        state: *State,
+        stream_id: u64,
+        codec_options: control.CodecOptions,
+        write_options: quic_streams.ControlWriteOptions,
+    ) !FlushSender {
+        const frame_count = state.queuedFrameCount();
+        const sender = try state.initSender(stream_id, codec_options, write_options);
+        return .{
+            .state = state,
+            .sender = sender,
+            .frame_count = frame_count,
+            .queue_epoch = state.queue_epoch,
+        };
+    }
+
+    pub fn deinit(self: *FlushSender) void {
+        self.sender.deinit();
+        self.* = undefined;
+    }
+
+    pub fn pump(self: *FlushSender, transport: anytype) !quic_streams.WriteProgress {
+        const progress = try self.sender.pump(transport);
+        if (progress == .complete) self.ackComplete();
+        return progress;
+    }
+
+    pub fn ackComplete(self: *FlushSender) void {
+        if (self.completed) return;
+        self.state.clearQueuedFramePrefix(self.frame_count, self.queue_epoch);
+        self.completed = true;
     }
 };
 
@@ -181,6 +265,34 @@ fn cloneQueuedFrame(allocator: std.mem.Allocator, frame: control.Frame) !control
         else => error.UnexpectedFrame,
     };
 }
+
+const FlushTestStream = struct {
+    allocator: std.mem.Allocator,
+    writes: std.ArrayList(u8) = .empty,
+    write_limit: usize = std.math.maxInt(usize),
+    opened_uni: bool = false,
+    finished: bool = false,
+
+    fn deinit(self: *FlushTestStream) void {
+        self.writes.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn openUni(self: *FlushTestStream, _: u64) !void {
+        self.opened_uni = true;
+    }
+
+    pub fn streamWrite(self: *FlushTestStream, _: u64, bytes: []const u8) !usize {
+        const writable = @min(bytes.len, self.write_limit);
+        if (writable == 0) return 0;
+        try self.writes.appendSlice(self.allocator, bytes[0..writable]);
+        return writable;
+    }
+
+    pub fn streamFinish(self: *FlushTestStream, _: u64) !void {
+        self.finished = true;
+    }
+};
 
 test "queued control frames own emitted borrowed slices" {
     const allocator = std.testing.allocator;
@@ -223,6 +335,96 @@ test "queued control frames own emitted borrowed slices" {
 
     state.clearQueuedFrames();
     try std.testing.expectEqual(@as(usize, 0), state.queuedFrames().len);
+}
+
+test "flush sender clears queued prefix only after completion" {
+    const allocator = std.testing.allocator;
+
+    var registry = pubsub.Registry.init(allocator);
+    defer registry.deinit();
+    var ledger = pushpull.CreditLedger.init(allocator);
+    defer ledger.deinit();
+
+    var state = State.init(allocator, &registry, &ledger, .{});
+    defer state.deinit();
+
+    try state.queueSubscribe("jobs.resize", .{});
+    try state.queueCredit("pull.*", .{ .messages = 2, .bytes = 128 });
+    try std.testing.expectEqual(@as(usize, 2), state.queuedFrameCount());
+
+    var flush = try state.initFlushSender(quic_streams.localControlStreamId(.client), .{}, .{});
+    defer flush.deinit();
+
+    try state.queueUnsubscribe("jobs.resize");
+
+    var io: FlushTestStream = .{
+        .allocator = allocator,
+        .write_limit = 0,
+    };
+    defer io.deinit();
+
+    try std.testing.expectEqual(quic_streams.WriteProgress.pending, try flush.pump(&io));
+    try std.testing.expect(io.opened_uni);
+    try std.testing.expectEqual(@as(usize, 3), state.queuedFrameCount());
+
+    io.write_limit = 3;
+    while (try flush.pump(&io) == .pending) {}
+
+    try std.testing.expect(io.finished);
+    try std.testing.expectEqual(@as(usize, 1), state.queuedFrameCount());
+    try std.testing.expectEqual(control.Tag.unsubscribe, std.meta.activeTag(state.queuedFrames()[0]));
+    try std.testing.expectEqualStrings("jobs.resize", state.queuedFrames()[0].unsubscribe.filter);
+
+    try std.testing.expectEqual(quic_streams.WriteProgress.complete, try flush.pump(&io));
+    try std.testing.expectEqual(@as(usize, 1), state.queuedFrameCount());
+}
+
+test "failed flush sender init preserves queued frames" {
+    const allocator = std.testing.allocator;
+
+    var registry = pubsub.Registry.init(allocator);
+    defer registry.deinit();
+    var ledger = pushpull.CreditLedger.init(allocator);
+    defer ledger.deinit();
+
+    var state = State.init(allocator, &registry, &ledger, .{});
+    defer state.deinit();
+
+    try state.queueSubscribe("jobs.resize", .{});
+
+    try std.testing.expectError(
+        error.SubjectFilterTooLarge,
+        state.initFlushSender(quic_streams.localControlStreamId(.client), .{ .max_filter_len = 4 }, .{}),
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.queuedFrameCount());
+    try std.testing.expectEqual(control.Tag.subscribe, std.meta.activeTag(state.queuedFrames()[0]));
+    try std.testing.expectEqualStrings("jobs.resize", state.queuedFrames()[0].subscribe.filter);
+}
+
+test "stale flush completion does not clear requeued frames" {
+    const allocator = std.testing.allocator;
+
+    var registry = pubsub.Registry.init(allocator);
+    defer registry.deinit();
+    var ledger = pushpull.CreditLedger.init(allocator);
+    defer ledger.deinit();
+
+    var state = State.init(allocator, &registry, &ledger, .{});
+    defer state.deinit();
+
+    try state.queueSubscribe("jobs.old", .{});
+
+    var flush = try state.initFlushSender(quic_streams.localControlStreamId(.client), .{}, .{});
+    defer flush.deinit();
+
+    state.clearQueuedFrames();
+    try state.queueSubscribe("jobs.new", .{});
+
+    flush.ackComplete();
+
+    try std.testing.expectEqual(@as(usize, 1), state.queuedFrameCount());
+    try std.testing.expectEqual(control.Tag.subscribe, std.meta.activeTag(state.queuedFrames()[0]));
+    try std.testing.expectEqualStrings("jobs.new", state.queuedFrames()[0].subscribe.filter);
 }
 
 test "apply received subscribe unsubscribe and credit frames" {
@@ -282,6 +484,7 @@ test "apply received frames reports duplicate and removal results deterministica
     try std.testing.expectEqual(@as(usize, 1), summary.not_subscribed);
     try std.testing.expectEqual(@as(usize, 1), summary.credit_updated);
     try std.testing.expectEqual(@as(usize, 1), summary.credit_removed);
+    try std.testing.expect(registry.matches(9, "events.created"));
     try std.testing.expectEqual(@as(usize, 0), ledger.len());
 }
 

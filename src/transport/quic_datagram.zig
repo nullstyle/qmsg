@@ -36,6 +36,30 @@ pub const ReceiveOptions = struct {
     codec: CodecOptions = .{},
 };
 
+pub const ReceiveError = std.mem.Allocator.Error || error{
+    MessageTooLarge,
+    MalformedFrame,
+};
+
+pub const DecodedDatagram = struct {
+    message: message.Message,
+    arrived_in_early_data: bool = false,
+    owns_message: bool = true,
+
+    pub fn deinit(self: *DecodedDatagram) void {
+        if (self.owns_message) self.message.deinit();
+        self.* = undefined;
+    }
+
+    pub fn takeMessage(self: *DecodedDatagram) message.Message {
+        std.debug.assert(self.owns_message);
+        self.owns_message = false;
+        return self.message;
+    }
+};
+
+pub const ReceivedDatagram = DecodedDatagram;
+
 pub const Received = struct {
     msg: message.Message,
     arrived_in_early_data: bool = false,
@@ -133,6 +157,29 @@ pub fn decode(
     });
 }
 
+pub fn decodePayload(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    options: ReceiveOptions,
+) ReceiveError!DecodedDatagram {
+    return decodePayloadWithEarlyData(allocator, payload, false, options);
+}
+
+pub fn decodeIncomingDatagram(
+    allocator: std.mem.Allocator,
+    info: anytype,
+    receive_buffer: []const u8,
+    options: ReceiveOptions,
+) ReceiveError!ReceivedDatagram {
+    if (info.len > receive_buffer.len) return error.MalformedFrame;
+    return decodePayloadWithEarlyData(
+        allocator,
+        receive_buffer[0..info.len],
+        info.arrived_in_early_data,
+        options,
+    );
+}
+
 pub fn send(
     conn: *quic_zig.Connection,
     allocator: std.mem.Allocator,
@@ -158,17 +205,25 @@ pub fn receive(
     allocator: std.mem.Allocator,
     options: ReceiveOptions,
 ) !?Received {
-    const scratch = try allocator.alloc(u8, options.codec.max_payload_size);
+    var received = (try receiveDatagram(conn, allocator, options)) orelse return null;
+
+    return .{
+        .msg = received.takeMessage(),
+        .arrived_in_early_data = received.arrived_in_early_data,
+    };
+}
+
+pub fn receiveDatagram(
+    conn: *quic_zig.Connection,
+    allocator: std.mem.Allocator,
+    options: ReceiveOptions,
+) !?ReceivedDatagram {
+    const scratch_len = try receiveScratchLen(options.codec);
+    const scratch = try allocator.alloc(u8, scratch_len);
     defer allocator.free(scratch);
 
     const info = conn.receiveDatagramInfo(scratch) orelse return null;
-    var msg = try decode(allocator, scratch[0..info.len], options.codec);
-    errdefer msg.deinit();
-
-    return .{
-        .msg = msg,
-        .arrived_in_early_data = info.arrived_in_early_data,
-    };
+    return try decodeIncomingDatagram(allocator, info, scratch, options);
 }
 
 pub fn mapSendError(err: anyerror, queue_full_mapping: QueueFullMapping) anyerror {
@@ -183,12 +238,44 @@ pub fn mapSendError(err: anyerror, queue_full_mapping: QueueFullMapping) anyerro
     };
 }
 
+pub fn mapReceiveError(err: anyerror) ReceiveError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.MessageTooLarge,
+        error.HeaderLimitExceeded,
+        error.HeaderBytesLimitExceeded,
+        => error.MessageTooLarge,
+        error.MalformedFrame,
+        error.InvalidMessage,
+        error.InvalidSubject,
+        => error.MalformedFrame,
+        else => error.MalformedFrame,
+    };
+}
+
 pub fn shouldUseReliableFallback(err: anyerror, policy: FallbackPolicy) bool {
     if (policy != .allow_reliable) return false;
     return switch (err) {
         error.DatagramUnavailable, error.DatagramTooLarge, error.MessageTooLarge => true,
         else => false,
     };
+}
+
+fn decodePayloadWithEarlyData(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    arrived_in_early_data: bool,
+    options: ReceiveOptions,
+) ReceiveError!DecodedDatagram {
+    const msg = decode(allocator, payload, options.codec) catch |err| return mapReceiveError(err);
+    return .{
+        .message = msg,
+        .arrived_in_early_data = arrived_in_early_data,
+    };
+}
+
+fn receiveScratchLen(options: CodecOptions) ReceiveError!usize {
+    return addSize(options.max_payload_size, 1) catch error.MessageTooLarge;
 }
 
 fn validateOutgoing(outgoing: message.OutgoingMessage, options: CodecOptions) !void {
@@ -348,6 +435,107 @@ test "datagram envelope round trips owned message fields" {
     try std.testing.expectEqualStrings("presence.ada", decoded.subject);
     try std.testing.expectEqualStrings("online", decoded.body);
     try std.testing.expectEqualStrings("content-type", decoded.headers[1].name);
+}
+
+test "datagram receive helper decodes incoming datagram metadata" {
+    const allocator = std.testing.allocator;
+
+    const encoded = try encode(allocator, .{
+        .subject = "presence.ada",
+        .id = 7,
+        .flags = .{ .final = true, .unreliable = true },
+        .body = "online",
+    }, .{ .max_payload_size = 256 });
+    defer allocator.free(encoded);
+
+    const info = .{
+        .len = encoded.len,
+        .arrived_in_early_data = true,
+    };
+    var received = try decodeIncomingDatagram(allocator, info, encoded, .{
+        .codec = .{ .max_payload_size = 256 },
+    });
+    defer received.deinit();
+
+    try std.testing.expect(received.arrived_in_early_data);
+    try std.testing.expectEqual(@as(message.MessageId, 7), received.message.id);
+    try std.testing.expect(received.message.flags.unreliable);
+    try std.testing.expectEqualStrings("presence.ada", received.message.subject);
+    try std.testing.expectEqualStrings("online", received.message.body);
+}
+
+test "datagram receive helper maps malformed payloads stably" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.MalformedFrame, decodePayload(allocator, &.{0x40}, .{}));
+    try std.testing.expectError(error.MalformedFrame, decodePayload(allocator, &.{ 0, 0xf0 }, .{}));
+    try std.testing.expectError(error.MalformedFrame, decodePayload(allocator, &.{ 0, 0, 0 }, .{}));
+}
+
+test "datagram receive helper maps oversized payloads stably" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.MessageTooLarge, decodePayload(allocator, &.{ 0, 0, 0, 0, 0 }, .{
+        .codec = .{ .max_payload_size = 4 },
+    }));
+
+    const too_many_headers = try encode(allocator, .{
+        .subject = "presence.ada",
+        .headers = &.{
+            .{ .name = "a", .value = "b" },
+            .{ .name = "c", .value = "d" },
+        },
+    }, .{ .max_headers = 2 });
+    defer allocator.free(too_many_headers);
+
+    try std.testing.expectError(error.MessageTooLarge, decodePayload(allocator, too_many_headers, .{
+        .codec = .{ .max_headers = 1 },
+    }));
+}
+
+test "datagram receive helper owns decoded message storage" {
+    const allocator = std.testing.allocator;
+
+    const encoded = try encode(allocator, .{
+        .subject = "presence.ada",
+        .id = 11,
+        .headers = &.{.{ .name = "trace", .value = "abc" }},
+        .body = "online",
+    }, .{ .max_payload_size = 256 });
+
+    const mutable = try allocator.dupe(u8, encoded);
+    allocator.free(encoded);
+    defer allocator.free(mutable);
+
+    var decoded = try decodePayload(allocator, mutable, .{
+        .codec = .{ .max_payload_size = 256 },
+    });
+    defer decoded.deinit();
+
+    @memset(mutable, 0xaa);
+
+    try std.testing.expectEqualStrings("presence.ada", decoded.message.subject);
+    try std.testing.expectEqualStrings("online", decoded.message.body);
+    try std.testing.expectEqualStrings("trace", decoded.message.headers[0].name);
+    try std.testing.expectEqualStrings("abc", decoded.message.headers[0].value);
+}
+
+test "datagram receive helper can transfer message ownership for dispatch" {
+    const allocator = std.testing.allocator;
+
+    const encoded = try encode(allocator, .{
+        .subject = "presence.ada",
+        .body = "online",
+    }, .{});
+    defer allocator.free(encoded);
+
+    var decoded = try decodePayload(allocator, encoded, .{});
+    var msg = decoded.takeMessage();
+    defer msg.deinit();
+    decoded.deinit();
+
+    try std.testing.expectEqualStrings("presence.ada", msg.subject);
+    try std.testing.expectEqualStrings("online", msg.body);
 }
 
 test "datagram envelope enforces compact bounds" {

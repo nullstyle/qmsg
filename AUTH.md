@@ -156,6 +156,13 @@ challenge-bound credentials but no nonce/challenge was installed. The purpose is
 to stop a token minted for one protocol, listener, or audience from being
 replayed as a valid `qmsg` credential somewhere else.
 
+`auth.HelloChallengeState` is the transport-independent pre-auth helper for
+server-side challenges. It mints and owns bounded challenge bytes, exposes
+`challenge()` for advertisement in HELLO/auth negotiation, installs a
+`require_challenge` binding into an `AuthConfig`, and invalidates the bytes with
+`consume()` or `discard()`. After invalidation, `install()` and
+`bindingPolicy()` fail closed with `ChallengeRequired`.
+
 `control.Hello.auth.challenge` is an advertisement/propagation hook for
 transports. It is encoded only when non-empty and bounded by
 `control.CodecOptions.max_hello_challenge_len`. When verifying an incoming
@@ -318,6 +325,8 @@ For service-to-service deployments, the clean model is:
 The core API now carries this hook in the HELLO auth surface:
 
 - mint bounded bytes with `auth.allocHelloChallenge` or `auth.fillHelloChallenge`;
+- or hold the per-session nonce in `auth.HelloChallengeState`, which can mint
+  the bytes, install `AuthConfig.hello_binding`, and later consume/discard them;
 - advertise them in the outgoing `control.Hello.auth.challenge`;
 - retain the same bytes in local pre-auth state and install them as
   `AuthConfig.hello_binding.context.challenge` before verifying the peer's

@@ -230,11 +230,13 @@ pub const Client = struct {
 };
 
 pub fn validateListenerOptions(options: ListenerOptions) quic_runtime.Error!void {
+    if (options.runtime.tls_cert_pem.len == 0 or options.runtime.tls_key_pem.len == 0) return error.InvalidEndpoint;
     _ = try quic_runtime.parseEndpoint(options.bind_literal);
     try validateBuffers(options.rx_buffer_bytes, options.tx_buffer_bytes);
 }
 
 pub fn validateClientOptions(options: ClientOptions) quic_runtime.Error!void {
+    if (options.runtime.server_name.len == 0) return error.InvalidEndpoint;
     _ = try quic_runtime.parseEndpoint(options.bind_literal);
     _ = try quic_runtime.parseEndpoint(options.target_literal);
     try validateBuffers(options.rx_buffer_bytes, options.tx_buffer_bytes);

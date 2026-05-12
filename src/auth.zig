@@ -440,6 +440,87 @@ pub const HelloBindingPolicy = struct {
     }
 };
 
+pub const HelloChallengeState = struct {
+    context: HelloAuthContext = .{},
+    challenge_bytes: ?[]u8 = null,
+    max_challenge_bytes: usize = max_hello_challenge_bytes,
+
+    pub fn mint(
+        allocator: std.mem.Allocator,
+        random: std.Random,
+        context: HelloAuthContext,
+        len: usize,
+        options: HelloChallengeOptions,
+    ) !HelloChallengeState {
+        const owned_challenge = try allocHelloChallenge(allocator, random, len, options);
+        var bound_context = context;
+        bound_context.challenge = owned_challenge;
+        return .{
+            .context = bound_context,
+            .challenge_bytes = owned_challenge,
+            .max_challenge_bytes = options.max_bytes,
+        };
+    }
+
+    pub fn mintDefault(
+        allocator: std.mem.Allocator,
+        random: std.Random,
+        context: HelloAuthContext,
+        options: HelloChallengeOptions,
+    ) !HelloChallengeState {
+        return mint(allocator, random, context, default_hello_challenge_bytes, options);
+    }
+
+    pub fn deinit(self: *HelloChallengeState, allocator: std.mem.Allocator) void {
+        self.discard(allocator);
+    }
+
+    pub fn isActive(self: HelloChallengeState) bool {
+        return self.challenge_bytes != null;
+    }
+
+    pub fn challenge(self: HelloChallengeState) []const u8 {
+        return self.challenge_bytes orelse &.{};
+    }
+
+    pub fn bindingPolicy(self: HelloChallengeState) Error!HelloBindingPolicy {
+        const challenge_bytes = self.challenge_bytes orelse return Error.ChallengeRequired;
+        var bound_context = self.context;
+        bound_context.challenge = challenge_bytes;
+
+        const policy = HelloBindingPolicy{
+            .context = bound_context,
+            .require_challenge = true,
+            .max_challenge_bytes = self.max_challenge_bytes,
+        };
+        try policy.validate();
+        return policy;
+    }
+
+    pub fn install(self: HelloChallengeState, config: *AuthConfig) Error!void {
+        const policy = try self.bindingPolicy();
+        config.hello_binding = policy;
+    }
+
+    pub fn installedConfig(self: HelloChallengeState, base: AuthConfig) Error!AuthConfig {
+        var config = base;
+        try self.install(&config);
+        return config;
+    }
+
+    pub fn consume(self: *HelloChallengeState, allocator: std.mem.Allocator) void {
+        self.discard(allocator);
+    }
+
+    pub fn discard(self: *HelloChallengeState, allocator: std.mem.Allocator) void {
+        if (self.challenge_bytes) |challenge_bytes| {
+            allocator.free(challenge_bytes);
+        }
+        self.challenge_bytes = null;
+        self.context.challenge = &.{};
+    }
+};
+
 pub const HelloCredentials = struct {
     peer_id: []const u8 = "",
     scheme: []const u8 = "",
@@ -1106,6 +1187,59 @@ test "HELLO challenge helpers validate, mint, and compare bounded bytes" {
     try std.testing.expectError(Error.ChallengeTooLarge, validateHelloChallenge("12345", .{ .max_bytes = 4 }));
     try std.testing.expectError(Error.ChallengeRequired, allocHelloChallenge(allocator, prng.random(), 0, .{}));
     try std.testing.expectError(Error.ChallengeTooLarge, allocHelloChallenge(allocator, prng.random(), 5, .{ .max_bytes = 4 }));
+}
+
+test "HELLO challenge state mints owns and installs binding config" {
+    const allocator = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(0x51525354);
+    var state = try HelloChallengeState.mint(allocator, prng.random(), .{
+        .audience = "qmsg://jobs.example",
+        .authority = "jobs.example:443",
+        .listener_id = "listener-a",
+    }, 16, .{ .max_bytes = 32 });
+    defer state.deinit(allocator);
+
+    try std.testing.expect(state.isActive());
+    try std.testing.expectEqual(@as(usize, 16), state.challenge().len);
+    try std.testing.expectEqual(state.challenge().ptr, state.context.challenge.ptr);
+    try validateHelloChallenge(state.challenge(), .{ .required = true, .max_bytes = 32 });
+
+    var config = AuthConfig{ .required = true };
+    try state.install(&config);
+    try std.testing.expect(config.hello_binding.require_challenge);
+    try std.testing.expectEqual(@as(usize, 32), config.hello_binding.max_challenge_bytes);
+
+    const context = config.hello_binding.context.?;
+    try std.testing.expectEqualStrings("qmsg://jobs.example", context.audience);
+    try std.testing.expectEqualStrings("jobs.example:443", context.authority);
+    try std.testing.expectEqualStrings("listener-a", context.listener_id);
+    try std.testing.expect(helloChallengeMatches(state.challenge(), context.challenge));
+    try config.hello_binding.validate();
+}
+
+test "HELLO challenge state consume and discard fail closed" {
+    const allocator = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(0x51525354);
+    var consumed = try HelloChallengeState.mintDefault(allocator, prng.random(), .{}, .{});
+    try std.testing.expect(consumed.isActive());
+    consumed.consume(allocator);
+    try std.testing.expect(!consumed.isActive());
+    try std.testing.expectEqual(@as(usize, 0), consumed.challenge().len);
+    try std.testing.expectEqual(@as(usize, 0), consumed.context.challenge.len);
+    consumed.consume(allocator);
+
+    var config = AuthConfig{ .hello_binding = .{ .context = .{ .challenge = "old" } } };
+    try std.testing.expectError(Error.ChallengeRequired, consumed.install(&config));
+    try std.testing.expect(config.hello_binding.context != null);
+    try std.testing.expectEqualStrings("old", config.hello_binding.context.?.challenge);
+
+    var discarded = try HelloChallengeState.mint(allocator, prng.random(), .{}, 8, .{ .max_bytes = 8 });
+    discarded.discard(allocator);
+    try std.testing.expect(!discarded.isActive());
+    try std.testing.expectError(Error.ChallengeRequired, discarded.bindingPolicy());
+    discarded.deinit(allocator);
 }
 
 test "HELLO implicit assertion encodes challenge-bound context" {

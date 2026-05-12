@@ -1,10 +1,12 @@
 const std = @import("std");
+const message = @import("message.zig");
 const socket = @import("socket.zig");
 const session = @import("session.zig");
 const transport = @import("transport/root.zig");
 
 pub const NodeOptions = struct {
     max_sessions: usize = 1024,
+    io: std.Io = std.Io.Threaded.global_single_threaded.io(),
 };
 
 pub const Event = union(enum) {
@@ -50,7 +52,22 @@ pub const InprocRepEndpoint = struct {
 };
 
 pub const QuicListenOptions = struct {
+    tls_cert_pem: []const u8 = "",
+    tls_key_pem: []const u8 = "",
     transport: transport.quic.QuicOptions = .{},
+    rx_buffer_bytes: usize = transport.quic_runtime.default_rx_buffer_bytes,
+    tx_buffer_bytes: usize = transport.quic_runtime.default_tx_buffer_bytes,
+    receive_timeout: std.Io.Timeout = transport.quic_udp.default_receive_timeout,
+};
+
+pub const QuicDialOptions = struct {
+    server_name: []const u8,
+    ca_pem: ?[]const u8 = null,
+    transport: transport.quic.QuicOptions = .{},
+    bind_literal: []const u8 = transport.quic_udp.default_bind_literal,
+    rx_buffer_bytes: usize = transport.quic_runtime.default_rx_buffer_bytes,
+    tx_buffer_bytes: usize = transport.quic_runtime.default_tx_buffer_bytes,
+    receive_timeout: std.Io.Timeout = transport.quic_udp.default_receive_timeout,
 };
 
 pub const QuicSessionOptions = struct {
@@ -61,29 +78,68 @@ pub const QuicSessionOptions = struct {
 
 pub const QuicListenerRuntime = struct {
     id: QuicListenerId,
-    listener: transport.quic.QuicListener,
+    listener: transport.quic_udp.Listener,
+    transport_options: transport.quic.QuicOptions,
+    sessions: std.ArrayList(ListenerConnection) = .empty,
 
-    fn deinit(self: *QuicListenerRuntime) void {
+    pub fn localAddress(self: QuicListenerRuntime) std.Io.net.IpAddress {
+        return self.listener.localAddress();
+    }
+
+    fn deinit(self: *QuicListenerRuntime, allocator: std.mem.Allocator) void {
+        self.sessions.deinit(allocator);
         self.listener.deinit();
         self.* = undefined;
     }
 };
 
+pub const QuicClientRuntime = struct {
+    client: transport.quic_udp.Client,
+    runtime: *QuicSessionRuntime,
+
+    pub fn id(self: QuicClientRuntime) QuicSessionId {
+        return self.runtime.id();
+    }
+
+    fn deinit(self: *QuicClientRuntime) void {
+        self.client.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const QuicSessionRuntime = struct {
-    session: transport.quic.QuicSession,
+    runtime: transport.quic_session_runtime.QuicSessionRuntime,
+    transport_ready: bool = false,
 
     pub fn id(self: QuicSessionRuntime) QuicSessionId {
-        return self.session.session.id;
+        return self.runtime.id();
     }
 
     pub fn appSession(self: *QuicSessionRuntime) *session.Session {
-        return &self.session.session;
+        return self.runtime.appSession();
+    }
+
+    pub fn state(self: QuicSessionRuntime) transport.quic.State {
+        return self.runtime.state();
+    }
+
+    pub fn queueReliable(self: *QuicSessionRuntime, outgoing: message.OutgoingMessage) !u64 {
+        return self.runtime.queueReliable(outgoing);
+    }
+
+    pub fn replyReliableOnStream(self: *QuicSessionRuntime, stream_id: u64, outgoing: message.OutgoingMessage) !void {
+        try self.runtime.replyReliableOnStream(stream_id, outgoing);
     }
 
     fn deinit(self: *QuicSessionRuntime) void {
-        self.session.deinit();
+        self.runtime.deinit();
         self.* = undefined;
     }
+};
+
+pub const ListenerConnection = struct {
+    connection_index: usize,
+    runtime: *QuicSessionRuntime,
 };
 
 pub const Node = struct {
@@ -92,6 +148,7 @@ pub const Node = struct {
     events: std.ArrayList(Event) = .empty,
     inproc_rep_endpoints: std.ArrayList(*InprocRepEndpoint) = .empty,
     quic_listeners: std.ArrayList(*QuicListenerRuntime) = .empty,
+    quic_clients: std.ArrayList(*QuicClientRuntime) = .empty,
     quic_sessions: std.ArrayList(*QuicSessionRuntime) = .empty,
     now_us: u64 = 0,
     next_session_id: session.SessionId = 1,
@@ -104,13 +161,18 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        for (self.quic_clients.items) |client| {
+            client.deinit();
+            self.allocator.destroy(client);
+        }
+        self.quic_clients.deinit(self.allocator);
         for (self.quic_sessions.items) |runtime| {
             runtime.deinit();
             self.allocator.destroy(runtime);
         }
         self.quic_sessions.deinit(self.allocator);
         for (self.quic_listeners.items) |runtime| {
-            runtime.deinit();
+            runtime.deinit(self.allocator);
             self.allocator.destroy(runtime);
         }
         self.quic_listeners.deinit(self.allocator);
@@ -134,16 +196,19 @@ pub const Node = struct {
     }
 
     pub fn dial(self: *Node, kind: transport.Kind, endpoint: transport.Endpoint) !session.SessionId {
-        _ = self;
-        _ = endpoint;
         return switch (kind) {
             .inproc => error.UnsupportedTransport,
-            .quic => error.UnsupportedTransport,
+            .quic => {
+                if (std.meta.activeTag(endpoint) != .quic) return error.InvalidEndpoint;
+                return self.dialQuic(endpoint.quic, .{ .server_name = "localhost" });
+            },
         };
     }
 
     pub fn tick(self: *Node, now_us: u64) !void {
         self.now_us = now_us;
+        try self.tickQuicListeners(now_us);
+        try self.tickQuicClients(now_us);
     }
 
     pub fn listenQuic(self: *Node, endpoint: []const u8, options: QuicListenOptions) !QuicListenerId {
@@ -156,37 +221,62 @@ pub const Node = struct {
 
         runtime.* = .{
             .id = id,
-            .listener = try transport.quic.QuicListener.init(self.allocator, endpoint, options.transport),
+            .listener = try transport.quic_udp.Listener.start(self.allocator, self.options.io, .{
+                .bind_literal = endpoint,
+                .runtime = .{
+                    .tls_cert_pem = options.tls_cert_pem,
+                    .tls_key_pem = options.tls_key_pem,
+                    .transport = options.transport,
+                },
+                .rx_buffer_bytes = options.rx_buffer_bytes,
+                .tx_buffer_bytes = options.tx_buffer_bytes,
+                .receive_timeout = options.receive_timeout,
+            }),
+            .transport_options = options.transport,
         };
-        errdefer if (owns_runtime) runtime.deinit();
+        errdefer if (owns_runtime) runtime.deinit(self.allocator);
 
         try self.quic_listeners.append(self.allocator, runtime);
         owns_runtime = false;
         return id;
     }
 
-    pub fn openQuicSession(self: *Node, options: QuicSessionOptions) !*QuicSessionRuntime {
+    pub fn dialQuic(self: *Node, endpoint: []const u8, options: QuicDialOptions) !QuicSessionId {
         if (self.quic_sessions.items.len >= self.options.max_sessions) return error.TooManySessions;
 
-        const runtime = try self.allocator.create(QuicSessionRuntime);
+        const runtime = try self.createQuicSession(.client, options.transport, null);
         var owns_runtime = true;
-        errdefer if (owns_runtime) self.allocator.destroy(runtime);
+        errdefer if (owns_runtime) self.destroyQuicSession(runtime);
 
-        runtime.* = .{
-            .session = try transport.quic.QuicSession.init(
-                self.allocator,
-                self.nextSessionId(),
-                options.role,
-                options.transport,
-            ),
+        const client = try self.allocator.create(QuicClientRuntime);
+        var owns_client = true;
+        errdefer if (owns_client) self.allocator.destroy(client);
+
+        client.* = .{
+            .client = try transport.quic_udp.Client.start(self.allocator, self.options.io, .{
+                .target_literal = endpoint,
+                .bind_literal = options.bind_literal,
+                .runtime = .{
+                    .server_name = options.server_name,
+                    .ca_pem = options.ca_pem,
+                    .transport = options.transport,
+                },
+                .rx_buffer_bytes = options.rx_buffer_bytes,
+                .tx_buffer_bytes = options.tx_buffer_bytes,
+                .receive_timeout = options.receive_timeout,
+            }),
+            .runtime = runtime,
         };
-        errdefer if (owns_runtime) runtime.deinit();
-        runtime.session.session.user_data = options.user_data;
+        errdefer if (owns_client) client.deinit();
 
-        try self.quic_sessions.append(self.allocator, runtime);
+        try self.quic_clients.append(self.allocator, client);
+        owns_client = false;
         owns_runtime = false;
-        try self.emit(.{ .connected = runtime.id() });
-        return runtime;
+        return runtime.id();
+    }
+
+    pub fn openQuicSession(self: *Node, options: QuicSessionOptions) !*QuicSessionRuntime {
+        return self.createQuicSession(options.role, options.transport, options.user_data);
     }
 
     pub fn quicSession(self: *Node, id: QuicSessionId) ?*QuicSessionRuntime {
@@ -197,12 +287,21 @@ pub const Node = struct {
     }
 
     pub fn closeQuicSession(self: *Node, id: QuicSessionId) !void {
+        for (self.quic_clients.items, 0..) |client, index| {
+            if (client.id() != id) continue;
+            _ = self.quic_clients.orderedRemove(index);
+            client.deinit();
+            self.allocator.destroy(client);
+            break;
+        }
+
         for (self.quic_sessions.items, 0..) |runtime, index| {
             if (runtime.id() != id) continue;
 
-            runtime.session.close();
+            runtime.runtime.session.close();
             try self.emit(.{ .closed = id });
             _ = self.quic_sessions.orderedRemove(index);
+            self.removeListenerSessionRefs(runtime);
             runtime.deinit();
             self.allocator.destroy(runtime);
             return;
@@ -264,6 +363,25 @@ pub const Node = struct {
             }
         }
 
+        if (comptime dispatcherHas(@TypeOf(dispatcher), "dispatchQuicReliable")) {
+            for (self.quic_sessions.items) |runtime| {
+                var received = runtime.runtime.recvReliable() orelse continue;
+                const stream_id = received.stream_id;
+                const incoming = received.takeMessage();
+                var result = try dispatcher.dispatchQuicReliable(.rep, incoming, runtime.appSession());
+                defer result.deinit();
+
+                for (result.replies.items) |reply| {
+                    try runtime.replyReliableOnStream(stream_id, reply.outgoing());
+                }
+
+                return .{
+                    .messages = 1,
+                    .events_pending = self.eventCount(),
+                };
+            }
+        }
+
         return .{ .events_pending = self.eventCount() };
     }
 
@@ -279,8 +397,18 @@ pub const Node = struct {
     }
 
     pub fn nextTimer(self: *const Node) ?u64 {
-        _ = self;
-        return null;
+        var best: ?u64 = null;
+        for (self.quic_listeners.items) |listener| {
+            if (listener.listener.nextTimer(self.now_us)) |timer| {
+                bestTimer(&best, timer.deadline.at_us);
+            }
+        }
+        for (self.quic_clients.items) |client| {
+            if (client.client.nextTimer(self.now_us)) |timer| {
+                bestTimer(&best, timer.deadline.at_us);
+            }
+        }
+        return best;
     }
 
     pub fn emit(self: *Node, event: Event) !void {
@@ -289,6 +417,133 @@ pub const Node = struct {
 
     pub fn eventCount(self: *const Node) usize {
         return self.events.items.len;
+    }
+
+    fn tickQuicListeners(self: *Node, now_us: u64) !void {
+        for (self.quic_listeners.items) |listener| {
+            _ = try listener.listener.recvAndFeedOne(now_us);
+            try listener.listener.tick(now_us);
+            try self.ensureListenerSessions(listener);
+            try self.pumpListenerSessions(listener);
+            while (try listener.listener.drainAndSendOne(now_us)) |_| {}
+            _ = listener.listener.runtime.reap();
+        }
+    }
+
+    fn tickQuicClients(self: *Node, now_us: u64) !void {
+        for (self.quic_clients.items) |client| {
+            _ = try client.client.recvAndFeedOne(now_us);
+            try client.client.tick(now_us);
+            try self.ensureClientReady(client);
+            try self.pumpClientSession(client);
+            while (try client.client.drainAndSendOne(now_us)) |_| {}
+        }
+    }
+
+    fn ensureListenerSessions(self: *Node, listener: *QuicListenerRuntime) !void {
+        const count = listener.listener.runtime.connectionCount();
+        var index: usize = 0;
+        while (index < count) : (index += 1) {
+            const conn = listener.listener.runtime.connection(index) orelse continue;
+            if (!conn.handshakeDone()) continue;
+            if (listenerSession(listener, index) != null) continue;
+
+            const runtime = try self.createQuicSession(.server, listener.transport_options, null);
+            errdefer self.destroyQuicSession(runtime);
+            runtime.transport_ready = true;
+            try runtime.runtime.onQuicReady();
+            try listener.sessions.append(self.allocator, .{
+                .connection_index = index,
+                .runtime = runtime,
+            });
+        }
+    }
+
+    fn ensureClientReady(_: *Node, client: *QuicClientRuntime) !void {
+        if (client.runtime.transport_ready) return;
+        if (!client.client.runtime.connection().handshakeDone()) return;
+        client.runtime.transport_ready = true;
+        try client.runtime.runtime.onQuicReady();
+    }
+
+    fn pumpListenerSessions(_: *Node, listener: *QuicListenerRuntime) !void {
+        for (listener.sessions.items) |entry| {
+            const conn = listener.listener.runtime.connection(entry.connection_index) orelse continue;
+            if (entry.runtime.runtime.state() == .ready) {
+                _ = try entry.runtime.runtime.acceptPeerBidiStreamsConnection(conn);
+            }
+            _ = try entry.runtime.runtime.pumpConnection(conn);
+            if (entry.runtime.runtime.state() == .ready) {
+                _ = try entry.runtime.runtime.acceptPeerBidiStreamsConnection(conn);
+                _ = try entry.runtime.runtime.pumpConnection(conn);
+            }
+        }
+    }
+
+    fn pumpClientSession(_: *Node, client: *QuicClientRuntime) !void {
+        if (!client.runtime.transport_ready) return;
+        const conn = client.client.runtime.connection();
+        if (client.runtime.runtime.state() == .ready) {
+            _ = try client.runtime.runtime.acceptPeerBidiStreamsConnection(conn);
+        }
+        _ = try client.runtime.runtime.pumpConnection(conn);
+        if (client.runtime.runtime.state() == .ready) {
+            _ = try client.runtime.runtime.acceptPeerBidiStreamsConnection(conn);
+            _ = try client.runtime.runtime.pumpConnection(conn);
+        }
+    }
+
+    fn createQuicSession(
+        self: *Node,
+        role: transport.quic.Role,
+        options: transport.quic.QuicOptions,
+        user_data: ?*anyopaque,
+    ) !*QuicSessionRuntime {
+        if (self.quic_sessions.items.len >= self.options.max_sessions) return error.TooManySessions;
+
+        const runtime = try self.allocator.create(QuicSessionRuntime);
+        var owns_runtime = true;
+        errdefer if (owns_runtime) self.allocator.destroy(runtime);
+
+        runtime.* = .{
+            .runtime = try transport.quic_session_runtime.QuicSessionRuntime.init(
+                self.allocator,
+                self.nextSessionId(),
+                role,
+                options,
+            ),
+        };
+        errdefer if (owns_runtime) runtime.deinit();
+        runtime.runtime.appSession().user_data = user_data;
+
+        try self.quic_sessions.append(self.allocator, runtime);
+        owns_runtime = false;
+        try self.emit(.{ .connected = runtime.id() });
+        return runtime;
+    }
+
+    fn destroyQuicSession(self: *Node, runtime: *QuicSessionRuntime) void {
+        for (self.quic_sessions.items, 0..) |candidate, index| {
+            if (candidate != runtime) continue;
+            _ = self.quic_sessions.orderedRemove(index);
+            break;
+        }
+        self.removeListenerSessionRefs(runtime);
+        runtime.deinit();
+        self.allocator.destroy(runtime);
+    }
+
+    fn removeListenerSessionRefs(self: *Node, runtime: *QuicSessionRuntime) void {
+        for (self.quic_listeners.items) |listener| {
+            var index: usize = 0;
+            while (index < listener.sessions.items.len) {
+                if (listener.sessions.items[index].runtime == runtime) {
+                    _ = listener.sessions.orderedRemove(index);
+                } else {
+                    index += 1;
+                }
+            }
+        }
     }
 
     fn nextInprocSession(self: *Node) session.Session {
@@ -305,6 +560,25 @@ pub const Node = struct {
         return id;
     }
 };
+
+fn listenerSession(listener: *QuicListenerRuntime, connection_index: usize) ?*QuicSessionRuntime {
+    for (listener.sessions.items) |entry| {
+        if (entry.connection_index == connection_index) return entry.runtime;
+    }
+    return null;
+}
+
+fn dispatcherHas(comptime Dispatcher: type, comptime name: []const u8) bool {
+    const T = switch (@typeInfo(Dispatcher)) {
+        .pointer => |ptr| ptr.child,
+        else => Dispatcher,
+    };
+    return @hasDecl(T, name);
+}
+
+fn bestTimer(best: *?u64, candidate: u64) void {
+    if (best.* == null or candidate < best.*.?) best.* = candidate;
+}
 
 test {
     std.testing.refAllDecls(@This());
@@ -335,7 +609,7 @@ test "Node queues and polls events in FIFO order" {
     try std.testing.expectEqual(@as(usize, 0), n.eventCount());
 }
 
-test "Node tick records current time and keeps transport placeholders explicit" {
+test "Node tick records current time and validates QUIC listener config" {
     const allocator = std.testing.allocator;
 
     var n = try Node.init(allocator, .{});
@@ -344,20 +618,15 @@ test "Node tick records current time and keeps transport placeholders explicit" 
     try n.tick(99);
     try std.testing.expectEqual(@as(u64, 99), n.now_us);
     try std.testing.expect(n.nextTimer() == null);
-    _ = try n.listenQuic("127.0.0.1:4433", .{});
-    try std.testing.expectEqual(@as(usize, 1), n.quic_listeners.items.len);
-    try std.testing.expectError(error.UnsupportedTransport, n.dial(.quic, .{ .quic = "127.0.0.1:4433" }));
+    try std.testing.expectError(error.InvalidEndpoint, n.listenQuic("127.0.0.1:0", .{}));
+    try std.testing.expectError(error.UnsupportedTransport, n.dial(.inproc, .{ .quic = "127.0.0.1:4433" }));
 }
 
-test "Node prepares QUIC listener and session lifecycle without sockets" {
+test "Node prepares QUIC session lifecycle without opening UDP" {
     const allocator = std.testing.allocator;
 
     var n = try Node.init(allocator, .{});
     defer n.deinit();
-
-    const listener_id = try n.listenQuic("127.0.0.1:4433", .{});
-    try std.testing.expectEqual(@as(QuicListenerId, 0), listener_id);
-    try std.testing.expectEqual(transport.quic.State.listening, n.quic_listeners.items[listener_id].listener.state());
 
     const runtime = try n.openQuicSession(.{
         .role = .server,
