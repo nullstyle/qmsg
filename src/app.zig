@@ -56,6 +56,11 @@ pub const DispatchOptions = struct {
     publish_hook: ?EmitHandler = null,
 };
 
+pub const QuicDispatchOptions = struct {
+    reply_hook: ?EmitHandler = null,
+    publish_hook: ?EmitHandler = null,
+};
+
 pub const InprocRepOptions = struct {
     socket: socket.SocketOptions(.rep) = .{},
     session: ?session.Session = null,
@@ -326,6 +331,59 @@ pub const App = struct {
         return self.dispatchMessage(kind, incoming, options);
     }
 
+    /// QUIC integration hook for already-decoded reliable stream or datagram
+    /// messages. Node/session transport code supplies the route kind it derived
+    /// from stream/datagram context, and this facade returns any app replies or
+    /// publications in a socket-free ResponseSink for the QUIC writer to encode.
+    pub fn dispatchQuic(
+        self: *App,
+        kind: RouteKind,
+        incoming: message.Message,
+        sess: *session.Session,
+        options: QuicDispatchOptions,
+    ) !DispatchResult {
+        if (sess.transport != .quic) {
+            var owned = incoming;
+            owned.deinit();
+            return error.InvalidState;
+        }
+
+        var error_subject: ?[]u8 = null;
+        defer if (error_subject) |subject_name| self.allocator.free(subject_name);
+        if (self.error_policy == .reply_error and kind == .rep) {
+            error_subject = self.allocator.dupe(u8, incoming.subject) catch |err| {
+                var owned = incoming;
+                owned.deinit();
+                return err;
+            };
+        }
+
+        const request_id = incoming.id;
+        const request_deadline_ms = incoming.deadline_ms;
+
+        return self.dispatchMessage(kind, incoming, .{
+            .session = sess,
+            .reply_hook = options.reply_hook,
+            .publish_hook = options.publish_hook,
+        }) catch |err| try self.dispatchRepErrorResult(
+            kind,
+            error_subject orelse "",
+            request_id,
+            request_deadline_ms,
+            err,
+        );
+    }
+
+    pub fn runQuicMessage(
+        self: *App,
+        kind: RouteKind,
+        incoming: message.Message,
+        sess: *session.Session,
+        options: QuicDispatchOptions,
+    ) !DispatchResult {
+        return self.dispatchQuic(kind, incoming, sess, options);
+    }
+
     /// Takes ownership of `incoming` when a route is matched. Message handlers
     /// receive that owned value and are responsible for calling `deinit`.
     pub fn dispatchMessage(self: *App, kind: RouteKind, incoming: message.Message, options: DispatchOptions) !DispatchResult {
@@ -357,6 +415,27 @@ pub const App = struct {
 
         try route.handler(&ctx, owned);
         return result;
+    }
+
+    fn dispatchRepErrorResult(
+        self: *App,
+        kind: RouteKind,
+        request_subject: []const u8,
+        request_id: message.MessageId,
+        request_deadline_ms: ?u64,
+        err: anyerror,
+    ) !DispatchResult {
+        switch (self.error_policy) {
+            .propagate => return err,
+            .reply_error => {
+                if (kind != .rep) return err;
+
+                var result = ResponseSink.init(self.allocator);
+                errdefer result.deinit();
+                try appendRepError(&result, request_subject, request_id, request_deadline_ms, err);
+                return result;
+            },
+        }
     }
 
     pub fn dispatchConnect(self: *App, sess: ?*session.Session) !void {
@@ -469,6 +548,28 @@ fn handleRepError(self: *App, rep_socket: *socket.Socket(.rep), request: socket.
             .message = @errorName(err),
         }),
     }
+}
+
+fn appendRepError(
+    sink: *ResponseSink,
+    request_subject: []const u8,
+    request_id: message.MessageId,
+    request_deadline_ms: ?u64,
+    err: anyerror,
+) !void {
+    const headers = [_]message.Header{
+        .{ .name = socket.ErrorReply.code_header, .value = @errorName(err) },
+        .{ .name = socket.ErrorReply.message_header, .value = @errorName(err) },
+    };
+
+    try sink.appendReply(.{
+        .subject = request_subject,
+        .id = request_id,
+        .deadline_ms = request_deadline_ms,
+        .flags = .{ .err = true },
+        .headers = &headers,
+        .body = @errorName(err),
+    });
 }
 
 fn authPattern(pattern: socket.Pattern) auth.Pattern {
@@ -615,6 +716,181 @@ test "App dispatch cleans up unrouted messages" {
         .subject = "missing.route",
         .body = "drop me",
     }, .{}));
+}
+
+test "App dispatchQuic routes REP reply with session auth" {
+    const allocator = std.testing.allocator;
+
+    var app = try App.init(allocator, .{});
+    defer app.deinit();
+
+    const Handler = struct {
+        fn getUser(ctx: *Context, msg: message.Message) !void {
+            var owned = msg;
+            defer owned.deinit();
+
+            try std.testing.expectEqual(session.TransportKind.quic, ctx.session.?.transport);
+            try std.testing.expectEqual(socket.Pattern.rep, ctx.pattern.?);
+            try ctx.requireRouteAccess();
+            try ctx.reply(.{
+                .subject = "",
+                .body = "Ada",
+            });
+        }
+    };
+
+    var sess = session.Session{
+        .id = 21,
+        .transport = .quic,
+    };
+    sess.setAuthorization(.{
+        .subject = "service:users",
+        .issuer = "test",
+        .allowed_patterns = auth.PatternSet.init(&.{.rep}),
+        .allowed_subjects = .{ .filters = &.{"user.*"} },
+    });
+
+    try app.rep("user.*", Handler.getUser);
+
+    const incoming = try message.Message.init(allocator, .{
+        .subject = "user.get",
+        .id = 42,
+        .deadline_ms = 1234,
+        .body = "id=42",
+    });
+    var result = try app.dispatchQuic(.rep, incoming, &sess, .{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.replies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), result.publications.items.len);
+    try std.testing.expectEqualStrings("user.get", result.replies.items[0].subject);
+    try std.testing.expectEqual(@as(message.MessageId, 42), result.replies.items[0].id);
+    try std.testing.expectEqual(@as(?u64, 1234), result.replies.items[0].deadline_ms);
+    try std.testing.expectEqualStrings("Ada", result.replies.items[0].body);
+}
+
+test "App dispatchQuic default REP error policy returns ResponseSink error reply" {
+    const allocator = std.testing.allocator;
+
+    var app = try App.init(allocator, .{});
+    defer app.deinit();
+
+    const Handler = struct {
+        fn needsAuth(ctx: *Context, msg: message.Message) !void {
+            var owned = msg;
+            defer owned.deinit();
+            try ctx.requireRouteAccess();
+        }
+    };
+
+    var sess = session.Session{
+        .id = 22,
+        .transport = .quic,
+    };
+
+    try app.rep("user.*", Handler.needsAuth);
+
+    const incoming = try message.Message.init(allocator, .{
+        .subject = "user.get",
+        .id = 7,
+        .deadline_ms = 500,
+    });
+    var result = try app.dispatchQuic(.rep, incoming, &sess, .{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.replies.items.len);
+    const reply = result.replies.items[0];
+    try std.testing.expect(reply.flags.err);
+    try std.testing.expectEqualStrings("user.get", reply.subject);
+    try std.testing.expectEqual(@as(message.MessageId, 7), reply.id);
+    try std.testing.expectEqual(@as(?u64, 500), reply.deadline_ms);
+    try std.testing.expectEqualStrings("AuthenticationRequired", reply.body);
+    try std.testing.expectEqual(@as(usize, 2), reply.headers.len);
+    try std.testing.expectEqualStrings(socket.ErrorReply.code_header, reply.headers[0].name);
+    try std.testing.expectEqualStrings("AuthenticationRequired", reply.headers[0].value);
+}
+
+test "App dispatchQuic datagram route captures publications" {
+    const allocator = std.testing.allocator;
+
+    var app = try App.init(allocator, .{});
+    defer app.deinit();
+
+    const Handler = struct {
+        fn presence(ctx: *Context, msg: message.Message) !void {
+            var owned = msg;
+            defer owned.deinit();
+
+            try std.testing.expect(ctx.pattern == null);
+            try std.testing.expectEqual(RouteKind.datagram, ctx.route_kind.?);
+            try ctx.requireRouteAccess();
+            try ctx.publish(.{
+                .subject = "presence.seen",
+                .body = owned.body,
+            });
+        }
+    };
+
+    var sess = session.Session{
+        .id = 23,
+        .transport = .quic,
+        .datagram_enabled = true,
+    };
+    sess.setAuthorization(.{
+        .subject = "service:presence",
+        .issuer = "test",
+        .allowed_subjects = .{ .filters = &.{"presence.*"} },
+        .datagram_allowed = true,
+    });
+
+    try app.datagram("presence.*", Handler.presence);
+
+    const incoming = try message.Message.init(allocator, .{
+        .subject = "presence.ada",
+        .body = "online",
+        .flags = .{ .unreliable = true },
+    });
+    var result = try app.dispatchQuic(.datagram, incoming, &sess, .{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.replies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), result.publications.items.len);
+    try std.testing.expectEqualStrings("presence.seen", result.publications.items[0].subject);
+    try std.testing.expectEqualStrings("online", result.publications.items[0].body);
+}
+
+test "App dispatchQuic no-route behavior follows reply error policy" {
+    const allocator = std.testing.allocator;
+
+    var app = try App.init(allocator, .{});
+    defer app.deinit();
+
+    var sess = session.Session{
+        .id = 24,
+        .transport = .quic,
+    };
+
+    const missing_rep = try message.Message.init(allocator, .{
+        .subject = "missing.route",
+        .id = 99,
+    });
+    var default_result = try app.dispatchQuic(.rep, missing_rep, &sess, .{});
+    defer default_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), default_result.replies.items.len);
+    try std.testing.expect(default_result.replies.items[0].flags.err);
+    try std.testing.expectEqualStrings("NoRoute", default_result.replies.items[0].body);
+
+    app.setErrorPolicy(.propagate);
+    const propagate_missing = try message.Message.init(allocator, .{
+        .subject = "missing.route",
+    });
+    try std.testing.expectError(error.NoRoute, app.dispatchQuic(.rep, propagate_missing, &sess, .{}));
+
+    const missing_datagram = try message.Message.init(allocator, .{
+        .subject = "presence.missing",
+    });
+    try std.testing.expectError(error.NoRoute, app.dispatchQuic(.datagram, missing_datagram, &sess, .{}));
 }
 
 test "Context reply hook overrides internal sink" {

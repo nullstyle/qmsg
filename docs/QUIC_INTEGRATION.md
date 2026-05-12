@@ -41,18 +41,25 @@ across qmsg-owned transport modules:
   HELLO exchange;
 - `Node`/`App` lifecycle placeholders for QUIC listeners and sessions;
 - socket-free runtime wrappers for `quic_zig.Server` and `quic_zig.Client`;
+- low-level UDP socket owners for embeddable listener/client loops;
+- a per-session driver that queues local HELLO, pumps control streams, and
+  queues/receives reliable qmsg messages;
 - reusable control-stream and reliable-message stream pumps with short-write
   handling;
 - cancellation, close, and backpressure mapping helpers;
 - compact qmsg DATAGRAM envelope helpers and quic-zig send/receive adapters;
-- transport-agnostic SUBSCRIBE/UNSUBSCRIBE and CREDIT control helpers;
+- transport-agnostic SUBSCRIBE/UNSUBSCRIBE and CREDIT control helpers plus
+  QUIC control state that owns queued frames and applies received frames;
+- decoded QUIC message dispatch through the App facade;
+- bounded HELLO challenge encode/decode and validation hooks;
 - hermetic tests that drive quic-zig handshake, qmsg HELLO, pair-style
   streams, and req/rep over a qmsg runtime wrapper;
 - a one-process `quic-runtime-reqrep` smoke example.
 
-This is still not the final network transport. qmsg does not yet own OS UDP
-sockets in `Node`, expose public QUIC socket pattern APIs, dispatch App
-handlers over QUIC, or send SUBSCRIBE/CREDIT over live control streams.
+This is still not the final network transport. qmsg has the low-level UDP and
+session-driver pieces, but `Node` does not yet wire them into a complete
+listener/dialer loop, expose public QUIC socket convenience APIs, or
+automatically flush SUBSCRIBE/CREDIT state over live sessions.
 
 ## Build Integration
 
@@ -370,12 +377,14 @@ the QUIC adapter.
    echo over the hermetic transport.
 6. Implement req/rep over one bidi stream, including deadline cancellation via
    reset/stop-sending and stable qmsg error mapping.
-7. Add real UDP listen/dial loops inside qmsg `Node`, borrowing the shape of
-   `quic_zig.transport.udp_server` / `udp_client` but keeping qmsg dispatch in
-   the same loop.
-8. Add optional DATAGRAM support for `Flags.unreliable`; test too-large,
+7. Wire qmsg's UDP owner and per-session driver into `Node` listen/dial loops,
+   borrowing the shape of `quic_zig.transport.udp_server` / `udp_client` but
+   keeping qmsg dispatch in the same loop.
+8. Add public socket convenience APIs over that loop:
+   `listen(.quic)`/`dial(.quic)` or the equivalent Zig-native spelling.
+9. Add optional DATAGRAM support for `Flags.unreliable`; test too-large,
    disabled, queue-full, and ack/loss event paths.
-9. Add production hardening knobs: Retry, NEW_TOKEN, stateless reset,
+10. Add production hardening knobs: Retry, NEW_TOKEN, stateless reset,
    listener/source rate limits, qlog callback, keylog callback, and migration
    callback.
 

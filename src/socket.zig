@@ -13,6 +13,43 @@ pub const OnFull = queue.OnFull;
 pub const QueueOptions = queue.QueueOptions;
 pub const InprocEndpoint = transport.inproc.PatternEndpoint;
 
+/// Metadata passed to QUIC attachment send callbacks.
+///
+/// Socket owns request/reply/pair state. A Node/session driver owns QUIC stream
+/// ids, encoding, retransmit/write queues, and flow control; it receives this
+/// metadata plus an owned Message and maps it to the appropriate QUIC work.
+pub const QuicSendMeta = struct {
+    local_pattern: Pattern,
+    peer_pattern: Pattern,
+    operation: protocol.Operation,
+    delivery: protocol.Delivery = .reliable,
+    id: message.MessageId,
+    deadline_ms: ?u64,
+    subject: []const u8,
+};
+
+/// Sends one owned message through an attached QUIC peer/session.
+///
+/// On success the callback has consumed `msg` and must eventually deinit it.
+/// On error the socket will deinit `msg`, so the callback must not retain it.
+pub const QuicSendFn = *const fn (context: *anyopaque, msg: message.Message, meta: QuicSendMeta) anyerror!void;
+
+/// Optional subject gate for attachment drivers with local routing knowledge.
+pub const QuicAcceptsFn = *const fn (context: *anyopaque, subject: []const u8) bool;
+
+pub const QuicPeer = struct {
+    pattern: Pattern,
+    context: *anyopaque,
+    send: QuicSendFn,
+    accepts: ?QuicAcceptsFn = null,
+};
+
+pub const QuicSession = struct {
+    context: *anyopaque,
+    send: QuicSendFn,
+    accepts: ?QuicAcceptsFn = null,
+};
+
 pub const Request = struct {
     message: message.Message,
 
@@ -103,6 +140,21 @@ pub const PairSocket = struct {
         try self.core.connectInproc(peer);
     }
 
+    pub fn attachQuicPeer(self: *PairSocket, peer: QuicPeer) !void {
+        try self.core.attachQuicPeer(peer);
+    }
+
+    pub fn attachQuicSession(self: *PairSocket, session: QuicSession) !void {
+        try self.attachQuicPeer(quicPeerFromSession(.pair, session));
+    }
+
+    /// Hands an owned, decoded QUIC message to the socket receive queue.
+    ///
+    /// On success the socket consumes `msg`; on error the caller still owns it.
+    pub fn receiveQuicMessage(self: *PairSocket, msg: message.Message) !void {
+        try self.core.receiveQuicMessage(msg);
+    }
+
     pub fn listen(self: *PairSocket, endpoint: transport.Endpoint) !void {
         try self.core.listen(endpoint);
     }
@@ -149,6 +201,21 @@ pub const ReqSocket = struct {
 
     pub fn connectInproc(self: *ReqSocket, peer: InprocEndpoint) !void {
         try self.core.connectInproc(peer);
+    }
+
+    pub fn attachQuicPeer(self: *ReqSocket, peer: QuicPeer) !void {
+        try self.core.attachQuicPeer(peer);
+    }
+
+    pub fn attachQuicSession(self: *ReqSocket, session: QuicSession) !void {
+        try self.attachQuicPeer(quicPeerFromSession(.rep, session));
+    }
+
+    /// Hands an owned, decoded QUIC reply to the request state machine.
+    ///
+    /// On success the socket consumes `msg`; on error the caller still owns it.
+    pub fn receiveQuicMessage(self: *ReqSocket, msg: message.Message) !void {
+        try self.core.receiveQuicMessage(msg);
     }
 
     pub fn listen(self: *ReqSocket, endpoint: transport.Endpoint) !void {
@@ -275,6 +342,21 @@ pub const RepSocket = struct {
 
     pub fn connectInproc(self: *RepSocket, peer: InprocEndpoint) !void {
         try self.core.connectInproc(peer);
+    }
+
+    pub fn attachQuicPeer(self: *RepSocket, peer: QuicPeer) !void {
+        try self.core.attachQuicPeer(peer);
+    }
+
+    pub fn attachQuicSession(self: *RepSocket, session: QuicSession) !void {
+        try self.attachQuicPeer(quicPeerFromSession(.req, session));
+    }
+
+    /// Hands an owned, decoded QUIC request to the reply state machine.
+    ///
+    /// On success the socket consumes `msg`; on error the caller still owns it.
+    pub fn receiveQuicMessage(self: *RepSocket, msg: message.Message) !void {
+        try self.core.receiveQuicMessage(msg);
     }
 
     pub fn listen(self: *RepSocket, endpoint: transport.Endpoint) !void {
@@ -536,6 +618,7 @@ fn Core(comptime pattern: Pattern) type {
         options: Options,
         inbox: queue.Queue,
         peers: std.ArrayList(InprocEndpoint) = .empty,
+        quic_peers: std.ArrayList(QuicPeer) = .empty,
         local_subscriptions: pubsub.SubscriptionSet,
         subscriber_registry: pubsub.Registry,
         inflight: std.ArrayList(InflightRequest) = .empty,
@@ -561,6 +644,7 @@ fn Core(comptime pattern: Pattern) type {
             self.local_subscriptions.deinit();
             self.subscriber_registry.deinit();
             self.inflight.deinit(self.allocator);
+            self.quic_peers.deinit(self.allocator);
             self.peers.deinit(self.allocator);
             self.* = undefined;
         }
@@ -587,6 +671,18 @@ fn Core(comptime pattern: Pattern) type {
             try self.peers.append(self.allocator, peer);
             errdefer _ = self.peers.pop();
             try Self.connectPubSub(self, peer);
+        }
+
+        fn attachQuicPeer(self: *Self, peer: QuicPeer) !void {
+            if (!quicAttachmentSupported(pattern)) return error.UnsupportedTransport;
+            if (!pattern.canSendTo(peer.pattern)) return error.InvalidPattern;
+            if (self.hasQuicPeer(peer)) return;
+            try self.quic_peers.append(self.allocator, peer);
+        }
+
+        fn receiveQuicMessage(self: *Self, msg: message.Message) !void {
+            if (!quicAttachmentSupported(pattern)) return error.UnsupportedTransport;
+            try Self.enqueue(self, msg);
         }
 
         fn listen(self: *Self, endpoint: transport.Endpoint) !void {
@@ -622,6 +718,19 @@ fn Core(comptime pattern: Pattern) type {
 
                 const msg = try cloneOutgoing(self.allocator, outgoing, overrides);
                 try deliver(peer, msg);
+                return;
+            }
+
+            for (self.quic_peers.items) |peer| {
+                if (peer.pattern != expected_peer) continue;
+
+                const effective_subject = overrides.subject orelse outgoing.subject;
+                if (peer.accepts) |accepts_fn| {
+                    if (!accepts_fn(peer.context, effective_subject)) continue;
+                }
+
+                const msg = try cloneOutgoing(self.allocator, outgoing, overrides);
+                try deliverQuic(pattern, peer, msg);
                 return;
             }
 
@@ -862,6 +971,13 @@ fn Core(comptime pattern: Pattern) type {
             return false;
         }
 
+        fn hasQuicPeer(self: *Self, peer: QuicPeer) bool {
+            for (self.quic_peers.items) |existing| {
+                if (existing.pattern == peer.pattern and existing.context == peer.context) return true;
+            }
+            return false;
+        }
+
         fn enqueue(context: *anyopaque, msg: message.Message) anyerror!void {
             const self: *Self = @ptrCast(@alignCast(context));
             if (pattern == .sub and !self.acceptsSubject(msg.subject)) {
@@ -950,6 +1066,49 @@ fn deliver(peer: InprocEndpoint, msg: message.Message) !void {
     };
 }
 
+fn deliverQuic(local_pattern: Pattern, peer: QuicPeer, msg: message.Message) !void {
+    var owned = msg;
+    const meta: QuicSendMeta = .{
+        .local_pattern = local_pattern,
+        .peer_pattern = peer.pattern,
+        .operation = quicOperation(local_pattern),
+        .delivery = if (owned.flags.unreliable) .unreliable else .reliable,
+        .id = owned.id,
+        .deadline_ms = owned.deadline_ms,
+        .subject = owned.subject,
+    };
+
+    peer.send(peer.context, owned, meta) catch |err| {
+        owned.deinit();
+        return err;
+    };
+}
+
+fn quicPeerFromSession(peer_pattern: Pattern, session: QuicSession) QuicPeer {
+    return .{
+        .pattern = peer_pattern,
+        .context = session.context,
+        .send = session.send,
+        .accepts = session.accepts,
+    };
+}
+
+fn quicAttachmentSupported(comptime pattern: Pattern) bool {
+    return switch (pattern) {
+        .pair, .req, .rep => true,
+        .@"pub", .sub, .push, .pull => false,
+    };
+}
+
+fn quicOperation(local_pattern: Pattern) protocol.Operation {
+    return switch (local_pattern) {
+        .req => .request,
+        .rep => .reply,
+        .@"pub" => .publish,
+        else => .message,
+    };
+}
+
 fn validateOutgoing(outgoing: message.OutgoingMessage, max_message_size: usize, subject_override: ?[]const u8) !void {
     const effective_subject = subject_override orelse outgoing.subject;
     try subject_mod.validate(effective_subject);
@@ -989,6 +1148,63 @@ fn outgoingBytes(outgoing: message.OutgoingMessage, effective_subject: []const u
     return total;
 }
 
+const CapturedQuicSend = struct {
+    msg: message.Message,
+    meta: QuicSendMeta,
+
+    fn deinit(self: *CapturedQuicSend) void {
+        self.msg.deinit();
+        self.* = undefined;
+    }
+};
+
+const FakeQuicPeer = struct {
+    allocator: std.mem.Allocator,
+    max_messages: usize = std.math.maxInt(usize),
+    sent: std.ArrayList(CapturedQuicSend) = .empty,
+
+    fn init(allocator: std.mem.Allocator) FakeQuicPeer {
+        return .{ .allocator = allocator };
+    }
+
+    fn initLimited(allocator: std.mem.Allocator, max_messages: usize) FakeQuicPeer {
+        return .{ .allocator = allocator, .max_messages = max_messages };
+    }
+
+    fn deinit(self: *FakeQuicPeer) void {
+        for (self.sent.items) |*captured| {
+            captured.deinit();
+        }
+        self.sent.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn peer(self: *FakeQuicPeer, peer_pattern: Pattern) QuicPeer {
+        return .{
+            .pattern = peer_pattern,
+            .context = self,
+            .send = FakeQuicPeer.send,
+        };
+    }
+
+    fn session(self: *FakeQuicPeer) QuicSession {
+        return .{
+            .context = self,
+            .send = FakeQuicPeer.send,
+        };
+    }
+
+    fn send(context: *anyopaque, msg: message.Message, meta: QuicSendMeta) anyerror!void {
+        const self: *FakeQuicPeer = @ptrCast(@alignCast(context));
+        if (self.sent.items.len >= self.max_messages) return error.QueueFull;
+        try self.sent.append(self.allocator, .{ .msg = msg, .meta = meta });
+    }
+
+    fn takeFirst(self: *FakeQuicPeer) CapturedQuicSend {
+        return self.sent.orderedRemove(0);
+    }
+};
+
 test "pair sends and receives owned messages over explicit inproc endpoints" {
     const allocator = std.testing.allocator;
 
@@ -1007,6 +1223,136 @@ test "pair sends and receives owned messages over explicit inproc endpoints" {
 
     try std.testing.expectEqualStrings("control.ping", received.subject);
     try std.testing.expectEqualStrings("hello", received.body);
+}
+
+test "pair sends over attached QUIC session callback" {
+    const allocator = std.testing.allocator;
+
+    var left = try Socket(.pair).init(allocator, .{});
+    defer left.deinit();
+    var quic_peer = FakeQuicPeer.init(allocator);
+    defer quic_peer.deinit();
+
+    try left.attachQuicSession(quic_peer.session());
+    try left.send(.{ .subject = "control.ping", .body = "hello" });
+
+    try std.testing.expectEqual(@as(usize, 1), quic_peer.sent.items.len);
+    const captured = quic_peer.sent.items[0];
+    try std.testing.expectEqual(Pattern.pair, captured.meta.local_pattern);
+    try std.testing.expectEqual(Pattern.pair, captured.meta.peer_pattern);
+    try std.testing.expectEqual(protocol.Operation.message, captured.meta.operation);
+    try std.testing.expectEqual(protocol.Delivery.reliable, captured.meta.delivery);
+    try std.testing.expectEqual(@as(message.MessageId, 0), captured.meta.id);
+    try std.testing.expectEqualStrings("control.ping", captured.meta.subject);
+    try std.testing.expectEqualStrings("control.ping", captured.msg.subject);
+    try std.testing.expectEqualStrings("hello", captured.msg.body);
+}
+
+test "req rep use QUIC callbacks while preserving id deadline and reply correlation" {
+    const allocator = std.testing.allocator;
+
+    var req = try Socket(.req).init(allocator, .{});
+    defer req.deinit();
+    var rep = try Socket(.rep).init(allocator, .{});
+    defer rep.deinit();
+
+    var req_to_rep = FakeQuicPeer.init(allocator);
+    defer req_to_rep.deinit();
+    var rep_to_req = FakeQuicPeer.init(allocator);
+    defer rep_to_req.deinit();
+
+    try req.attachQuicSession(req_to_rep.session());
+    try rep.attachQuicSession(rep_to_req.session());
+
+    const id = try req.sendRequestAt(.{
+        .subject = "user.get",
+        .deadline_ms = 250,
+        .body = "42",
+    }, 10_000);
+    try std.testing.expect(id != 0);
+    try std.testing.expectEqual(@as(usize, 1), req.inflightCount());
+
+    try std.testing.expectEqual(@as(usize, 1), req_to_rep.sent.items.len);
+    const request_capture = req_to_rep.takeFirst();
+    try std.testing.expectEqual(Pattern.req, request_capture.meta.local_pattern);
+    try std.testing.expectEqual(Pattern.rep, request_capture.meta.peer_pattern);
+    try std.testing.expectEqual(protocol.Operation.request, request_capture.meta.operation);
+    try std.testing.expectEqual(id, request_capture.meta.id);
+    try std.testing.expectEqual(@as(?u64, 250), request_capture.meta.deadline_ms);
+    try std.testing.expectEqualStrings("user.get", request_capture.meta.subject);
+
+    try rep.receiveQuicMessage(request_capture.msg);
+    var request = try rep.recv();
+    defer request.deinit();
+    try std.testing.expectEqual(id, request.id());
+    try std.testing.expectEqual(@as(?u64, 250), request.deadlineMs());
+    try std.testing.expectEqualStrings("user.get", request.subject());
+    try std.testing.expectEqualStrings("42", request.message.body);
+
+    try rep.reply(request, .{ .subject = "user.ok", .body = "Ada" });
+    try std.testing.expectEqual(@as(usize, 1), rep_to_req.sent.items.len);
+    const reply_capture = rep_to_req.takeFirst();
+    try std.testing.expectEqual(Pattern.rep, reply_capture.meta.local_pattern);
+    try std.testing.expectEqual(Pattern.req, reply_capture.meta.peer_pattern);
+    try std.testing.expectEqual(protocol.Operation.reply, reply_capture.meta.operation);
+    try std.testing.expectEqual(id, reply_capture.meta.id);
+    try std.testing.expectEqual(@as(?u64, 250), reply_capture.meta.deadline_ms);
+    try std.testing.expectEqualStrings("user.ok", reply_capture.meta.subject);
+
+    try req.receiveQuicMessage(reply_capture.msg);
+    var reply = try req.recvAt(10_100);
+    defer reply.deinit();
+    try std.testing.expectEqual(id, reply.id);
+    try std.testing.expectEqual(@as(?u64, 250), reply.deadline_ms);
+    try std.testing.expectEqualStrings("user.ok", reply.subject);
+    try std.testing.expectEqualStrings("Ada", reply.body);
+    try std.testing.expectEqual(@as(usize, 0), req.inflightCount());
+}
+
+test "QUIC send callback pressure rolls back rejected req inflight" {
+    const allocator = std.testing.allocator;
+
+    var req = try Socket(.req).init(allocator, .{});
+    defer req.deinit();
+    var quic_peer = FakeQuicPeer.initLimited(allocator, 1);
+    defer quic_peer.deinit();
+
+    try req.attachQuicSession(quic_peer.session());
+
+    _ = try req.sendRequestAt(.{
+        .subject = "user.get",
+        .id = 1,
+        .deadline_ms = 100,
+    }, 20_000);
+    try std.testing.expectEqual(@as(usize, 1), req.inflightCount());
+
+    try std.testing.expectError(error.QueueFull, req.sendRequestAt(.{
+        .subject = "user.get",
+        .id = 2,
+        .deadline_ms = 100,
+    }, 20_001));
+    try std.testing.expectEqual(@as(usize, 1), req.inflightCount());
+    try std.testing.expect(!req.cancelRequest(2));
+    try std.testing.expectEqual(@as(usize, 1), quic_peer.sent.items.len);
+}
+
+test "unsupported QUIC socket patterns and peers stay explicit" {
+    const allocator = std.testing.allocator;
+
+    var pair_socket = try Socket(.pair).init(allocator, .{});
+    defer pair_socket.deinit();
+    var req_socket = try Socket(.req).init(allocator, .{});
+    defer req_socket.deinit();
+    var quic_peer = FakeQuicPeer.init(allocator);
+    defer quic_peer.deinit();
+
+    try std.testing.expectError(error.InvalidPattern, pair_socket.attachQuicPeer(quic_peer.peer(.req)));
+    try std.testing.expectError(error.InvalidPattern, req_socket.attachQuicPeer(quic_peer.peer(.pair)));
+
+    var pub_socket = try Socket(.@"pub").init(allocator, .{});
+    defer pub_socket.deinit();
+    try std.testing.expectError(error.UnsupportedTransport, pub_socket.listen(.{ .quic = "127.0.0.1:4433" }));
+    try std.testing.expectError(error.UnsupportedTransport, pub_socket.dial(.{ .quic = "127.0.0.1:4433" }));
 }
 
 test "tryRecv returns null instead of WouldBlock for receive-capable sockets" {

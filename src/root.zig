@@ -2,8 +2,8 @@
 //! subjects, message patterns, bounded queues, and transport adapters.
 //!
 //! The current implementation focuses on allocator-explicit core types,
-//! in-process transport, and initial nng-like pattern APIs. QUIC and PASETO
-//! integrations are represented by stable boundaries but remain optional.
+//! in-process transport, initial nng-like pattern APIs, and qmsg-owned QUIC
+//! integration surfaces. PASETO integration remains optional.
 
 const std = @import("std");
 
@@ -58,11 +58,17 @@ pub const Context = app.Context;
 pub const ErrorPolicy = app.ErrorPolicy;
 pub const InprocRepOptions = app.InprocRepOptions;
 pub const RunOnceResult = app.RunOnceResult;
+pub const QuicDispatchOptions = app.QuicDispatchOptions;
 pub const TlsConfig = app.TlsConfig;
 pub const QuicListenOptions = node.QuicListenOptions;
 pub const QuicSessionOptions = node.QuicSessionOptions;
 pub const QuicListenerId = node.QuicListenerId;
 pub const QuicSessionId = node.QuicSessionId;
+pub const QuicSendMeta = socket.QuicSendMeta;
+pub const QuicSendFn = socket.QuicSendFn;
+pub const QuicAcceptsFn = socket.QuicAcceptsFn;
+pub const QuicPeer = socket.QuicPeer;
+pub const QuicSocketSession = socket.QuicSession;
 
 pub const Error = error{
     InvalidSubject,
@@ -88,6 +94,8 @@ pub const Error = error{
     Canceled,
     PeerClosed,
     ConnectionLost,
+    StreamNotFound,
+    StreamAlreadyOpen,
     StreamReset,
     MalformedFrame,
     UnknownControlFrame,

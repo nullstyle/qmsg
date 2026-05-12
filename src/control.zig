@@ -8,6 +8,7 @@ pub const CodecOptions = struct {
     max_auth_scheme_len: usize = 64,
     max_credential_len: usize = 16 * 1024,
     max_key_id_hint_len: usize = 512,
+    max_hello_challenge_len: usize = 128,
     max_filter_len: usize = 512,
     max_goaway_reason_len: usize = 1024,
 };
@@ -53,11 +54,13 @@ pub const AuthProperties = struct {
     scheme: []const u8 = "",
     credential: []const u8 = "",
     key_id_hint: ?[]const u8 = null,
+    challenge: []const u8 = &.{},
 
     fn deinit(self: *AuthProperties, allocator: std.mem.Allocator) void {
         allocator.free(@constCast(self.scheme));
         allocator.free(@constCast(self.credential));
         if (self.key_id_hint) |hint| allocator.free(@constCast(hint));
+        allocator.free(@constCast(self.challenge));
         self.* = undefined;
     }
 };
@@ -197,6 +200,10 @@ pub fn encodedSize(frame: Frame, options: CodecOptions) !usize {
             if (hello.auth.key_id_hint) |hint| {
                 size = try addSize(size, try bytesSize(hint));
             }
+            if (hello.auth.challenge.len != 0) {
+                size = try addSize(size, 1);
+                size = try addSize(size, try bytesSize(hello.auth.challenge));
+            }
         },
         .goaway => |goaway| {
             size = try addSize(size, try varIntLen(goaway.code));
@@ -243,6 +250,10 @@ pub fn encode(allocator: std.mem.Allocator, frame: Frame, options: CodecOptions)
             try appendBool(allocator, &bytes, hello.auth.key_id_hint != null);
             if (hello.auth.key_id_hint) |hint| {
                 try appendBytes(allocator, &bytes, hint);
+            }
+            if (hello.auth.challenge.len != 0) {
+                try appendBool(allocator, &bytes, true);
+                try appendBytes(allocator, &bytes, hello.auth.challenge);
             }
         },
         .goaway => |goaway| {
@@ -303,6 +314,12 @@ fn decodeHello(allocator: std.mem.Allocator, reader: *Reader, options: CodecOpti
         try reader.readBytesLimited(options.max_key_id_hint_len, error.KeyIdHintTooLarge)
     else
         null;
+    const challenge = if (reader.remaining() == 0)
+        &.{}
+    else if (try reader.readBool())
+        try reader.readBytesLimited(options.max_hello_challenge_len, error.ChallengeTooLarge)
+    else
+        &.{};
 
     var hello: Hello = .{
         .allocator = allocator,
@@ -324,6 +341,7 @@ fn decodeHello(allocator: std.mem.Allocator, reader: *Reader, options: CodecOpti
     if (key_id_hint) |hint| {
         hello.auth.key_id_hint = try allocator.dupe(u8, hint);
     }
+    hello.auth.challenge = try allocator.dupe(u8, challenge);
 
     return hello;
 }
@@ -384,6 +402,7 @@ fn validateFrame(frame: Frame, options: CodecOptions) !void {
             if (hello.auth.key_id_hint) |hint| {
                 if (hint.len == 0 or hint.len > options.max_key_id_hint_len) return error.KeyIdHintTooLarge;
             }
+            if (hello.auth.challenge.len > options.max_hello_challenge_len) return error.ChallengeTooLarge;
 
             _ = try varIntLen(hello.wire_version);
             _ = try varIntLen(hello.role_flags);
@@ -603,6 +622,7 @@ test "hello frame round trips all negotiated fields" {
     try std.testing.expectEqualStrings("paseto", hello.auth.scheme);
     try std.testing.expectEqualStrings("v4.public.token", hello.auth.credential);
     try std.testing.expectEqualStrings("k4.pid.example", hello.auth.key_id_hint.?);
+    try std.testing.expectEqual(@as(usize, 0), hello.auth.challenge.len);
 }
 
 test "hello supports absent auth key hint" {
@@ -622,6 +642,38 @@ test "hello supports absent auth key hint" {
     defer decoded.deinit();
 
     try std.testing.expect(decoded.hello.auth.key_id_hint == null);
+    try std.testing.expectEqual(@as(usize, 0), decoded.hello.auth.challenge.len);
+}
+
+test "hello auth challenge extension round trips and enforces bounds" {
+    const allocator = std.testing.allocator;
+
+    const encoded = try encode(allocator, .{ .hello = .{
+        .peer_id = "node-a",
+        .auth = .{
+            .scheme = "paseto",
+            .credential = "v4.public.token",
+            .challenge = &.{ 0, 1, 2, 3, 4 },
+        },
+    } }, .{});
+    defer allocator.free(encoded);
+
+    var decoded = try decode(allocator, encoded, .{});
+    defer decoded.deinit();
+
+    try std.testing.expectEqualStrings("node-a", decoded.hello.peer_id);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 4 }, decoded.hello.auth.challenge);
+
+    try std.testing.expectError(error.ChallengeTooLarge, encode(allocator, .{ .hello = .{
+        .peer_id = "node-a",
+        .auth = .{ .challenge = "12345" },
+    } }, .{ .max_hello_challenge_len = 4 }));
+
+    try std.testing.expectError(error.ChallengeTooLarge, decode(
+        allocator,
+        encoded,
+        .{ .max_hello_challenge_len = 4 },
+    ));
 }
 
 test "subscribe and unsubscribe validate filters" {

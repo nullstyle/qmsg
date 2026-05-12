@@ -93,6 +93,7 @@ HELLO {
     scheme = paseto
     token = bytes
     key_id_hint = optional PASERK ID string
+    challenge = optional bounded nonce/challenge bytes
 }
 ```
 
@@ -118,8 +119,8 @@ succeeds, unless the listener explicitly allows anonymous sessions.
 
 Current integration shape:
 
-- `control.Hello.auth` remains the wire shape: `scheme`, `credential`, and
-  optional `key_id_hint`.
+- `control.Hello.auth` remains the wire shape: `scheme`, `credential`,
+  optional `key_id_hint`, and optional `challenge`.
 - `auth.HelloCredentials` converts those fields into the generic
   `auth.Credential` accepted by `auth.Authenticator`.
 - `Session.authenticateHello` is transport-independent: it validates the HELLO
@@ -154,6 +155,13 @@ per-session values, and `require_challenge` fails closed when a listener expects
 challenge-bound credentials but no nonce/challenge was installed. The purpose is
 to stop a token minted for one protocol, listener, or audience from being
 replayed as a valid `qmsg` credential somewhere else.
+
+`control.Hello.auth.challenge` is an advertisement/propagation hook for
+transports. It is encoded only when non-empty and bounded by
+`control.CodecOptions.max_hello_challenge_len`. When verifying an incoming
+credential, use the locally minted challenge stored in
+`AuthConfig.hello_binding.context.challenge`; do not treat the peer's advertised
+challenge as proof that the credential is bound to the current session.
 
 For deployments that cannot use implicit assertions, put protocol and audience
 constraints in claims and require strict claim validation.
@@ -307,10 +315,19 @@ For service-to-service deployments, the clean model is:
 3. client presents PASETO bound to `qmsg/1` and the challenge;
 4. server verifies and consumes the challenge.
 
-The core API now leaves room for this without changing the HELLO wire shape:
-transport code can attach a per-session `HelloAuthContext` to `AuthConfig`, or
-pass prebuilt implicit assertion bytes through `HelloCredentials`. The QUIC
-adapter still needs to allocate, advertise, and consume the server challenge.
+The core API now carries this hook in the HELLO auth surface:
+
+- mint bounded bytes with `auth.allocHelloChallenge` or `auth.fillHelloChallenge`;
+- advertise them in the outgoing `control.Hello.auth.challenge`;
+- retain the same bytes in local pre-auth state and install them as
+  `AuthConfig.hello_binding.context.challenge` before verifying the peer's
+  credential;
+- pass the decoded peer `hello.auth.challenge` to the local token provider when
+  minting an outbound credential for that peer;
+- consume or discard the local challenge after `Session.authenticateHello`
+  succeeds or fails.
+
+The QUIC adapter still needs to wire those hooks into its per-connection state.
 
 The concrete PASETO helper accepts an optional `auth.ReplayCache`. When present,
 `authenticateV4Public` requires `jti`, parses qmsg claims into an

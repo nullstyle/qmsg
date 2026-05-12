@@ -56,6 +56,9 @@ pub const Session = struct {
         errdefer if (clear_on_error) self.clearAuthorization(allocator);
 
         try config.hello_binding.validate();
+        try auth.validateHelloChallenge(hello.challenge, .{
+            .max_bytes = config.hello_binding.max_challenge_bytes,
+        });
 
         var owned_implicit_assertion: ?[]u8 = null;
         defer if (owned_implicit_assertion) |assertion| allocator.free(assertion);
@@ -341,6 +344,87 @@ test "Session binds HELLO credential to configured challenge context" {
     });
 
     try std.testing.expect(session.isAuthenticated());
+}
+
+test "Session required HELLO challenge ignores peer challenge and fails wrong bindings closed" {
+    const allocator = std.testing.allocator;
+
+    const expected_assertion = try auth.allocHelloImplicitAssertion(allocator, .{
+        .audience = "qmsg://jobs.example",
+        .authority = "jobs.example:443",
+        .listener_id = "listener-a",
+        .challenge = "nonce-good",
+    });
+    defer allocator.free(expected_assertion);
+
+    const TestAuthenticator = struct {
+        expected: []const u8,
+
+        fn authenticate(
+            ptr: ?*anyopaque,
+            inner_allocator: std.mem.Allocator,
+            credential: auth.Credential,
+        ) !auth.Authorization {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            try std.testing.expectEqualStrings("hello-token", credential.token);
+            if (!std.mem.eql(u8, self.expected, credential.implicit_assertion)) {
+                return auth.Error.Unauthorized;
+            }
+            return try (auth.Authorization{
+                .subject = "service:client",
+                .issuer = "auth.example",
+                .purpose = auth.hello_auth_purpose,
+                .allowed_patterns = auth.PatternSet.init(&.{.req}),
+            }).clone(inner_allocator);
+        }
+    };
+
+    var authenticator = TestAuthenticator{ .expected = expected_assertion };
+    var session = Session{ .id = 1, .transport = .inproc };
+    defer session.clearAuthorization(allocator);
+
+    try std.testing.expectError(
+        auth.Error.ChallengeRequired,
+        session.authenticateHello(allocator, .{
+            .required = true,
+            .authenticator = .{
+                .ptr = &authenticator,
+                .authenticate_fn = TestAuthenticator.authenticate,
+            },
+            .hello_binding = .{ .require_challenge = true },
+        }, .{
+            .peer_id = "client-a",
+            .scheme = auth.hello_auth_scheme_paseto,
+            .credential = "hello-token",
+            .challenge = "peer-advertised-nonce",
+        }),
+    );
+    try std.testing.expect(session.isAnonymous());
+
+    try std.testing.expectError(
+        auth.Error.Unauthorized,
+        session.authenticateHello(allocator, .{
+            .required = true,
+            .authenticator = .{
+                .ptr = &authenticator,
+                .authenticate_fn = TestAuthenticator.authenticate,
+            },
+            .hello_binding = .{
+                .context = .{
+                    .audience = "qmsg://jobs.example",
+                    .authority = "jobs.example:443",
+                    .listener_id = "listener-a",
+                    .challenge = "nonce-replayed-from-old-session",
+                },
+                .require_challenge = true,
+            },
+        }, .{
+            .peer_id = "client-a",
+            .scheme = auth.hello_auth_scheme_paseto,
+            .credential = "hello-token",
+        }),
+    );
+    try std.testing.expect(session.isAnonymous());
 }
 
 test "Session clears cached authorization when HELLO auth fails policy" {

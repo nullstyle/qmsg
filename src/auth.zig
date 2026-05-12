@@ -368,6 +368,51 @@ pub const Credential = struct {
 pub const hello_auth_scheme_paseto = "paseto";
 pub const hello_auth_purpose = "hello";
 pub const hello_implicit_assertion_prefix = "qmsg/hello-auth/v1";
+pub const default_hello_challenge_bytes: usize = 32;
+pub const max_hello_challenge_bytes: usize = 128;
+
+pub const HelloChallengeOptions = struct {
+    required: bool = false,
+    max_bytes: usize = max_hello_challenge_bytes,
+};
+
+pub fn validateHelloChallenge(challenge: []const u8, options: HelloChallengeOptions) Error!void {
+    if (challenge.len == 0) {
+        if (options.required) return Error.ChallengeRequired;
+        return;
+    }
+    if (challenge.len > options.max_bytes) return Error.ChallengeTooLarge;
+}
+
+pub fn fillHelloChallenge(random: std.Random, challenge: []u8, options: HelloChallengeOptions) Error!void {
+    try validateHelloChallenge(challenge, .{
+        .required = true,
+        .max_bytes = options.max_bytes,
+    });
+    random.bytes(challenge);
+}
+
+pub fn allocHelloChallenge(
+    allocator: std.mem.Allocator,
+    random: std.Random,
+    len: usize,
+    options: HelloChallengeOptions,
+) ![]u8 {
+    if (len == 0) return Error.ChallengeRequired;
+    if (len > options.max_bytes) return Error.ChallengeTooLarge;
+
+    const challenge = try allocator.alloc(u8, len);
+    errdefer allocator.free(challenge);
+    random.bytes(challenge);
+    return challenge;
+}
+
+pub fn helloChallengeMatches(expected: []const u8, actual: []const u8) bool {
+    if (expected.len == 0 or expected.len != actual.len) return false;
+    var diff: u8 = 0;
+    for (expected, actual) |left, right| diff |= left ^ right;
+    return diff == 0;
+}
 
 pub const HelloAuthContext = struct {
     protocol: []const u8 = "qmsg/1",
@@ -381,15 +426,17 @@ pub const HelloAuthContext = struct {
 pub const HelloBindingPolicy = struct {
     context: ?HelloAuthContext = null,
     require_challenge: bool = false,
-    max_challenge_bytes: usize = 128,
+    max_challenge_bytes: usize = max_hello_challenge_bytes,
 
     pub fn validate(self: HelloBindingPolicy) Error!void {
         const context = self.context orelse {
             if (self.require_challenge) return Error.ChallengeRequired;
             return;
         };
-        if (context.challenge.len > self.max_challenge_bytes) return Error.ChallengeTooLarge;
-        if (self.require_challenge and context.challenge.len == 0) return Error.ChallengeRequired;
+        try validateHelloChallenge(context.challenge, .{
+            .required = self.require_challenge,
+            .max_bytes = self.max_challenge_bytes,
+        });
     }
 };
 
@@ -398,6 +445,7 @@ pub const HelloCredentials = struct {
     scheme: []const u8 = "",
     credential: []const u8 = "",
     key_id_hint: ?[]const u8 = null,
+    challenge: []const u8 = &.{},
     implicit_assertion: []const u8 = &.{},
 
     pub fn isEmpty(self: HelloCredentials) bool {
@@ -1029,6 +1077,35 @@ test "AuthConfig bounds token size and anonymous subject filters" {
     );
     try std.testing.expect(config.allowsAnonymousSubject("health.ping"));
     try std.testing.expect(!config.allowsAnonymousSubject("admin.delete"));
+}
+
+test "HELLO challenge helpers validate, mint, and compare bounded bytes" {
+    const allocator = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(0x51525354);
+    const challenge = try allocHelloChallenge(
+        allocator,
+        prng.random(),
+        default_hello_challenge_bytes,
+        .{},
+    );
+    defer allocator.free(challenge);
+
+    try std.testing.expectEqual(default_hello_challenge_bytes, challenge.len);
+    try validateHelloChallenge(challenge, .{ .required = true });
+
+    const copied = try allocator.dupe(u8, challenge);
+    defer allocator.free(copied);
+    try std.testing.expect(helloChallengeMatches(challenge, copied));
+
+    copied[0] ^= 0xff;
+    try std.testing.expect(!helloChallengeMatches(challenge, copied));
+    try std.testing.expect(!helloChallengeMatches(challenge, challenge[0 .. challenge.len - 1]));
+
+    try std.testing.expectError(Error.ChallengeRequired, validateHelloChallenge(&.{}, .{ .required = true }));
+    try std.testing.expectError(Error.ChallengeTooLarge, validateHelloChallenge("12345", .{ .max_bytes = 4 }));
+    try std.testing.expectError(Error.ChallengeRequired, allocHelloChallenge(allocator, prng.random(), 0, .{}));
+    try std.testing.expectError(Error.ChallengeTooLarge, allocHelloChallenge(allocator, prng.random(), 5, .{ .max_bytes = 4 }));
 }
 
 test "HELLO implicit assertion encodes challenge-bound context" {
