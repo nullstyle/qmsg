@@ -133,7 +133,7 @@ Exit criteria:
 - Pair over QUIC on localhost.
 - Req/rep over QUIC on localhost.
 - Peer close and request cancel tests.
-- Interop-style smoke binary: `qmsg-server` and `qmsg-client`.
+- Library-embedding localhost smoke examples for pair and req/rep.
 - Release guidance carries the `quic-zig` `ReleaseSafe` requirement for
   production QUIC use.
 
@@ -328,9 +328,9 @@ Fuzz/property tests:
 
 Interop tests:
 
-- current one-process `quic-runtime-reqrep` smoke binary;
-- future split `qmsg-client` and `qmsg-server` binaries once Node-owned UDP
-  socket transport lands;
+- current one-process `quic-runtime-reqrep` example;
+- future library-embedding localhost examples once Node-owned UDP socket
+  transport lands;
 - scripted smoke tests for each pattern;
 - packet loss/reorder tests once transport hooks support them.
 

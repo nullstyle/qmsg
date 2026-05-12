@@ -52,8 +52,7 @@ across qmsg-owned transport modules:
 
 This is still not the final network transport. qmsg does not yet own OS UDP
 sockets in `Node`, expose public QUIC socket pattern APIs, dispatch App
-handlers over QUIC, send SUBSCRIBE/CREDIT over live control streams, or provide
-split `qmsg-server` / `qmsg-client` binaries.
+handlers over QUIC, or send SUBSCRIBE/CREDIT over live control streams.
 
 ## Build Integration
 

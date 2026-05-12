@@ -41,8 +41,7 @@ mapping, socket-free runtime wrappers around `quic_zig.Server`/`Client`,
 incremental control/reliable stream pumps, cancellation/error mapping,
 compact DATAGRAM envelope helpers, and hermetic tests that drive quic-zig
 handshake, qmsg HELLO, and reliable req/rep over QUIC streams. Node-owned UDP
-sockets, public socket pattern APIs over QUIC, and split `qmsg-server` /
-`qmsg-client` binaries are still future work.
+sockets and public socket pattern APIs over QUIC are still future work.
 
 ## Package Use
 
@@ -164,7 +163,8 @@ zig build examples
 ```
 
 That path proves the qmsg protocol mapping without opening OS UDP sockets yet.
-Separate server/client binaries should land with the Node-owned UDP event loop.
+Once the Node-owned UDP event loop lands, this should become a library example
+that shows an application embedding qmsg, not a qmsg-owned server/client tool.
 
 ## Design Tenets
 
