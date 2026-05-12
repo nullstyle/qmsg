@@ -32,9 +32,13 @@ tranches are building around:
 - `App`, `Context`, and `Session`.
 
 The inproc socket examples build and run against the current public API. The
-App facade can now serve inproc REP routes through `runOnce`. Real UDP QUIC
-listen/dial loops and reliable-message mapping over QUIC streams are still
-future work.
+App facade can now serve inproc REP routes through `runOnce`, and can prepare
+QUIC listener/session placeholders for lifecycle plumbing. QUIC currently has
+a compiled `quic-zig` dependency, option wrappers, transport-parameter
+mapping, qmsg control-stream HELLO/session tests, and a hermetic quic-zig
+handshake test in progress. Real UDP QUIC listen/dial loops, reliable-message
+mapping over QUIC streams, datagram delivery, and qmsg-server/qmsg-client
+smoke binaries are still future work.
 
 ## Package Use
 
@@ -118,8 +122,11 @@ req/rep example shape.
 
 ## App Facade Style
 
-The high-level facade should feel small and route-like, but the routes are qmsg
-patterns and subjects, not HTTP methods and paths.
+The high-level facade is route-like, but the routes are qmsg patterns and
+subjects, not HTTP methods and paths. The current runnable facade path is
+inproc REP through `listenInprocRep` and `runOnce`; `listenQuic` and
+`openQuicSession` currently prepare QUIC lifecycle state without opening UDP
+sockets or dispatching qmsg messages over QUIC yet.
 
 ```zig
 const qmsg = @import("qmsg");
@@ -133,8 +140,8 @@ pub fn main() !void {
     try app.sub("metrics.*", observeMetric);
     try app.datagram("presence.*", updatePresence);
 
-    try app.listenQuic("0.0.0.0:4433", tls_config);
-    try app.run();
+    _ = try app.listenInprocRep(&network, "users", .{});
+    _ = try app.runOnce();
 }
 ```
 
@@ -193,6 +200,10 @@ Build the examples:
 ```sh
 zig build examples
 ```
+
+For internet-facing QUIC builds, follow `quic-zig`'s production posture and
+use `ReleaseSafe`; the current qmsg QUIC surface is still a skeleton and is not
+yet a production listener/dialer.
 
 ## Repository Notes
 

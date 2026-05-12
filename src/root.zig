@@ -59,6 +59,10 @@ pub const ErrorPolicy = app.ErrorPolicy;
 pub const InprocRepOptions = app.InprocRepOptions;
 pub const RunOnceResult = app.RunOnceResult;
 pub const TlsConfig = app.TlsConfig;
+pub const QuicListenOptions = node.QuicListenOptions;
+pub const QuicSessionOptions = node.QuicSessionOptions;
+pub const QuicListenerId = node.QuicListenerId;
+pub const QuicSessionId = node.QuicSessionId;
 
 pub const Error = error{
     InvalidSubject,

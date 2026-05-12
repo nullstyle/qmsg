@@ -46,6 +46,28 @@ pub const Session = struct {
         self.authorization = authorization;
     }
 
+    pub fn authenticateHello(
+        self: *Session,
+        allocator: std.mem.Allocator,
+        config: auth.AuthConfig,
+        hello: auth.HelloCredentials,
+    ) !void {
+        const credential = (try auth.credentialFromHello(config, hello)) orelse {
+            if (!config.allowsAnonymousSubject(hello.peer_id)) {
+                return auth.Error.AuthenticationRequired;
+            }
+            self.clearAuthorization(allocator);
+            return;
+        };
+
+        const authenticator = config.authenticator orelse return auth.Error.UnsupportedCredential;
+        var authorization = try authenticator.authenticate(allocator, credential);
+        errdefer authorization.deinit(allocator);
+
+        self.clearAuthorization(allocator);
+        self.setAuthorization(authorization);
+    }
+
     pub fn replaceAuthorization(
         self: *Session,
         allocator: std.mem.Allocator,
@@ -194,6 +216,63 @@ test "Session check combines session and authorization limits" {
     });
     try std.testing.expectError(auth.Error.MessageTooLarge, session.check(.{ .message_size = 17 }));
     try std.testing.expectError(auth.Error.Unauthorized, session.check(.{ .datagram = true }));
+}
+
+test "Session authenticates HELLO credentials and caches authorization" {
+    const allocator = std.testing.allocator;
+
+    const TestAuthenticator = struct {
+        calls: usize = 0,
+
+        fn authenticate(
+            ptr: ?*anyopaque,
+            inner_allocator: std.mem.Allocator,
+            credential: auth.Credential,
+        ) !auth.Authorization {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("hello-token", credential.token);
+            return try (auth.Authorization{
+                .subject = "service:client",
+                .issuer = "auth.example",
+                .allowed_patterns = auth.PatternSet.init(&.{.req}),
+                .allowed_subjects = .allow_all,
+            }).clone(inner_allocator);
+        }
+    };
+
+    var authenticator = TestAuthenticator{};
+    var session = Session{ .id = 1, .transport = .inproc };
+    defer session.clearAuthorization(allocator);
+
+    try session.authenticateHello(allocator, .{
+        .required = true,
+        .authenticator = .{
+            .ptr = &authenticator,
+            .authenticate_fn = TestAuthenticator.authenticate,
+        },
+    }, .{
+        .peer_id = "client-a",
+        .scheme = auth.hello_auth_scheme_paseto,
+        .credential = "hello-token",
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), authenticator.calls);
+    try session.requirePattern(.req);
+    try std.testing.expectEqualStrings("service:client", session.authorizationCache().?.subject);
+}
+
+test "Session permits anonymous HELLO only when configured" {
+    const allocator = std.testing.allocator;
+
+    var session = Session{ .id = 1, .transport = .inproc };
+    try std.testing.expectError(
+        auth.Error.AuthenticationRequired,
+        session.authenticateHello(allocator, .{ .required = true }, .{ .peer_id = "client-a" }),
+    );
+
+    try session.authenticateHello(allocator, .{ .required = false }, .{ .peer_id = "client-a" });
+    try std.testing.expect(session.isAnonymous());
 }
 
 test {

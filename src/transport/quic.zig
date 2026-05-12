@@ -1,7 +1,10 @@
 const std = @import("std");
 const quic_zig = @import("quic_zig");
 
+const auth = @import("../auth.zig");
 const control = @import("../control.zig");
+const envelope = @import("../envelope.zig");
+const message = @import("../message.zig");
 const session_mod = @import("../session.zig");
 
 pub const alpn = "qmsg/1";
@@ -26,6 +29,192 @@ pub const State = enum {
     closed,
 };
 
+pub const StreamIdAllocator = struct {
+    next_bidi: u64,
+    next_uni: u64,
+
+    pub fn init(role: Role) StreamIdAllocator {
+        return switch (role) {
+            .client => .{ .next_bidi = 0, .next_uni = 2 },
+            .server => .{ .next_bidi = 1, .next_uni = 3 },
+        };
+    }
+
+    pub fn nextBidi(self: *StreamIdAllocator) !u64 {
+        return self.next(&self.next_bidi);
+    }
+
+    pub fn nextUni(self: *StreamIdAllocator) !u64 {
+        return self.next(&self.next_uni);
+    }
+
+    fn next(_: *StreamIdAllocator, cursor: *u64) !u64 {
+        const id = cursor.*;
+        cursor.* = std.math.add(u64, cursor.*, 4) catch return error.InvalidState;
+        return id;
+    }
+};
+
+pub const ReliableWriteOptions = struct {
+    open_bidi: bool = true,
+    finish: bool = true,
+};
+
+pub const ReliableWriteProgress = enum {
+    pending,
+    complete,
+};
+
+pub const ReliableMessageSender = struct {
+    allocator: std.mem.Allocator,
+    stream_id: u64,
+    bytes: []u8,
+    offset: usize = 0,
+    options: ReliableWriteOptions = .{},
+    opened: bool = false,
+    finished: bool = false,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        stream_id: u64,
+        outgoing: message.OutgoingMessage,
+        codec_options: envelope.CodecOptions,
+        options: ReliableWriteOptions,
+    ) !ReliableMessageSender {
+        const bytes = try encodeReliableMessage(allocator, outgoing, codec_options);
+        errdefer allocator.free(bytes);
+
+        return .{
+            .allocator = allocator,
+            .stream_id = stream_id,
+            .bytes = bytes,
+            .options = options,
+        };
+    }
+
+    pub fn deinit(self: *ReliableMessageSender) void {
+        self.allocator.free(self.bytes);
+        self.* = undefined;
+    }
+
+    pub fn pump(self: *ReliableMessageSender, conn: *quic_zig.Connection) !ReliableWriteProgress {
+        if (!self.opened) {
+            if (self.options.open_bidi) _ = try conn.openBidi(self.stream_id);
+            self.opened = true;
+        }
+
+        while (self.offset < self.bytes.len) {
+            const written = try conn.streamWrite(self.stream_id, self.bytes[self.offset..]);
+            if (written == 0) return .pending;
+            self.offset += written;
+        }
+
+        if (self.options.finish and !self.finished) {
+            try conn.streamFinish(self.stream_id);
+            self.finished = true;
+        }
+
+        return .complete;
+    }
+};
+
+pub const ReliableMessageReceiver = struct {
+    allocator: std.mem.Allocator,
+    stream_id: u64,
+    codec_options: envelope.CodecOptions,
+    bytes: std.ArrayList(u8) = .empty,
+    decoded: bool = false,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        stream_id: u64,
+        codec_options: envelope.CodecOptions,
+    ) ReliableMessageReceiver {
+        return .{
+            .allocator = allocator,
+            .stream_id = stream_id,
+            .codec_options = codec_options,
+        };
+    }
+
+    pub fn deinit(self: *ReliableMessageReceiver) void {
+        self.bytes.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn read(self: *ReliableMessageReceiver, conn: *quic_zig.Connection) !?message.Message {
+        if (self.decoded) return error.InvalidState;
+
+        try self.checkStreamResetAndSize(conn);
+        var scratch: [4096]u8 = undefined;
+        while (true) {
+            const n = try conn.streamRead(self.stream_id, &scratch);
+            if (n == 0) break;
+            if (n > self.codec_options.max_message_size or
+                self.bytes.items.len > self.codec_options.max_message_size - n)
+            {
+                return error.MessageTooLarge;
+            }
+            try self.bytes.appendSlice(self.allocator, scratch[0..n]);
+        }
+
+        if (!try self.streamComplete(conn)) return null;
+
+        self.decoded = true;
+        return try decodeReliableMessage(self.allocator, self.bytes.items, self.codec_options);
+    }
+
+    fn checkStreamResetAndSize(self: *ReliableMessageReceiver, conn: *quic_zig.Connection) !void {
+        const stream = conn.stream(self.stream_id) orelse return error.StreamNotFound;
+        if (stream.recv.reset != null) return error.StreamReset;
+        if (stream.recv.final_size) |final_size| {
+            if (final_size > self.codec_options.max_message_size) return error.MessageTooLarge;
+        }
+    }
+
+    fn streamComplete(self: *ReliableMessageReceiver, conn: *quic_zig.Connection) !bool {
+        const stream = conn.stream(self.stream_id) orelse return error.StreamNotFound;
+        if (stream.recv.reset != null) return error.StreamReset;
+        const final_size = stream.recv.final_size orelse return false;
+        return stream.recv.read_offset == final_size;
+    }
+};
+
+pub const RequestCorrelation = struct {
+    stream_id: u64,
+    message_id: message.MessageId,
+
+    pub fn expectReply(self: RequestCorrelation, stream_id: u64, reply: message.Message) !void {
+        if (stream_id != self.stream_id) return error.UnexpectedFrame;
+        if (reply.id != self.message_id) return error.UnexpectedFrame;
+    }
+};
+
+pub fn encodeReliableMessage(
+    allocator: std.mem.Allocator,
+    outgoing: message.OutgoingMessage,
+    options: envelope.CodecOptions,
+) ![]u8 {
+    if (outgoing.flags.unreliable) return error.InvalidMessage;
+    return envelope.encode(allocator, outgoing, options);
+}
+
+pub fn decodeReliableMessage(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    options: envelope.CodecOptions,
+) !message.Message {
+    return envelope.decode(allocator, bytes, options);
+}
+
+pub fn requestCorrelation(stream_id: u64, outgoing: message.OutgoingMessage) !RequestCorrelation {
+    if (outgoing.id == 0) return error.InvalidMessage;
+    return .{
+        .stream_id = stream_id,
+        .message_id = outgoing.id,
+    };
+}
+
 pub const QuicOptions = struct {
     alpn_protocols: []const []const u8 = &default_alpn_protocols,
     peer_id: []const u8 = "qmsg",
@@ -38,6 +227,7 @@ pub const QuicOptions = struct {
     max_datagram_frame_size: u64 = 0,
     heartbeat_interval_ms: u64 = 0,
     auth: control.AuthProperties = .{},
+    auth_config: auth.AuthConfig = .{},
     control_codec: control.CodecOptions = .{},
 
     max_idle_timeout_ms: u64 = 30_000,
@@ -167,6 +357,7 @@ pub const QuicSession = struct {
 
     pub fn deinit(self: *QuicSession) void {
         if (self.peer_id) |peer_id| self.allocator.free(peer_id);
+        self.session.clearAuthorization(self.allocator);
         self.* = undefined;
     }
 
@@ -199,6 +390,27 @@ pub const QuicSession = struct {
         return bytes;
     }
 
+    pub fn sendLocalHelloOnStream(self: *QuicSession, conn: *quic_zig.Connection) !u64 {
+        if (self.state_value != .quic_ready and self.state_value != .ready) return error.InvalidState;
+        if (self.local_hello_sent) return error.InvalidState;
+
+        const stream_id = localControlStreamId(self.role);
+        if (conn.stream(stream_id) == null) {
+            _ = try conn.openUni(stream_id);
+        }
+
+        const bytes = try encodeHelloControlStream(self.allocator, self.options);
+        defer self.allocator.free(bytes);
+
+        const written = try conn.streamWrite(stream_id, bytes);
+        if (written != bytes.len) return error.FlowControlled;
+        try conn.streamFinish(stream_id);
+
+        self.local_hello_sent = true;
+        self.refreshState();
+        return stream_id;
+    }
+
     pub fn acceptPeerControl(self: *QuicSession, bytes: []const u8) !void {
         if (self.state_value == .waiting_for_quic or self.state_value == .closing or self.state_value == .closed) {
             return error.InvalidState;
@@ -219,17 +431,42 @@ pub const QuicSession = struct {
         self.refreshState();
     }
 
+    pub fn acceptPeerControlFromStream(
+        self: *QuicSession,
+        conn: *quic_zig.Connection,
+        stream_id: u64,
+        max_bytes: usize,
+    ) !void {
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(self.allocator);
+
+        var scratch: [1024]u8 = undefined;
+        while (true) {
+            const n = try conn.streamRead(stream_id, &scratch);
+            if (n == 0) break;
+            if (bytes.items.len + n > max_bytes) return error.FrameTooLarge;
+            try bytes.appendSlice(self.allocator, scratch[0..n]);
+        }
+        if (bytes.items.len == 0) return error.MalformedFrame;
+
+        try self.acceptPeerControl(bytes.items);
+    }
+
     pub fn close(self: *QuicSession) void {
         self.state_value = .closed;
     }
 
     fn acceptHello(self: *QuicSession, hello: control.Hello) !void {
         if (self.peer_hello_received) return error.InvalidState;
-        if (hello.wire_version != control.default_wire_version) return error.VersionMismatch;
-        if (hello.peer_id.len == 0) return error.PeerIdTooLarge;
+        try self.validateHelloPolicy(hello);
 
         const owned_peer_id = try self.allocator.dupe(u8, hello.peer_id);
         errdefer self.allocator.free(owned_peer_id);
+
+        var auth_committed = false;
+        errdefer if (!auth_committed) self.session.clearAuthorization(self.allocator);
+        try self.authenticateHello(hello);
+
         if (self.peer_id) |previous| self.allocator.free(previous);
         self.peer_id = owned_peer_id;
         self.peer_hello_received = true;
@@ -237,6 +474,28 @@ pub const QuicSession = struct {
         self.session.peer_id = self.peer_id.?;
         self.session.datagram_enabled = self.options.datagram_enabled and hello.datagram_enabled;
         self.session.max_message_size = @min(self.options.max_message_size, hello.max_message_size);
+        auth_committed = true;
+    }
+
+    fn validateHelloPolicy(self: *QuicSession, hello: control.Hello) !void {
+        if (hello.wire_version != control.default_wire_version) return error.VersionMismatch;
+        if (hello.peer_id.len == 0) return error.PeerIdTooLarge;
+        if (hello.supported_patterns == 0) return error.InvalidPattern;
+        if ((hello.supported_patterns & ~control.PatternBits.all) != 0) return error.InvalidPattern;
+        if ((hello.supported_patterns & self.options.supported_patterns) == 0) return error.InvalidPattern;
+    }
+
+    fn authenticateHello(self: *QuicSession, hello: control.Hello) !void {
+        try self.session.authenticateHello(self.allocator, self.options.auth_config, .{
+            .peer_id = hello.peer_id,
+            .scheme = hello.auth.scheme,
+            .credential = hello.auth.credential,
+            .key_id_hint = hello.auth.key_id_hint,
+        });
+
+        if (self.session.authorizationCache()) |authorization| {
+            try checkHelloAuthorization(authorization, hello);
+        }
     }
 
     fn refreshState(self: *QuicSession) void {
@@ -250,6 +509,20 @@ pub const QuicSession = struct {
         }
     }
 };
+
+pub fn localControlStreamId(role: Role) u64 {
+    return switch (role) {
+        .client => 2,
+        .server => 3,
+    };
+}
+
+pub fn peerControlStreamId(role: Role) u64 {
+    return switch (role) {
+        .client => localControlStreamId(.server),
+        .server => localControlStreamId(.client),
+    };
+}
 
 pub fn validateAlpn(protocols: []const []const u8) !void {
     if (protocols.len == 0) return error.InvalidEndpoint;
@@ -328,6 +601,26 @@ pub fn decodeControlStream(
 
     if (frames.items.len == 0) return error.MalformedFrame;
     return try frames.toOwnedSlice(allocator);
+}
+
+fn checkHelloAuthorization(authorization: auth.Authorization, hello: control.Hello) auth.Error!void {
+    try checkHelloPattern(authorization, hello.supported_patterns, control.PatternBits.pair, .pair);
+    try checkHelloPattern(authorization, hello.supported_patterns, control.PatternBits.req, .req);
+    try checkHelloPattern(authorization, hello.supported_patterns, control.PatternBits.rep, .rep);
+    try checkHelloPattern(authorization, hello.supported_patterns, control.PatternBits.pub_, .@"pub");
+    try checkHelloPattern(authorization, hello.supported_patterns, control.PatternBits.sub, .sub);
+    try checkHelloPattern(authorization, hello.supported_patterns, control.PatternBits.push, .push);
+    try checkHelloPattern(authorization, hello.supported_patterns, control.PatternBits.pull, .pull);
+    if (hello.datagram_enabled) try authorization.check(.{ .datagram = true });
+}
+
+fn checkHelloPattern(
+    authorization: auth.Authorization,
+    bits: u64,
+    bit: u64,
+    pattern: auth.Pattern,
+) auth.Error!void {
+    if ((bits & bit) != 0) try authorization.check(.{ .pattern = pattern });
 }
 
 fn helloFromOptions(options: QuicOptions) control.Hello {
@@ -519,4 +812,298 @@ test "QUIC session rejects control bytes before QUIC readiness" {
 
     try std.testing.expectError(error.InvalidState, sess.encodeLocalHello());
     try std.testing.expectError(error.InvalidState, sess.acceptPeerControl(bytes));
+}
+
+test "QUIC session rejects HELLO with incompatible wire version" {
+    const allocator = std.testing.allocator;
+
+    var sess = try QuicSession.init(allocator, 1, .client, .{ .peer_id = "client-a" });
+    defer sess.deinit();
+    try sess.onQuicReady();
+
+    const bytes = try encodeControlStream(allocator, .{ .hello = .{
+        .wire_version = control.default_wire_version + 1,
+        .peer_id = "server-a",
+        .supported_patterns = control.PatternBits.pair,
+    } }, .{});
+    defer allocator.free(bytes);
+
+    try std.testing.expectError(error.VersionMismatch, sess.acceptPeerControl(bytes));
+    try std.testing.expectEqual(State.quic_ready, sess.state());
+    try std.testing.expectEqualStrings("", sess.peerId());
+}
+
+test "QUIC session rejects HELLO with no compatible pattern" {
+    const allocator = std.testing.allocator;
+
+    var sess = try QuicSession.init(allocator, 1, .client, .{
+        .peer_id = "client-a",
+        .supported_patterns = control.PatternBits.req,
+    });
+    defer sess.deinit();
+    try sess.onQuicReady();
+
+    const bytes = try encodeHelloControlStream(allocator, .{
+        .peer_id = "server-a",
+        .supported_patterns = control.PatternBits.pub_,
+    });
+    defer allocator.free(bytes);
+
+    try std.testing.expectError(error.InvalidPattern, sess.acceptPeerControl(bytes));
+    try std.testing.expectEqual(State.quic_ready, sess.state());
+}
+
+test "QUIC session rejects HELLO when auth is required but absent" {
+    const allocator = std.testing.allocator;
+
+    var sess = try QuicSession.init(allocator, 1, .client, .{
+        .peer_id = "client-a",
+        .auth_config = .{ .required = true },
+    });
+    defer sess.deinit();
+    try sess.onQuicReady();
+
+    const bytes = try encodeHelloControlStream(allocator, .{
+        .peer_id = "server-a",
+        .supported_patterns = control.PatternBits.pair,
+    });
+    defer allocator.free(bytes);
+
+    try std.testing.expectError(auth.Error.AuthenticationRequired, sess.acceptPeerControl(bytes));
+    try std.testing.expect(!sess.session.isAuthenticated());
+}
+
+test "QUIC session permits anonymous HELLO when auth is optional" {
+    const allocator = std.testing.allocator;
+
+    var sess = try QuicSession.init(allocator, 1, .client, .{ .peer_id = "client-a" });
+    defer sess.deinit();
+    try sess.onQuicReady();
+
+    const bytes = try encodeHelloControlStream(allocator, .{
+        .peer_id = "server-a",
+        .supported_patterns = control.PatternBits.pair,
+    });
+    defer allocator.free(bytes);
+
+    try sess.acceptPeerControl(bytes);
+    try std.testing.expectEqualStrings("server-a", sess.peerId());
+    try std.testing.expect(sess.session.isAnonymous());
+}
+
+test "QUIC session rejects unsupported scheme and authenticator unknown key" {
+    const allocator = std.testing.allocator;
+
+    const UnknownKeyAuthenticator = struct {
+        fn authenticate(_: ?*anyopaque, _: std.mem.Allocator, _: auth.Credential) !auth.Authorization {
+            return auth.Error.UnknownKey;
+        }
+    };
+
+    var sess = try QuicSession.init(allocator, 1, .client, .{
+        .peer_id = "client-a",
+        .auth_config = .{
+            .required = true,
+            .authenticator = .{ .authenticate_fn = UnknownKeyAuthenticator.authenticate },
+        },
+    });
+    defer sess.deinit();
+    try sess.onQuicReady();
+
+    const unsupported = try encodeHelloControlStream(allocator, .{
+        .peer_id = "server-a",
+        .supported_patterns = control.PatternBits.pair,
+        .auth = .{ .scheme = "bearer", .credential = "token" },
+    });
+    defer allocator.free(unsupported);
+
+    try std.testing.expectError(auth.Error.UnsupportedCredential, sess.acceptPeerControl(unsupported));
+    try std.testing.expectEqualStrings("", sess.peerId());
+    try std.testing.expect(!sess.session.isAuthenticated());
+
+    const unknown_key = try encodeHelloControlStream(allocator, .{
+        .peer_id = "server-a",
+        .supported_patterns = control.PatternBits.pair,
+        .auth = .{ .scheme = auth.hello_auth_scheme_paseto, .credential = "token" },
+    });
+    defer allocator.free(unknown_key);
+
+    try std.testing.expectError(auth.Error.UnknownKey, sess.acceptPeerControl(unknown_key));
+    try std.testing.expectEqualStrings("", sess.peerId());
+    try std.testing.expect(!sess.session.isAuthenticated());
+}
+
+test "QUIC session caches successful HELLO authorization" {
+    const allocator = std.testing.allocator;
+
+    const SuccessAuthenticator = struct {
+        calls: usize = 0,
+
+        fn authenticate(ptr: ?*anyopaque, alloc: std.mem.Allocator, credential: auth.Credential) !auth.Authorization {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("token", credential.token);
+            return try (auth.Authorization{
+                .subject = "service:server",
+                .issuer = "issuer",
+                .allowed_patterns = auth.PatternSet.init(&.{.pair}),
+                .allowed_subjects = .allow_all,
+            }).clone(alloc);
+        }
+    };
+
+    var success = SuccessAuthenticator{};
+    var sess = try QuicSession.init(allocator, 1, .client, .{
+        .peer_id = "client-a",
+        .auth_config = .{
+            .required = true,
+            .authenticator = .{
+                .ptr = &success,
+                .authenticate_fn = SuccessAuthenticator.authenticate,
+            },
+        },
+    });
+    defer sess.deinit();
+    try sess.onQuicReady();
+
+    const bytes = try encodeHelloControlStream(allocator, .{
+        .peer_id = "server-a",
+        .supported_patterns = control.PatternBits.pair,
+        .auth = .{ .scheme = auth.hello_auth_scheme_paseto, .credential = "token" },
+    });
+    defer allocator.free(bytes);
+
+    try sess.acceptPeerControl(bytes);
+    try std.testing.expectEqual(@as(usize, 1), success.calls);
+    try std.testing.expectEqualStrings("server-a", sess.peerId());
+    try std.testing.expect(sess.session.isAuthenticated());
+    try std.testing.expectEqualStrings("service:server", sess.session.authorizationCache().?.subject);
+    try sess.session.requirePattern(.pair);
+}
+
+test "QUIC session applies auth policy to HELLO patterns and datagrams" {
+    const allocator = std.testing.allocator;
+
+    const AuthHarness = struct {
+        fn authenticate(_: ?*anyopaque, alloc: std.mem.Allocator, _: auth.Credential) !auth.Authorization {
+            const subject = try alloc.dupe(u8, "peer");
+            errdefer alloc.free(subject);
+            const issuer = try alloc.dupe(u8, "issuer");
+            errdefer alloc.free(issuer);
+
+            return .{
+                .subject = subject,
+                .issuer = issuer,
+                .allowed_patterns = auth.PatternSet.init(&.{.req}),
+                .datagram_allowed = false,
+            };
+        }
+    };
+
+    var pattern_sess = try QuicSession.init(allocator, 1, .client, .{
+        .peer_id = "client-a",
+        .auth_config = .{
+            .required = true,
+            .authenticator = .{ .authenticate_fn = AuthHarness.authenticate },
+        },
+    });
+    defer pattern_sess.deinit();
+    try pattern_sess.onQuicReady();
+
+    const pattern_bytes = try encodeHelloControlStream(allocator, .{
+        .peer_id = "server-a",
+        .supported_patterns = control.PatternBits.rep,
+        .auth = .{ .scheme = auth.hello_auth_scheme_paseto, .credential = "token" },
+    });
+    defer allocator.free(pattern_bytes);
+
+    try std.testing.expectError(auth.Error.Unauthorized, pattern_sess.acceptPeerControl(pattern_bytes));
+
+    var datagram_sess = try QuicSession.init(allocator, 2, .client, .{
+        .peer_id = "client-b",
+        .datagram_enabled = true,
+        .auth_config = .{
+            .required = true,
+            .authenticator = .{ .authenticate_fn = AuthHarness.authenticate },
+        },
+    });
+    defer datagram_sess.deinit();
+    try datagram_sess.onQuicReady();
+
+    const datagram_bytes = try encodeHelloControlStream(allocator, .{
+        .peer_id = "server-b",
+        .supported_patterns = control.PatternBits.req,
+        .datagram_enabled = true,
+        .auth = .{ .scheme = auth.hello_auth_scheme_paseto, .credential = "token" },
+    });
+    defer allocator.free(datagram_bytes);
+
+    try std.testing.expectError(auth.Error.Unauthorized, datagram_sess.acceptPeerControl(datagram_bytes));
+    try std.testing.expect(!datagram_sess.session.isAuthenticated());
+}
+
+test "QUIC stream id allocator owns role-specific stream ids" {
+    var client_ids = StreamIdAllocator.init(.client);
+    try std.testing.expectEqual(@as(u64, 0), try client_ids.nextBidi());
+    try std.testing.expectEqual(@as(u64, 4), try client_ids.nextBidi());
+    try std.testing.expectEqual(@as(u64, 2), try client_ids.nextUni());
+    try std.testing.expectEqual(@as(u64, 6), try client_ids.nextUni());
+
+    var server_ids = StreamIdAllocator.init(.server);
+    try std.testing.expectEqual(@as(u64, 1), try server_ids.nextBidi());
+    try std.testing.expectEqual(@as(u64, 5), try server_ids.nextBidi());
+    try std.testing.expectEqual(@as(u64, 3), try server_ids.nextUni());
+    try std.testing.expectEqual(@as(u64, 7), try server_ids.nextUni());
+}
+
+test "reliable message helpers encode decode and reject unreliable flag" {
+    const allocator = std.testing.allocator;
+
+    const bytes = try encodeReliableMessage(allocator, .{
+        .subject = "pair.echo",
+        .id = 42,
+        .headers = &.{.{ .name = "content-type", .value = "text/plain" }},
+        .body = "hello",
+    }, .{});
+    defer allocator.free(bytes);
+
+    var decoded = try decodeReliableMessage(allocator, bytes, .{});
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(@as(message.MessageId, 42), decoded.id);
+    try std.testing.expectEqualStrings("pair.echo", decoded.subject);
+    try std.testing.expectEqualStrings("hello", decoded.body);
+    try std.testing.expectEqualStrings("content-type", decoded.headers[0].name);
+
+    try std.testing.expectError(error.InvalidMessage, encodeReliableMessage(allocator, .{
+        .subject = "pair.echo",
+        .flags = .{ .unreliable = true },
+    }, .{}));
+}
+
+test "request correlation requires same stream and message id" {
+    const allocator = std.testing.allocator;
+
+    const correlation = try requestCorrelation(0, .{
+        .subject = "user.get",
+        .id = 700,
+        .body = "request",
+    });
+
+    var reply = try message.Message.init(allocator, .{
+        .subject = "user.get",
+        .id = 700,
+        .body = "reply",
+    });
+    defer reply.deinit();
+
+    try correlation.expectReply(0, reply);
+    try std.testing.expectError(error.UnexpectedFrame, correlation.expectReply(1, reply));
+
+    reply.id = 701;
+    try std.testing.expectError(error.UnexpectedFrame, correlation.expectReply(0, reply));
+    try std.testing.expectError(error.InvalidMessage, requestCorrelation(0, .{
+        .subject = "user.get",
+        .id = 0,
+    }));
 }

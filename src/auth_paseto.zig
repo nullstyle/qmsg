@@ -51,6 +51,41 @@ pub const AuthOptions = struct {
     replay_cache: ?auth.ReplayCache = null,
 };
 
+pub const V4PublicAuthenticator = struct {
+    keys: KeyStore,
+    options: AuthOptions = .{},
+
+    pub fn authenticator(self: *V4PublicAuthenticator) auth.Authenticator {
+        return .{
+            .ptr = self,
+            .authenticate_fn = authenticate,
+        };
+    }
+
+    fn authenticate(
+        ptr: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        credential: auth.Credential,
+    ) !auth.Authorization {
+        const self: *V4PublicAuthenticator = @ptrCast(@alignCast(ptr.?));
+        const key_id_hint = if (credential.key_id_hint) |hint|
+            try parseV4PublicKeyId(hint)
+        else
+            null;
+
+        return try authenticateV4Public(
+            allocator,
+            self.keys,
+            .{
+                .token = credential.token,
+                .key_id_hint = key_id_hint,
+                .implicit_assertion = credential.implicit_assertion,
+            },
+            self.options,
+        );
+    }
+};
+
 pub const VerifiedV4Public = struct {
     key_id: PaserkId,
     claims: []u8,
@@ -506,6 +541,58 @@ test "authenticate maps qmsg claims into Authorization and checks replay cache" 
                 },
             },
         ),
+    );
+}
+
+test "V4PublicAuthenticator adapts generic HELLO credentials" {
+    const allocator = std.testing.allocator;
+    const key = try V4Public.fromSeed(&@as([32]u8, @splat(35)));
+    const key_id = try v4PublicKeyId(key);
+    const key_id_bytes = key_id.toArray();
+
+    const claims =
+        \\{
+        \\  "iss":"issuer.example",
+        \\  "sub":"service:hello",
+        \\  "qmsg":{
+        \\    "patterns":["pair"],
+        \\    "subjects":">"
+        \\  }
+        \\}
+    ;
+    const token = try key.sign(allocator, claims, .{});
+    defer allocator.free(token);
+
+    const entries = [_]PublicKeyEntry{.{ .key_id = key_id, .key = key }};
+    const static = StaticKeyStore{ .v4_public_keys = &entries };
+    var concrete = V4PublicAuthenticator{
+        .keys = static.keyStore(),
+        .options = .{
+            .verify = .{ .require_footer_key_id = false },
+        },
+    };
+
+    var authorization = try concrete.authenticator().authenticate(allocator, .{
+        .token = token,
+        .key_id_hint = &key_id_bytes,
+    });
+    defer authorization.deinit(allocator);
+
+    try std.testing.expectEqualStrings("service:hello", authorization.subject);
+    try authorization.check(.{ .pattern = .pair, .subject = "anything" });
+
+    var unknown = V4PublicAuthenticator{
+        .keys = .{},
+        .options = .{
+            .verify = .{ .require_footer_key_id = false },
+        },
+    };
+    try std.testing.expectError(
+        Error.UnknownKey,
+        unknown.authenticator().authenticate(allocator, .{
+            .token = token,
+            .key_id_hint = &key_id_bytes,
+        }),
     );
 }
 

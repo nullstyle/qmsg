@@ -116,6 +116,19 @@ Server validation flow:
 The session should not dispatch application messages until authentication
 succeeds, unless the listener explicitly allows anonymous sessions.
 
+Current integration shape:
+
+- `control.Hello.auth` remains the wire shape: `scheme`, `credential`, and
+  optional `key_id_hint`.
+- `auth.HelloCredentials` converts those fields into the generic
+  `auth.Credential` accepted by `auth.Authenticator`.
+- `Session.authenticateHello` is transport-independent: it validates the HELLO
+  auth scheme and token bounds, permits anonymous peers only when `AuthConfig`
+  allows it, calls the configured authenticator, and caches the returned
+  `Authorization` on success.
+- The QUIC adapter calls that helper while processing decoded HELLO control
+  frames; no real QUIC connection is required to exercise HELLO auth.
+
 ## Context Binding
 
 PASETO v3/v4 support implicit assertions. `qmsg` should use them to bind a

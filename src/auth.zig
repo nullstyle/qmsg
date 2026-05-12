@@ -322,6 +322,30 @@ pub const Credential = struct {
     implicit_assertion: []const u8 = &.{},
 };
 
+pub const hello_auth_scheme_paseto = "paseto";
+
+pub const HelloCredentials = struct {
+    peer_id: []const u8 = "",
+    scheme: []const u8 = "",
+    credential: []const u8 = "",
+    key_id_hint: ?[]const u8 = null,
+    implicit_assertion: []const u8 = &.{},
+
+    pub fn isEmpty(self: HelloCredentials) bool {
+        return self.scheme.len == 0 and
+            self.credential.len == 0 and
+            self.key_id_hint == null;
+    }
+
+    pub fn toCredential(self: HelloCredentials) Credential {
+        return .{
+            .token = self.credential,
+            .key_id_hint = self.key_id_hint,
+            .implicit_assertion = self.implicit_assertion,
+        };
+    }
+};
+
 pub const Authenticator = struct {
     ptr: ?*anyopaque = null,
     authenticate_fn: *const fn (?*anyopaque, std.mem.Allocator, Credential) anyerror!Authorization,
@@ -334,6 +358,19 @@ pub const Authenticator = struct {
         return try self.authenticate_fn(self.ptr, allocator, credential);
     }
 };
+
+pub fn credentialFromHello(
+    config: AuthConfig,
+    hello: HelloCredentials,
+) Error!?Credential {
+    if (hello.isEmpty()) return null;
+    if (!std.mem.eql(u8, hello.scheme, hello_auth_scheme_paseto)) return Error.UnsupportedCredential;
+    if (hello.credential.len == 0) return Error.AuthenticationRequired;
+
+    const credential = hello.toCredential();
+    try config.validateCredentialSize(credential);
+    return credential;
+}
 
 pub const ReplayEntry = struct {
     issuer: []const u8,
@@ -795,6 +832,32 @@ test "AuthConfig bounds token size and anonymous subject filters" {
     try std.testing.expectError(Error.TokenTooLarge, config.validateCredentialSize(.{ .token = "12345" }));
     try std.testing.expect(config.allowsAnonymousSubject("health.ping"));
     try std.testing.expect(!config.allowsAnonymousSubject("admin.delete"));
+}
+
+test "Hello credentials map to generic credentials and fail closed" {
+    const config = AuthConfig{ .required = true, .max_token_bytes = 4 };
+
+    try std.testing.expect(try credentialFromHello(config, .{}) == null);
+    try std.testing.expectError(
+        Error.UnsupportedCredential,
+        credentialFromHello(config, .{ .scheme = "bearer", .credential = "1234" }),
+    );
+    try std.testing.expectError(
+        Error.AuthenticationRequired,
+        credentialFromHello(config, .{ .scheme = hello_auth_scheme_paseto }),
+    );
+    try std.testing.expectError(
+        Error.TokenTooLarge,
+        credentialFromHello(config, .{ .scheme = hello_auth_scheme_paseto, .credential = "12345" }),
+    );
+
+    const credential = (try credentialFromHello(config, .{
+        .scheme = hello_auth_scheme_paseto,
+        .credential = "1234",
+        .key_id_hint = "k4.pid.example",
+    })).?;
+    try std.testing.expectEqualStrings("1234", credential.token);
+    try std.testing.expectEqualStrings("k4.pid.example", credential.key_id_hint.?);
 }
 
 test "PasetoAuth uses paseto PaserkId alias when present" {

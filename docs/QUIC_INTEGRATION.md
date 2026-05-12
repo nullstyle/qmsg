@@ -27,6 +27,27 @@ loops are useful examples, but qmsg needs to interleave application dispatch,
 bounded queues, deadlines, auth hooks, and transport polling in one `Node`
 loop without requiring an extra app thread.
 
+## Current qmsg Status
+
+The repository already has the local `quic_zig` dependency wired through
+`build.zig.zon` and `build.zig`. `src/transport/quic.zig` currently owns:
+
+- qmsg ALPN validation for `qmsg/1`;
+- `QuicOptions`, `QuicListener`, `QuicDialer`, and `QuicSession` wrappers;
+- mapping from qmsg options to `quic_zig.tls.TransportParams`;
+- qmsg control-stream marker plus length-prefixed control-frame encoding;
+- HELLO encode/decode and session readiness after QUIC readiness plus peer
+  HELLO exchange;
+- `Node`/`App` lifecycle placeholders for QUIC listeners and sessions;
+- source-level hermetic quic-zig handshake coverage that marks qmsg sessions
+  QUIC-ready.
+
+This is still a skeleton. The runtime adapter does not yet own UDP sockets,
+drive `quic_zig.Server` or `quic_zig.Client` from `Node`, map qmsg messages
+onto QUIC streams, send QUIC DATAGRAM frames, expose working network
+`listenQuic`/`dialQuic`, or provide `qmsg-server` / `qmsg-client` smoke
+binaries.
+
 ## Build Integration
 
 `quic-zig` package metadata:
@@ -37,11 +58,10 @@ loop without requiring an extra app thread.
 - minimum Zig version: `0.16.0`
 - transitive dependency: `boringssl_zig`
 
-qmsg currently declares `minimum_zig_version = "0.17.0"` and has no
-dependencies. Before adding the dependency, verify that the local qmsg
-toolchain can build the quic-zig checkout. If not, either align qmsg's
-toolchain target with quic-zig or pin a quic-zig branch known to build on
-the qmsg compiler.
+qmsg currently declares `minimum_zig_version = "0.17.0"` and depends on a local
+`../quic-zig` checkout. Keep verifying that the local qmsg toolchain can build
+that checkout. If not, either align qmsg's toolchain target with quic-zig or
+pin a quic-zig branch known to build on the qmsg compiler.
 
 Keep quic support behind a clearly named module such as
 `src/transport/quic.zig`. Do not expose `quic_zig.Connection` directly in the
@@ -329,14 +349,15 @@ the QUIC adapter.
 
 ## MVP Implementation Sequence
 
-1. Add the `quic_zig` dependency and a private `transport/quic.zig` module.
-   Verify Zig version compatibility before wiring it into the default build.
-2. Implement `QuicOptions`, `QuicListener`, `QuicDialer`, and
-   `QuicSession` wrappers. No socket patterns yet; just handshake and qmsg
-   session creation.
-3. Add a hermetic test using `quic_zig.Server` and `quic_zig.Client` with no
-   OS sockets, following quic-zig's `tests/e2e/server_client_handshake.zig`.
-   Assert ALPN `qmsg/1`.
+1. Keep the `quic_zig` dependency and private `transport/quic.zig` module
+   compiling in the default test build.
+2. Extend the existing `QuicOptions`, `QuicListener`, `QuicDialer`, and
+   `QuicSession` wrappers from HELLO/session state into actual quic-zig
+   handshake ownership. No socket patterns yet; just handshake and qmsg session
+   creation.
+3. Keep the hermetic test using `quic_zig.Server` and `quic_zig.Client` with
+   no OS sockets compiling cleanly, following quic-zig's
+   `tests/e2e/server_client_handshake.zig`. Assert ALPN `qmsg/1`.
 4. Implement qmsg control stream open/read/write and exchange `HELLO`.
    Session becomes app-ready only after both HELLOs are accepted.
 5. Implement one reliable qmsg message over one bidi stream. Test pair-style
@@ -387,5 +408,5 @@ the QUIC adapter.
   adapter.
 - Production posture: quic-zig README requires ReleaseSafe for
   internet-facing builds. qmsg should carry that requirement in its own QUIC
-  docs and CI/release guidance.
-
+  docs and CI/release guidance. Do not advertise a qmsg QUIC binary as
+  internet-facing unless it is built and verified in `ReleaseSafe`.

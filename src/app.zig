@@ -7,7 +7,9 @@ const subject = @import("subject.zig");
 const socket = @import("socket.zig");
 const transport = @import("transport/root.zig");
 
-pub const TlsConfig = struct {};
+pub const TlsConfig = struct {
+    quic: transport.quic.QuicOptions = .{},
+};
 
 pub const ErrorPolicy = enum {
     propagate,
@@ -361,6 +363,10 @@ pub const App = struct {
         if (sess) |active| {
             try self.node.emit(.{ .connected = active.id });
         }
+        try self.dispatchConnectHandler(sess);
+    }
+
+    fn dispatchConnectHandler(self: *App, sess: ?*session.Session) !void {
         const handler = self.connect_handler orelse return;
         var ctx = Context{
             .app = self,
@@ -373,6 +379,10 @@ pub const App = struct {
         if (sess) |active| {
             try self.node.emit(.{ .closed = active.id });
         }
+        try self.dispatchCloseHandler(sess);
+    }
+
+    fn dispatchCloseHandler(self: *App, sess: ?*session.Session) !void {
         const handler = self.close_handler orelse return;
         var ctx = Context{
             .app = self,
@@ -381,11 +391,20 @@ pub const App = struct {
         try handler(&ctx);
     }
 
-    pub fn listenQuic(self: *App, addr: []const u8, tls: TlsConfig) !void {
-        _ = self;
-        _ = addr;
-        _ = tls;
-        return error.UnsupportedTransport;
+    pub fn listenQuic(self: *App, addr: []const u8, tls: TlsConfig) !node.QuicListenerId {
+        return self.node.listenQuic(addr, .{ .transport = tls.quic });
+    }
+
+    pub fn openQuicSession(self: *App, options: node.QuicSessionOptions) !*node.QuicSessionRuntime {
+        const runtime = try self.node.openQuicSession(options);
+        try self.dispatchConnectHandler(runtime.appSession());
+        return runtime;
+    }
+
+    pub fn closeQuicSession(self: *App, id: session.SessionId) !void {
+        const runtime = self.node.quicSession(id) orelse return error.EndpointNotFound;
+        try self.dispatchCloseHandler(runtime.appSession());
+        try self.node.closeQuicSession(id);
     }
 
     pub fn listenInprocRep(
@@ -684,6 +703,60 @@ test "App connect and close dispatch handlers through node events" {
     try std.testing.expectEqual(@as(usize, 2), try app.node.poll(&events));
     try std.testing.expectEqual(@as(session.SessionId, 11), events[0].connected);
     try std.testing.expectEqual(@as(session.SessionId, 11), events[1].closed);
+}
+
+test "App listenQuic and QUIC session hooks are socket-free" {
+    const allocator = std.testing.allocator;
+
+    var app = try App.init(allocator, .{});
+    defer app.deinit();
+
+    const Recorder = struct {
+        connects: usize = 0,
+        closes: usize = 0,
+
+        fn onConnect(ctx: *Context) !void {
+            const recorder: *@This() = @ptrCast(@alignCast(ctx.session.?.user_data.?));
+            recorder.connects += 1;
+            try std.testing.expectEqual(session.TransportKind.quic, ctx.session.?.transport);
+        }
+
+        fn onClose(ctx: *Context) !void {
+            const recorder: *@This() = @ptrCast(@alignCast(ctx.session.?.user_data.?));
+            recorder.closes += 1;
+            try std.testing.expectEqual(session.TransportKind.quic, ctx.session.?.transport);
+        }
+    };
+
+    const listener_id = try app.listenQuic("127.0.0.1:4433", .{
+        .quic = .{ .peer_id = "server-a" },
+    });
+    try std.testing.expectEqual(@as(node.QuicListenerId, 0), listener_id);
+    try std.testing.expectEqual(transport.quic.State.listening, app.node.quic_listeners.items[listener_id].listener.state());
+
+    var recorder = Recorder{};
+    app.onConnect(Recorder.onConnect);
+    app.onClose(Recorder.onClose);
+
+    const runtime = try app.openQuicSession(.{
+        .role = .server,
+        .transport = .{
+            .peer_id = "server-a",
+            .datagram_enabled = true,
+        },
+        .user_data = @ptrCast(&recorder),
+    });
+    const id = runtime.id();
+
+    try app.closeQuicSession(id);
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.connects);
+    try std.testing.expectEqual(@as(usize, 1), recorder.closes);
+
+    var events: [2]node.Event = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try app.node.poll(&events));
+    try std.testing.expectEqual(id, events[0].connected);
+    try std.testing.expectEqual(id, events[1].closed);
 }
 
 test "App runOnce serves real req rep through inproc facade with handler auth check" {
