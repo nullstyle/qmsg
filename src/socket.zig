@@ -2,6 +2,8 @@ const std = @import("std");
 
 const message = @import("message.zig");
 const protocol = @import("protocol/root.zig");
+const pushpull = protocol.pushpull;
+const pubsub = protocol.pubsub;
 const queue = @import("queue.zig");
 const subject_mod = @import("subject.zig");
 const transport = @import("transport/root.zig");
@@ -32,6 +34,15 @@ pub const Request = struct {
     }
 };
 
+pub const ErrorReply = struct {
+    pub const code_header = "qmsg-error-code";
+    pub const message_header = "qmsg-error-message";
+
+    subject: []const u8 = "",
+    code: []const u8,
+    message: []const u8 = "",
+};
+
 pub const SocketError = error{
     InvalidEndpoint,
     InvalidPattern,
@@ -45,6 +56,7 @@ pub const SocketError = error{
     FlowControlled,
     DuplicateInflightRequest,
     TooManyInflightRequests,
+    DeadlineExceeded,
     PeerClosed,
     UnexpectedFrame,
     UnsupportedTransport,
@@ -156,12 +168,29 @@ pub const ReqSocket = struct {
     }
 
     pub fn sendRequest(self: *ReqSocket, outgoing: message.OutgoingMessage) !message.MessageId {
+        return self.sendRequestAt(outgoing, nowMs());
+    }
+
+    pub fn sendRequestAt(self: *ReqSocket, outgoing: message.OutgoingMessage, sent_at_ms: u64) !message.MessageId {
+        _ = self.core.expireInflight(sent_at_ms);
         const id = if (outgoing.id == 0) self.core.nextAvailableMessageId() else outgoing.id;
-        try self.core.addInflight(id);
+        try self.core.addInflight(id, outgoing.deadline_ms, sent_at_ms);
         errdefer _ = self.core.removeInflight(id);
 
         try self.core.sendToFirst(.rep, outgoing, .{ .id = id });
         return id;
+    }
+
+    pub fn cancelRequest(self: *ReqSocket, id: message.MessageId) bool {
+        return self.core.removeInflight(id);
+    }
+
+    pub fn expireRequests(self: *ReqSocket, now_ms: u64) usize {
+        return self.core.expireInflight(now_ms);
+    }
+
+    pub fn inflightCount(self: *ReqSocket) usize {
+        return self.core.inflightCount();
     }
 
     /// Sends a request and immediately attempts to receive its reply.
@@ -200,20 +229,31 @@ pub const ReqSocket = struct {
     }
 
     pub fn recv(self: *ReqSocket) !message.Message {
+        return self.recvAt(nowMs());
+    }
+
+    pub fn recvAt(self: *ReqSocket, now_ms: u64) !message.Message {
         var reply = try self.core.recv();
-        if (!self.core.removeInflight(reply.id)) {
+        self.core.completeInflight(reply.id, now_ms) catch |err| {
             reply.deinit();
-            return error.UnexpectedFrame;
-        }
+            return err;
+        };
         return reply;
     }
 
     pub fn tryRecv(self: *ReqSocket) !?message.Message {
-        var reply = (try self.core.recvOrNull()) orelse return null;
-        if (!self.core.removeInflight(reply.id)) {
+        return self.tryRecvAt(nowMs());
+    }
+
+    pub fn tryRecvAt(self: *ReqSocket, now_ms: u64) !?message.Message {
+        var reply = (try self.core.recvOrNull()) orelse {
+            _ = self.core.expireInflight(now_ms);
+            return null;
+        };
+        self.core.completeInflight(reply.id, now_ms) catch |err| {
             reply.deinit();
-            return error.UnexpectedFrame;
-        }
+            return err;
+        };
         return reply;
     }
 };
@@ -267,6 +307,20 @@ pub const RepSocket = struct {
             .id = request_to_answer.message.id,
             .deadline_ms = request_to_answer.message.deadline_ms,
             .subject = if (outgoing.subject.len == 0) request_to_answer.message.subject else null,
+        });
+    }
+
+    pub fn replyError(self: *RepSocket, request_to_answer: Request, app_error: ErrorReply) !void {
+        const headers = [_]message.Header{
+            .{ .name = ErrorReply.code_header, .value = app_error.code },
+            .{ .name = ErrorReply.message_header, .value = app_error.message },
+        };
+
+        try self.reply(request_to_answer, .{
+            .subject = app_error.subject,
+            .flags = .{ .err = true },
+            .headers = &headers,
+            .body = app_error.message,
         });
     }
 };
@@ -398,8 +452,12 @@ pub const PushSocket = struct {
         try self.dial(.{ .inproc = .{ .network = network, .address = address } });
     }
 
+    /// Sends one work item to a credited puller.
+    ///
+    /// Push/pull is at-most-once: after a transport accepts a message, qmsg
+    /// does not retry it on another puller if that transport later fails.
     pub fn push(self: *PushSocket, outgoing: message.OutgoingMessage) !void {
-        try self.core.sendToNext(.pull, outgoing, .{});
+        try self.core.sendPush(outgoing);
     }
 };
 
@@ -453,9 +511,20 @@ const MessageOverrides = struct {
     subject: ?[]const u8 = null,
 };
 
-const Subscription = struct {
-    filter: subject_mod.Filter,
-    order: usize,
+const InflightRequest = struct {
+    id: message.MessageId,
+    deadline_ms: ?u64,
+    sent_at_ms: u64,
+
+    fn expiresAt(self: InflightRequest) ?u64 {
+        const deadline_ms = self.deadline_ms orelse return null;
+        return self.sent_at_ms +| deadline_ms;
+    }
+
+    fn isExpired(self: InflightRequest, now_ms: u64) bool {
+        const expires_at = self.expiresAt() orelse return false;
+        return now_ms >= expires_at;
+    }
 };
 
 fn Core(comptime pattern: Pattern) type {
@@ -467,26 +536,30 @@ fn Core(comptime pattern: Pattern) type {
         options: Options,
         inbox: queue.Queue,
         peers: std.ArrayList(InprocEndpoint) = .empty,
-        subscriptions: std.ArrayList(Subscription) = .empty,
-        inflight: std.ArrayList(message.MessageId) = .empty,
+        local_subscriptions: pubsub.SubscriptionSet,
+        subscriber_registry: pubsub.Registry,
+        inflight: std.ArrayList(InflightRequest) = .empty,
         next_id: message.MessageId = 1,
         next_peer: usize = 0,
 
         fn init(allocator: std.mem.Allocator, options: Options) !Self {
             if (options.recv_queue.max_messages == 0) return error.InvalidState;
+            var inbox = try queue.Queue.init(allocator, options.recv_queue);
+            errdefer inbox.deinit();
+
             return .{
                 .allocator = allocator,
                 .options = options,
-                .inbox = try queue.Queue.init(allocator, options.recv_queue),
+                .inbox = inbox,
+                .local_subscriptions = pubsub.SubscriptionSet.init(allocator, options.max_subscriptions),
+                .subscriber_registry = pubsub.Registry.init(allocator),
             };
         }
 
         fn deinit(self: *Self) void {
             self.inbox.deinit();
-            for (self.subscriptions.items) |*subscription| {
-                subscription.filter.deinit();
-            }
-            self.subscriptions.deinit(self.allocator);
+            self.local_subscriptions.deinit();
+            self.subscriber_registry.deinit();
             self.inflight.deinit(self.allocator);
             self.peers.deinit(self.allocator);
             self.* = undefined;
@@ -495,16 +568,25 @@ fn Core(comptime pattern: Pattern) type {
         fn inprocEndpoint(self: *Self) InprocEndpoint {
             return .{
                 .pattern = pattern,
+                .pubsub_id = Self.pubsubId(self),
+                .recv_queue_options = self.options.recv_queue,
                 .context = @ptrCast(self),
-                .enqueue = enqueue,
-                .accepts = accepts,
-                .connect_peer = connectPeer,
+                .enqueue = Self.enqueue,
+                .accepts = Self.accepts,
+                .puller_flow = Self.pullerFlow,
+                .connect_peer = Self.connectPeer,
+                .subscribe_peer = Self.subscribePeer,
+                .unsubscribe_peer = Self.unsubscribePeer,
+                .sync_subscriptions = Self.syncSubscriptions,
             };
         }
 
         fn connectInproc(self: *Self, peer: InprocEndpoint) !void {
             if (!pattern.canSendTo(peer.pattern)) return error.InvalidPattern;
+            if (self.hasPeer(peer)) return;
             try self.peers.append(self.allocator, peer);
+            errdefer _ = self.peers.pop();
+            try Self.connectPubSub(self, peer);
         }
 
         fn listen(self: *Self, endpoint: transport.Endpoint) !void {
@@ -547,6 +629,10 @@ fn Core(comptime pattern: Pattern) type {
         }
 
         fn sendToAll(self: *Self, expected_peer: Pattern, outgoing: message.OutgoingMessage, overrides: MessageOverrides) !void {
+            if (pattern == .@"pub" and expected_peer == .sub) {
+                return self.publishToSubscribers(outgoing, overrides);
+            }
+
             try validateOutgoing(outgoing, self.options.max_message_size, overrides.subject);
 
             for (self.peers.items) |peer| {
@@ -557,6 +643,26 @@ fn Core(comptime pattern: Pattern) type {
                 const msg = try cloneOutgoing(self.allocator, outgoing, overrides);
                 try deliver(peer, msg);
             }
+        }
+
+        fn publishToSubscribers(self: *Self, outgoing: message.OutgoingMessage, overrides: MessageOverrides) !void {
+            try validateOutgoing(outgoing, self.options.max_message_size, overrides.subject);
+
+            const effective_subject = overrides.subject orelse outgoing.subject;
+            var first_error: ?anyerror = null;
+
+            for (self.peers.items) |peer| {
+                if (peer.pattern != .sub) continue;
+                if (!self.subscriber_registry.matches(peer.pubsub_id, effective_subject)) continue;
+
+                const msg = try cloneOutgoing(self.allocator, outgoing, overrides);
+                deliver(peer, msg) catch |err| {
+                    if (first_error == null) first_error = err;
+                    continue;
+                };
+            }
+
+            if (first_error) |err| return err;
         }
 
         fn sendToNext(self: *Self, expected_peer: Pattern, outgoing: message.OutgoingMessage, overrides: MessageOverrides) !void {
@@ -586,55 +692,144 @@ fn Core(comptime pattern: Pattern) type {
             return last_error;
         }
 
+        fn sendPush(self: *Self, outgoing: message.OutgoingMessage) !void {
+            if (pattern != .push) return error.InvalidPattern;
+
+            try validateOutgoing(outgoing, self.options.max_message_size, null);
+            if (self.peers.items.len == 0) return error.NoPeer;
+
+            const msg_bytes = outgoingBytes(outgoing, outgoing.subject);
+            var scan = pushpull.Scan{};
+
+            var attempts: usize = 0;
+            while (attempts < self.peers.items.len) : (attempts += 1) {
+                const index = (self.next_peer + attempts) % self.peers.items.len;
+                const peer = self.peers.items[index];
+                if (peer.pattern != .pull) continue;
+                if (!peer.accepts(peer.context, outgoing.subject)) continue;
+
+                const flow = peer.puller_flow(peer.context);
+                if (scan.record(flow, msg_bytes) != .ready) continue;
+
+                const msg = try cloneOutgoing(self.allocator, outgoing, .{});
+                try deliver(peer, msg);
+                self.next_peer = pushpull.nextFairIndex(index, self.peers.items.len);
+                return;
+            }
+
+            return scan.err();
+        }
+
+        fn connectPubSub(self: *Self, peer: InprocEndpoint) !void {
+            if (pattern == .@"pub" and peer.pattern == .sub) {
+                try self.subscriber_registry.addPeer(peer.pubsub_id, peer.recv_queue_options);
+                errdefer _ = self.subscriber_registry.removePeer(peer.pubsub_id);
+                try peer.sync_subscriptions(peer.context, self.inprocEndpoint());
+                try peer.connect_peer(peer.context, self.inprocEndpoint());
+                return;
+            }
+
+            if (pattern == .sub and peer.pattern == .@"pub") {
+                try self.replaySubscriptions(peer);
+            }
+        }
+
+        fn replaySubscriptions(self: *Self, publisher: InprocEndpoint) !void {
+            if (pattern != .sub) return error.InvalidPattern;
+
+            for (self.local_subscriptions.entries.items) |entry| {
+                try publisher.subscribe_peer(
+                    publisher.context,
+                    Self.pubsubId(self),
+                    entry.filter.text,
+                    self.options.recv_queue,
+                );
+            }
+        }
+
         fn subscribe(self: *Self, filter: []const u8) !void {
             if (pattern != .sub) return error.InvalidPattern;
 
-            for (self.subscriptions.items) |subscription| {
-                if (std.mem.eql(u8, subscription.filter.text, filter)) return;
+            const added = try self.local_subscriptions.add(filter);
+            if (!added) return;
+
+            for (self.peers.items) |peer| {
+                if (peer.pattern != .@"pub") continue;
+                try peer.subscribe_peer(peer.context, Self.pubsubId(self), filter, self.options.recv_queue);
             }
-
-            var owned = try subject_mod.Filter.init(self.allocator, filter);
-            errdefer owned.deinit();
-
-            if (self.subscriptions.items.len >= self.options.max_subscriptions) return error.QueueFull;
-
-            try self.subscriptions.append(self.allocator, .{
-                .filter = owned,
-                .order = self.subscriptions.items.len,
-            });
         }
 
         fn unsubscribe(self: *Self, filter: []const u8) void {
             if (pattern != .sub) return;
+            if (!self.local_subscriptions.remove(filter)) return;
 
-            var index: usize = 0;
-            while (index < self.subscriptions.items.len) : (index += 1) {
-                if (!std.mem.eql(u8, self.subscriptions.items[index].filter.text, filter)) continue;
-                var subscription = self.subscriptions.orderedRemove(index);
-                subscription.filter.deinit();
-                return;
+            for (self.peers.items) |peer| {
+                if (peer.pattern != .@"pub") continue;
+                peer.unsubscribe_peer(peer.context, Self.pubsubId(self), filter);
             }
         }
 
-        fn addInflight(self: *Self, id: message.MessageId) !void {
+        fn addInflight(self: *Self, id: message.MessageId, deadline_ms: ?u64, sent_at_ms: u64) !void {
             if (pattern != .req) return error.InvalidPattern;
             if (id == 0) return error.InvalidState;
+            _ = self.expireInflight(sent_at_ms);
             if (self.inflight.items.len >= self.options.max_inflight_requests) return error.TooManyInflightRequests;
             for (self.inflight.items) |existing| {
-                if (existing == id) return error.DuplicateInflightRequest;
+                if (existing.id == id) return error.DuplicateInflightRequest;
             }
-            try self.inflight.append(self.allocator, id);
+            try self.inflight.append(self.allocator, .{
+                .id = id,
+                .deadline_ms = deadline_ms,
+                .sent_at_ms = sent_at_ms,
+            });
         }
 
         fn removeInflight(self: *Self, id: message.MessageId) bool {
             if (pattern != .req) return false;
             for (self.inflight.items, 0..) |existing, index| {
-                if (existing == id) {
+                if (existing.id == id) {
                     _ = self.inflight.orderedRemove(index);
                     return true;
                 }
             }
             return false;
+        }
+
+        fn completeInflight(self: *Self, id: message.MessageId, now_ms: u64) !void {
+            if (pattern != .req) return error.InvalidPattern;
+            for (self.inflight.items, 0..) |existing, index| {
+                if (existing.id == id) {
+                    _ = self.inflight.orderedRemove(index);
+                    if (existing.isExpired(now_ms)) return error.DeadlineExceeded;
+                    return;
+                }
+            }
+            return error.UnexpectedFrame;
+        }
+
+        fn expireInflight(self: *Self, now_ms: u64) usize {
+            if (pattern != .req) return 0;
+
+            var expired: usize = 0;
+            var index: usize = 0;
+            while (index < self.inflight.items.len) {
+                if (self.inflight.items[index].isExpired(now_ms)) {
+                    _ = self.inflight.orderedRemove(index);
+                    expired += 1;
+                    continue;
+                }
+                index += 1;
+            }
+            return expired;
+        }
+
+        fn inflightCount(self: *Self) usize {
+            if (pattern != .req) return 0;
+            return self.inflight.items.len;
+        }
+
+        fn pubsubId(self: *Self) pubsub.PeerId {
+            return @intFromPtr(self);
         }
 
         fn nextMessageId(self: *Self) message.MessageId {
@@ -655,7 +850,14 @@ fn Core(comptime pattern: Pattern) type {
         fn hasInflight(self: *Self, id: message.MessageId) bool {
             if (pattern != .req) return false;
             for (self.inflight.items) |existing| {
-                if (existing == id) return true;
+                if (existing.id == id) return true;
+            }
+            return false;
+        }
+
+        fn hasPeer(self: *Self, peer: InprocEndpoint) bool {
+            for (self.peers.items) |existing| {
+                if (existing.pattern == peer.pattern and existing.context == peer.context) return true;
             }
             return false;
         }
@@ -675,19 +877,55 @@ fn Core(comptime pattern: Pattern) type {
             return self.acceptsSubject(subject);
         }
 
+        fn pullerFlow(context: *anyopaque) pushpull.PullerFlow {
+            const self: *Self = @ptrCast(@alignCast(context));
+            return pushpull.PullerFlow.fromQueue(
+                self.options.recv_queue,
+                self.inbox.len(),
+                self.inbox.bytes(),
+            );
+        }
+
         fn connectPeer(context: *anyopaque, peer: InprocEndpoint) anyerror!void {
             const self: *Self = @ptrCast(@alignCast(context));
             try self.connectInproc(peer);
         }
 
+        fn subscribePeer(context: *anyopaque, peer_id: pubsub.PeerId, filter: []const u8, options: QueueOptions) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            if (pattern != .@"pub") return error.InvalidPattern;
+            _ = try self.subscriber_registry.subscribe(peer_id, filter, options);
+        }
+
+        fn unsubscribePeer(context: *anyopaque, peer_id: pubsub.PeerId, filter: []const u8) void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            if (pattern != .@"pub") return;
+            _ = self.subscriber_registry.unsubscribe(peer_id, filter);
+        }
+
+        fn syncSubscriptions(context: *anyopaque, publisher: InprocEndpoint) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            if (pattern != .sub) return;
+            try self.replaySubscriptions(publisher);
+        }
+
         fn acceptsSubject(self: *Self, subject: []const u8) bool {
             if (pattern != .sub) return true;
-            for (self.subscriptions.items) |subscription| {
-                if (subscription.filter.matches(subject) catch false) return true;
-            }
-            return false;
+            return self.local_subscriptions.matches(subject);
         }
     };
+}
+
+fn nowMs() u64 {
+    var timespec: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &timespec))) {
+        .SUCCESS => {},
+        else => return 0,
+    }
+
+    const seconds: u64 = @intCast(@max(timespec.sec, 0));
+    const nanos: u64 = @intCast(@max(timespec.nsec, 0));
+    return seconds *| std.time.ms_per_s +| nanos / std.time.ns_per_ms;
 }
 
 fn defaultRecvQueue(comptime pattern: Pattern) QueueOptions {
@@ -895,6 +1133,154 @@ test "req rejects duplicate explicit ids and max inflight overflows" {
     try std.testing.expectEqual(@as(message.MessageId, 10), limited_source.id());
 }
 
+test "req cleans inflight entries on no peer and duplicate ids do not enqueue" {
+    const allocator = std.testing.allocator;
+
+    var req = try Socket(.req).init(allocator, .{});
+    defer req.deinit();
+
+    try std.testing.expectError(error.NoPeer, req.sendRequestAt(.{
+        .subject = "user.get",
+        .id = 7,
+        .deadline_ms = 250,
+    }, 1_000));
+    try std.testing.expectEqual(@as(usize, 0), req.inflightCount());
+
+    var rep = try Socket(.rep).init(allocator, .{});
+    defer rep.deinit();
+    try req.connectInproc(rep.inprocEndpoint());
+
+    _ = try req.sendRequestAt(.{
+        .subject = "user.get",
+        .id = 7,
+        .deadline_ms = 250,
+    }, 1_000);
+    try std.testing.expectEqual(@as(usize, 1), req.inflightCount());
+
+    try std.testing.expectError(error.DuplicateInflightRequest, req.sendRequestAt(.{
+        .subject = "user.get",
+        .id = 7,
+        .deadline_ms = 250,
+    }, 1_001));
+    try std.testing.expectEqual(@as(usize, 1), req.inflightCount());
+
+    var received = try rep.recv();
+    defer received.deinit();
+    try std.testing.expectEqual(@as(message.MessageId, 7), received.id());
+    try expectNoRequest(try rep.tryRecv());
+}
+
+test "req deadlines expire inflight state and reject late replies" {
+    const allocator = std.testing.allocator;
+
+    var req = try Socket(.req).init(allocator, .{});
+    defer req.deinit();
+    var rep = try Socket(.rep).init(allocator, .{});
+    defer rep.deinit();
+
+    try req.connectInproc(rep.inprocEndpoint());
+    try rep.connectInproc(req.inprocEndpoint());
+
+    _ = try req.sendRequestAt(.{
+        .subject = "user.get",
+        .id = 9,
+        .deadline_ms = 50,
+    }, 1_000);
+    try std.testing.expectEqual(@as(usize, 1), req.inflightCount());
+    try std.testing.expectEqual(@as(usize, 0), req.expireRequests(1_049));
+    try std.testing.expectEqual(@as(usize, 1), req.inflightCount());
+
+    var expired_request = try rep.recv();
+    defer expired_request.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), req.expireRequests(1_050));
+    try std.testing.expectEqual(@as(usize, 0), req.inflightCount());
+
+    try rep.reply(expired_request, .{ .subject = "user.get.ok", .body = "late" });
+    try std.testing.expectError(error.UnexpectedFrame, req.recvAt(1_051));
+
+    _ = try req.sendRequestAt(.{
+        .subject = "user.get",
+        .id = 9,
+        .deadline_ms = 50,
+    }, 1_060);
+    try std.testing.expectEqual(@as(usize, 1), req.inflightCount());
+    try std.testing.expect(req.cancelRequest(9));
+    try std.testing.expectEqual(@as(usize, 0), req.inflightCount());
+    try std.testing.expect(!req.cancelRequest(9));
+}
+
+test "req recv reports deadline exceeded when reply arrives too late" {
+    const allocator = std.testing.allocator;
+
+    var req = try Socket(.req).init(allocator, .{});
+    defer req.deinit();
+    var rep = try Socket(.rep).init(allocator, .{});
+    defer rep.deinit();
+
+    try req.connectInproc(rep.inprocEndpoint());
+    try rep.connectInproc(req.inprocEndpoint());
+
+    _ = try req.sendRequestAt(.{
+        .subject = "user.get",
+        .id = 11,
+        .deadline_ms = 10,
+    }, 2_000);
+
+    var request = try rep.recv();
+    defer request.deinit();
+    try rep.reply(request, .{ .subject = "user.get.ok", .body = "late" });
+
+    try std.testing.expectError(error.DeadlineExceeded, req.recvAt(2_010));
+    try std.testing.expectEqual(@as(usize, 0), req.inflightCount());
+}
+
+test "req queue pressure rolls back only the rejected inflight request" {
+    const allocator = std.testing.allocator;
+
+    var req = try Socket(.req).init(allocator, .{});
+    defer req.deinit();
+    var rep = try Socket(.rep).init(allocator, .{
+        .recv_queue = .{ .max_messages = 1, .max_bytes = 1024, .on_full = .fail },
+    });
+    defer rep.deinit();
+
+    try req.connectInproc(rep.inprocEndpoint());
+    try rep.connectInproc(req.inprocEndpoint());
+
+    _ = try req.sendRequestAt(.{
+        .subject = "user.get",
+        .id = 1,
+        .deadline_ms = 100,
+    }, 3_000);
+    try std.testing.expectEqual(@as(usize, 1), req.inflightCount());
+
+    try std.testing.expectError(error.QueueFull, req.sendRequestAt(.{
+        .subject = "user.get",
+        .id = 2,
+        .deadline_ms = 100,
+    }, 3_001));
+    try std.testing.expectEqual(@as(usize, 1), req.inflightCount());
+    try std.testing.expect(!req.cancelRequest(2));
+
+    var first = try rep.recv();
+    defer first.deinit();
+    try std.testing.expectEqual(@as(message.MessageId, 1), first.id());
+    try rep.reply(first, .{ .subject = "user.get.ok", .body = "Ada" });
+
+    var reply = try req.recvAt(3_050);
+    defer reply.deinit();
+    try std.testing.expectEqual(@as(message.MessageId, 1), reply.id);
+    try std.testing.expectEqual(@as(usize, 0), req.inflightCount());
+
+    _ = try req.sendRequestAt(.{
+        .subject = "user.get",
+        .id = 2,
+        .deadline_ms = 100,
+    }, 3_051);
+    try std.testing.expectEqual(@as(usize, 1), req.inflightCount());
+}
+
 test "req rep preserves correlation id and deadline" {
     const allocator = std.testing.allocator;
 
@@ -930,6 +1316,45 @@ test "req rep preserves correlation id and deadline" {
     try std.testing.expectEqual(@as(?u64, 500), reply.deadline_ms);
     try std.testing.expectEqualStrings("user.result", reply.subject);
     try std.testing.expectEqualStrings("Ada", reply.body);
+}
+
+test "rep error replies preserve correlation and use stable error shape" {
+    const allocator = std.testing.allocator;
+
+    var req = try Socket(.req).init(allocator, .{});
+    defer req.deinit();
+    var rep = try Socket(.rep).init(allocator, .{});
+    defer rep.deinit();
+
+    try req.connectInproc(rep.inprocEndpoint());
+    try rep.connectInproc(req.inprocEndpoint());
+
+    const id = try req.sendRequestAt(.{
+        .subject = "user.get",
+        .deadline_ms = 250,
+        .body = "missing",
+    }, 4_000);
+
+    var request = try rep.recv();
+    defer request.deinit();
+    try rep.replyError(request, .{
+        .code = "not_found",
+        .message = "user not found",
+    });
+
+    var reply = try req.recvAt(4_100);
+    defer reply.deinit();
+
+    try std.testing.expectEqual(id, reply.id);
+    try std.testing.expect(reply.flags.err);
+    try std.testing.expectEqual(@as(?u64, 250), reply.deadline_ms);
+    try std.testing.expectEqualStrings("user.get", reply.subject);
+    try std.testing.expectEqualStrings("user not found", reply.body);
+    try std.testing.expectEqual(@as(usize, 2), reply.headers.len);
+    try std.testing.expectEqualStrings(ErrorReply.code_header, reply.headers[0].name);
+    try std.testing.expectEqualStrings("not_found", reply.headers[0].value);
+    try std.testing.expectEqualStrings(ErrorReply.message_header, reply.headers[1].name);
+    try std.testing.expectEqualStrings("user not found", reply.headers[1].value);
 }
 
 test "request is immediate-only while requestComplete runs a synchronous responder" {
@@ -1006,6 +1431,74 @@ test "pub sub delivers only matching subscribed subjects" {
     try std.testing.expectError(error.WouldBlock, sub_socket.recv());
 }
 
+test "pub sub replays and updates subscriptions at the publisher" {
+    const allocator = std.testing.allocator;
+
+    var pub_socket = try Socket(.@"pub").init(allocator, .{});
+    defer pub_socket.deinit();
+    var sub_socket = try Socket(.sub).init(allocator, .{});
+    defer sub_socket.deinit();
+
+    try pub_socket.connectInproc(sub_socket.inprocEndpoint());
+    try sub_socket.connectInproc(pub_socket.inprocEndpoint());
+    try pub_socket.publish(.{ .subject = "metrics.cpu", .body = "ignored" });
+    try expectNoMessage(try sub_socket.tryRecv());
+
+    try sub_socket.subscribe("metrics.*");
+    try pub_socket.publish(.{ .subject = "metrics.cpu", .body = "91" });
+
+    var first = try sub_socket.recv();
+    defer first.deinit();
+    try std.testing.expectEqualStrings("metrics.cpu", first.subject);
+    try std.testing.expectEqualStrings("91", first.body);
+
+    sub_socket.unsubscribe("metrics.*");
+    try pub_socket.publish(.{ .subject = "metrics.mem", .body = "ignored" });
+    try expectNoMessage(try sub_socket.tryRecv());
+}
+
+test "pub sub fanout continues past slow consumers in peer order" {
+    const allocator = std.testing.allocator;
+
+    var pub_socket = try Socket(.@"pub").init(allocator, .{});
+    defer pub_socket.deinit();
+    var slow = try Socket(.sub).init(allocator, .{
+        .recv_queue = .{ .max_messages = 1, .max_bytes = 1024, .on_full = .fail },
+    });
+    defer slow.deinit();
+    var fast = try Socket(.sub).init(allocator, .{
+        .recv_queue = .{ .max_messages = 4, .max_bytes = 1024, .on_full = .fail },
+    });
+    defer fast.deinit();
+    var other = try Socket(.sub).init(allocator, .{});
+    defer other.deinit();
+
+    try slow.subscribe("metrics.*");
+    try fast.subscribe("metrics.*");
+    try other.subscribe("jobs.*");
+
+    try pub_socket.connectInproc(slow.inprocEndpoint());
+    try pub_socket.connectInproc(fast.inprocEndpoint());
+    try pub_socket.connectInproc(other.inprocEndpoint());
+
+    try pub_socket.publish(.{ .subject = "metrics.cpu", .body = "first" });
+    try std.testing.expectError(error.QueueFull, pub_socket.publish(.{ .subject = "metrics.cpu", .body = "second" }));
+
+    var slow_first = try slow.recv();
+    defer slow_first.deinit();
+    try std.testing.expectEqualStrings("first", slow_first.body);
+    try expectNoMessage(try slow.tryRecv());
+
+    var fast_first = try fast.recv();
+    defer fast_first.deinit();
+    try std.testing.expectEqualStrings("first", fast_first.body);
+    var fast_second = try fast.recv();
+    defer fast_second.deinit();
+    try std.testing.expectEqualStrings("second", fast_second.body);
+
+    try expectNoMessage(try other.tryRecv());
+}
+
 test "push distributes work across pull sockets" {
     const allocator = std.testing.allocator;
 
@@ -1029,6 +1522,140 @@ test "push distributes work across pull sockets" {
 
     try std.testing.expectEqualStrings("a", first.body);
     try std.testing.expectEqualStrings("b", second.body);
+}
+
+test "push puller credit limits inflight work and replenishes after receive" {
+    const allocator = std.testing.allocator;
+
+    var push_socket = try Socket(.push).init(allocator, .{});
+    defer push_socket.deinit();
+    var pull_socket = try Socket(.pull).init(allocator, .{
+        .recv_queue = .{ .max_messages = 1, .max_bytes = 1024, .on_full = .block },
+    });
+    defer pull_socket.deinit();
+
+    try push_socket.connectInproc(pull_socket.inprocEndpoint());
+
+    try push_socket.push(.{ .subject = "jobs.resize", .body = "first" });
+    try std.testing.expectError(error.FlowControlled, push_socket.push(.{ .subject = "jobs.resize", .body = "second" }));
+
+    var first = try pull_socket.recv();
+    defer first.deinit();
+    try std.testing.expectEqualStrings("first", first.body);
+
+    try push_socket.push(.{ .subject = "jobs.resize", .body = "second" });
+    var second = try pull_socket.recv();
+    defer second.deinit();
+    try std.testing.expectEqualStrings("second", second.body);
+}
+
+test "push skips saturated pullers and resumes fair order" {
+    const allocator = std.testing.allocator;
+
+    var push_socket = try Socket(.push).init(allocator, .{});
+    defer push_socket.deinit();
+    var pull_a = try Socket(.pull).init(allocator, .{
+        .recv_queue = .{ .max_messages = 1, .max_bytes = 1024, .on_full = .block },
+    });
+    defer pull_a.deinit();
+    var pull_b = try Socket(.pull).init(allocator, .{
+        .recv_queue = .{ .max_messages = 1, .max_bytes = 1024, .on_full = .block },
+    });
+    defer pull_b.deinit();
+
+    try push_socket.connectInproc(pull_a.inprocEndpoint());
+    try push_socket.connectInproc(pull_b.inprocEndpoint());
+
+    try push_socket.push(.{ .subject = "jobs.resize", .body = "a1" });
+    try push_socket.push(.{ .subject = "jobs.resize", .body = "b1" });
+    try std.testing.expectError(error.FlowControlled, push_socket.push(.{ .subject = "jobs.resize", .body = "blocked" }));
+
+    var a1 = try pull_a.recv();
+    defer a1.deinit();
+    try std.testing.expectEqualStrings("a1", a1.body);
+
+    try push_socket.push(.{ .subject = "jobs.resize", .body = "a2" });
+
+    var b1 = try pull_b.recv();
+    defer b1.deinit();
+    try std.testing.expectEqualStrings("b1", b1.body);
+
+    var a2 = try pull_a.recv();
+    defer a2.deinit();
+    try std.testing.expectEqualStrings("a2", a2.body);
+}
+
+test "push reports deterministic flow control before fail-full pressure" {
+    const allocator = std.testing.allocator;
+
+    var first_push = try Socket(.push).init(allocator, .{});
+    defer first_push.deinit();
+    var first_fail = try Socket(.pull).init(allocator, .{
+        .recv_queue = .{ .max_messages = 1, .max_bytes = 1024, .on_full = .fail },
+    });
+    defer first_fail.deinit();
+    var first_block = try Socket(.pull).init(allocator, .{
+        .recv_queue = .{ .max_messages = 1, .max_bytes = 1024, .on_full = .block },
+    });
+    defer first_block.deinit();
+
+    try first_push.connectInproc(first_fail.inprocEndpoint());
+    try first_push.connectInproc(first_block.inprocEndpoint());
+    try first_push.push(.{ .subject = "jobs.resize", .body = "fail-full" });
+    try first_push.push(.{ .subject = "jobs.resize", .body = "block-full" });
+    try std.testing.expectError(error.FlowControlled, first_push.push(.{ .subject = "jobs.resize", .body = "pressure" }));
+
+    var second_push = try Socket(.push).init(allocator, .{});
+    defer second_push.deinit();
+    var second_block = try Socket(.pull).init(allocator, .{
+        .recv_queue = .{ .max_messages = 1, .max_bytes = 1024, .on_full = .block },
+    });
+    defer second_block.deinit();
+    var second_fail = try Socket(.pull).init(allocator, .{
+        .recv_queue = .{ .max_messages = 1, .max_bytes = 1024, .on_full = .fail },
+    });
+    defer second_fail.deinit();
+
+    try second_push.connectInproc(second_block.inprocEndpoint());
+    try second_push.connectInproc(second_fail.inprocEndpoint());
+    try second_push.push(.{ .subject = "jobs.resize", .body = "block-full" });
+    try second_push.push(.{ .subject = "jobs.resize", .body = "fail-full" });
+    try std.testing.expectError(error.FlowControlled, second_push.push(.{ .subject = "jobs.resize", .body = "pressure" }));
+}
+
+test "push pull fail-full and drop-newest policies are honored" {
+    const allocator = std.testing.allocator;
+
+    var fail_push = try Socket(.push).init(allocator, .{});
+    defer fail_push.deinit();
+    var fail_pull = try Socket(.pull).init(allocator, .{
+        .recv_queue = .{ .max_messages = 1, .max_bytes = 1024, .on_full = .fail },
+    });
+    defer fail_pull.deinit();
+
+    try fail_push.connectInproc(fail_pull.inprocEndpoint());
+    try fail_push.push(.{ .subject = "jobs.resize", .body = "kept" });
+    try std.testing.expectError(error.QueueFull, fail_push.push(.{ .subject = "jobs.resize", .body = "rejected" }));
+
+    var kept = try fail_pull.recv();
+    defer kept.deinit();
+    try std.testing.expectEqualStrings("kept", kept.body);
+
+    var drop_push = try Socket(.push).init(allocator, .{});
+    defer drop_push.deinit();
+    var drop_pull = try Socket(.pull).init(allocator, .{
+        .recv_queue = .{ .max_messages = 1, .max_bytes = 1024, .on_full = .drop_newest },
+    });
+    defer drop_pull.deinit();
+
+    try drop_push.connectInproc(drop_pull.inprocEndpoint());
+    try drop_push.push(.{ .subject = "jobs.resize", .body = "kept" });
+    try drop_push.push(.{ .subject = "jobs.resize", .body = "dropped" });
+
+    var received = try drop_pull.recv();
+    defer received.deinit();
+    try std.testing.expectEqualStrings("kept", received.body);
+    try expectNoMessage(try drop_pull.tryRecv());
 }
 
 test "subscription filters validate wildcard placement" {

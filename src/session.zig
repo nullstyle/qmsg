@@ -36,9 +36,25 @@ pub const Session = struct {
         self.authorization = null;
     }
 
+    pub fn clearAuthorization(self: *Session, allocator: std.mem.Allocator) void {
+        if (self.authorization) |*authorization| authorization.deinit(allocator);
+        self.setAnonymous();
+    }
+
     pub fn setAuthorization(self: *Session, authorization: auth.Authorization) void {
         self.auth_state = .authenticated;
         self.authorization = authorization;
+    }
+
+    pub fn replaceAuthorization(
+        self: *Session,
+        allocator: std.mem.Allocator,
+        authorization: auth.Authorization,
+    ) !void {
+        var owned = try authorization.clone(allocator);
+        errdefer owned.deinit(allocator);
+        self.clearAuthorization(allocator);
+        self.setAuthorization(owned);
     }
 
     pub fn authorizationCache(self: Session) ?auth.Authorization {
@@ -120,6 +136,39 @@ test "Session defaults to anonymous and can cache authorization" {
     session.setAnonymous();
     try std.testing.expect(session.isAnonymous());
     try std.testing.expect(session.authorizationCache() == null);
+}
+
+test "Session can replace and clear owned authorization" {
+    const allocator = std.testing.allocator;
+    const borrowed = auth.Authorization{
+        .subject = "service:jobs",
+        .issuer = "auth.example",
+        .token_id = "token-1",
+        .allowed_patterns = auth.PatternSet.init(&.{.pull}),
+        .allowed_subjects = .{ .filters = &.{"jobs.*"} },
+    };
+
+    var session = Session{
+        .id = 1,
+        .transport = .inproc,
+    };
+    try session.replaceAuthorization(allocator, borrowed);
+    defer session.clearAuthorization(allocator);
+
+    try session.requirePattern(.pull);
+    try session.requireSubject("jobs.resize");
+
+    try session.replaceAuthorization(allocator, .{
+        .subject = "service:metrics",
+        .issuer = "auth.example",
+        .allowed_patterns = auth.PatternSet.init(&.{.@"pub"}),
+        .allowed_subjects = .allow_all,
+    });
+    try std.testing.expectError(auth.Error.Unauthorized, session.requirePattern(.pull));
+    try session.requirePattern(.@"pub");
+
+    session.clearAuthorization(allocator);
+    try std.testing.expect(session.isAnonymous());
 }
 
 test "Session check combines session and authorization limits" {

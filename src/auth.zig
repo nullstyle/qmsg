@@ -20,6 +20,7 @@ pub const Error = error{
     ReplayedCredential,
     CredentialExpired,
     CredentialNotYetValid,
+    InvalidClaims,
     MessageTooLarge,
 };
 
@@ -156,6 +157,74 @@ pub const Authorization = struct {
         now_unix_ms: ?i64 = null,
         clock_skew_ms: u64 = 0,
     };
+
+    pub const ClaimParseOptions = struct {
+        require_qmsg_claim: bool = true,
+        max_subject_filters: usize = 64,
+    };
+
+    pub fn fromClaimsJson(
+        allocator: std.mem.Allocator,
+        claims_json: []const u8,
+        options: ClaimParseOptions,
+    ) (Error || error{OutOfMemory})!Authorization {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, claims_json, .{}) catch {
+            return Error.InvalidClaims;
+        };
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return Error.InvalidClaims;
+        const obj = parsed.value.object;
+
+        const subject_value = requiredString(obj, "sub") catch return Error.InvalidClaims;
+        const issuer_value = requiredString(obj, "iss") catch return Error.InvalidClaims;
+        const token_id_value = optionalString(obj, "jti") catch return Error.InvalidClaims;
+        const expires_at = if (obj.get("exp")) |exp|
+            parseUnixMs(exp) catch return Error.InvalidClaims
+        else
+            null;
+
+        const qmsg_value = obj.get("qmsg") orelse {
+            if (options.require_qmsg_claim) return Error.InvalidClaims;
+            return try (Authorization{
+                .subject = subject_value,
+                .issuer = issuer_value,
+                .token_id = token_id_value,
+                .expires_at_unix_ms = expires_at,
+            }).clone(allocator);
+        };
+        if (qmsg_value != .object) return Error.InvalidClaims;
+        const qmsg_obj = qmsg_value.object;
+
+        const subject_copy = try allocator.dupe(u8, subject_value);
+        errdefer allocator.free(subject_copy);
+        const issuer_copy = try allocator.dupe(u8, issuer_value);
+        errdefer allocator.free(issuer_copy);
+        const token_id_copy = if (token_id_value) |token_id|
+            try allocator.dupe(u8, token_id)
+        else
+            null;
+        errdefer if (token_id_copy) |token_id| allocator.free(token_id);
+        var subject_policy = if (qmsg_obj.get("subjects")) |subjects|
+            try parseSubjects(allocator, subjects, options.max_subject_filters)
+        else
+            @as(SubjectPolicy, .allow_all);
+        errdefer subject_policy.deinit(allocator);
+
+        var authz = Authorization{
+            .subject = subject_copy,
+            .issuer = issuer_copy,
+            .token_id = token_id_copy,
+            .allowed_patterns = try parsePatterns(qmsg_obj.get("patterns") orelse return Error.InvalidClaims),
+            .allowed_subjects = subject_policy,
+            .datagram_allowed = try parseOptionalBool(qmsg_obj.get("datagram")) orelse false,
+            .max_message_size = try parseOptionalUsize(qmsg_obj.get("max_message_size")),
+            .expires_at_unix_ms = expires_at,
+        };
+        errdefer authz.deinit(allocator);
+
+        return authz;
+    }
 
     pub fn clone(self: Authorization, allocator: std.mem.Allocator) !Authorization {
         const subject_copy = try allocator.dupe(u8, self.subject);
@@ -365,6 +434,196 @@ fn PaserkIdType(comptime paseto: type) type {
     return paseto.paserk.Id;
 }
 
+fn requiredString(obj: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    const value = obj.get(name) orelse return Error.InvalidClaims;
+    if (value != .string) return Error.InvalidClaims;
+    return value.string;
+}
+
+fn optionalString(obj: std.json.ObjectMap, name: []const u8) !?[]const u8 {
+    const value = obj.get(name) orelse return null;
+    if (value == .null) return null;
+    if (value != .string) return Error.InvalidClaims;
+    return value.string;
+}
+
+fn parsePatterns(value: std.json.Value) !PatternSet {
+    if (value != .array) return Error.InvalidClaims;
+    var patterns = PatternSet.none;
+    for (value.array.items) |item| {
+        if (item != .string) return Error.InvalidClaims;
+        patterns.allow(parsePatternString(item.string) orelse return Error.InvalidClaims);
+    }
+    if (patterns.isEmpty()) return Error.InvalidClaims;
+    return patterns;
+}
+
+fn parsePatternString(raw: []const u8) ?Pattern {
+    if (std.mem.eql(u8, raw, "pair")) return .pair;
+    if (std.mem.eql(u8, raw, "req")) return .req;
+    if (std.mem.eql(u8, raw, "rep")) return .rep;
+    if (std.mem.eql(u8, raw, "pub")) return .@"pub";
+    if (std.mem.eql(u8, raw, "sub")) return .sub;
+    if (std.mem.eql(u8, raw, "push")) return .push;
+    if (std.mem.eql(u8, raw, "pull")) return .pull;
+    return null;
+}
+
+fn parseSubjects(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    max_subject_filters: usize,
+) !SubjectPolicy {
+    if (value == .string) {
+        if (std.mem.eql(u8, value.string, ">")) return .allow_all;
+        if (std.mem.eql(u8, value.string, "")) return .deny_all;
+
+        const filter = try allocator.dupe(u8, value.string);
+        errdefer allocator.free(filter);
+        const filters = try allocator.alloc([]const u8, 1);
+        filters[0] = filter;
+        return .{ .filters = filters };
+    }
+
+    if (value != .array) return Error.InvalidClaims;
+    if (value.array.items.len == 0) return .deny_all;
+    if (value.array.items.len > max_subject_filters) return Error.InvalidClaims;
+
+    const filters = try allocator.alloc([]const u8, value.array.items.len);
+    errdefer allocator.free(filters);
+
+    var copied: usize = 0;
+    errdefer {
+        for (filters[0..copied]) |filter| allocator.free(filter);
+    }
+
+    for (value.array.items, 0..) |item, index| {
+        if (item != .string) return Error.InvalidClaims;
+        filters[index] = try allocator.dupe(u8, item.string);
+        copied += 1;
+    }
+
+    return .{ .filters = filters };
+}
+
+fn parseOptionalBool(value: ?std.json.Value) !?bool {
+    const actual = value orelse return null;
+    if (actual == .null) return null;
+    if (actual != .bool) return Error.InvalidClaims;
+    return actual.bool;
+}
+
+fn parseOptionalUsize(value: ?std.json.Value) !?usize {
+    const actual = value orelse return null;
+    if (actual == .null) return null;
+    if (actual != .integer) return Error.InvalidClaims;
+    if (actual.integer < 0) return Error.InvalidClaims;
+    return std.math.cast(usize, actual.integer) orelse return Error.InvalidClaims;
+}
+
+fn parseUnixMs(value: std.json.Value) !i64 {
+    return switch (value) {
+        .integer => |seconds| try secondsToMs(seconds),
+        .string => |timestamp| try secondsToMs(try parseIsoTimestampSeconds(timestamp)),
+        else => return Error.InvalidClaims,
+    };
+}
+
+fn secondsToMs(seconds: i64) !i64 {
+    return std.math.mul(i64, seconds, 1000) catch Error.InvalidClaims;
+}
+
+fn parseIsoTimestampSeconds(s: []const u8) !i64 {
+    if (s.len < 20) return Error.InvalidClaims;
+
+    var idx: usize = 0;
+    const year = try parseFixedDecimal(i32, s, &idx, 4);
+    if (idx >= s.len or s[idx] != '-') return Error.InvalidClaims;
+    idx += 1;
+    const month = try parseFixedDecimal(u8, s, &idx, 2);
+    if (month < 1 or month > 12) return Error.InvalidClaims;
+    if (idx >= s.len or s[idx] != '-') return Error.InvalidClaims;
+    idx += 1;
+    const day = try parseFixedDecimal(u8, s, &idx, 2);
+    if (day < 1 or day > maxDayInMonth(year, month)) return Error.InvalidClaims;
+    if (idx >= s.len or (s[idx] != 'T' and s[idx] != ' ')) return Error.InvalidClaims;
+    idx += 1;
+    const hour = try parseFixedDecimal(u8, s, &idx, 2);
+    if (hour >= 24) return Error.InvalidClaims;
+    if (idx >= s.len or s[idx] != ':') return Error.InvalidClaims;
+    idx += 1;
+    const minute = try parseFixedDecimal(u8, s, &idx, 2);
+    if (minute >= 60) return Error.InvalidClaims;
+    if (idx >= s.len or s[idx] != ':') return Error.InvalidClaims;
+    idx += 1;
+    const second = try parseFixedDecimal(u8, s, &idx, 2);
+    if (second >= 60) return Error.InvalidClaims;
+
+    if (idx < s.len and s[idx] == '.') {
+        idx += 1;
+        while (idx < s.len and s[idx] >= '0' and s[idx] <= '9') : (idx += 1) {}
+    }
+
+    var offset_seconds: i32 = 0;
+    if (idx >= s.len) return Error.InvalidClaims;
+    if (s[idx] == 'Z' or s[idx] == 'z') {
+        idx += 1;
+    } else if (s[idx] == '+' or s[idx] == '-') {
+        const sign: i32 = if (s[idx] == '+') 1 else -1;
+        idx += 1;
+        const offset_hour = try parseFixedDecimal(u8, s, &idx, 2);
+        if (idx < s.len and s[idx] == ':') idx += 1;
+        const offset_minute = try parseFixedDecimal(u8, s, &idx, 2);
+        if (offset_hour > 23 or offset_minute > 59) return Error.InvalidClaims;
+        offset_seconds = sign * (@as(i32, offset_hour) * 3600 + @as(i32, offset_minute) * 60);
+    } else {
+        return Error.InvalidClaims;
+    }
+    if (idx != s.len) return Error.InvalidClaims;
+
+    const days = daysFromCivil(year, month, day);
+    const naive_seconds = @as(i64, days) * 86400 +
+        @as(i64, hour) * 3600 +
+        @as(i64, minute) * 60 +
+        @as(i64, second);
+    return naive_seconds - @as(i64, offset_seconds);
+}
+
+fn parseFixedDecimal(comptime T: type, s: []const u8, idx: *usize, width: usize) !T {
+    if (idx.* + width > s.len) return Error.InvalidClaims;
+    const chunk = s[idx.* .. idx.* + width];
+    var acc: T = 0;
+    for (chunk) |c| {
+        if (c < '0' or c > '9') return Error.InvalidClaims;
+        acc = acc * 10 + @as(T, @intCast(c - '0'));
+    }
+    idx.* += width;
+    return acc;
+}
+
+fn isLeapYear(year: i32) bool {
+    return (@mod(year, 4) == 0 and @mod(year, 100) != 0) or @mod(year, 400) == 0;
+}
+
+fn maxDayInMonth(year: i32, month: u8) u8 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(year)) 29 else 28,
+        else => 0,
+    };
+}
+
+fn daysFromCivil(year_input: i32, month: u8, day: u8) i32 {
+    const year = if (month <= 2) year_input - 1 else year_input;
+    const era = @divFloor(year, 400);
+    const yoe: u32 = @intCast(year - era * 400);
+    const mp: u32 = @intCast(if (month > 2) month - 3 else month + 9);
+    const doy: u32 = (153 * mp + 2) / 5 + @as(u32, day) - 1;
+    const doe: u32 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + @as(i32, @intCast(doe)) - 719468;
+}
+
 fn normalizePattern(pattern: anytype) Pattern {
     const tag = @tagName(pattern);
     if (std.mem.eql(u8, tag, "pair")) return .pair;
@@ -473,6 +732,56 @@ test "Authorization clone owns copied slices and enforces scope" {
     try std.testing.expectError(Error.Unauthorized, owned.check(.{ .pattern = .push }));
     try std.testing.expectError(Error.MessageTooLarge, owned.check(.{ .message_size = 5 }));
     try std.testing.expectError(Error.CredentialExpired, owned.check(.{ .now_unix_ms = 1_001 }));
+}
+
+test "Authorization parses qmsg claim block" {
+    const allocator = std.testing.allocator;
+    const claims =
+        \\{
+        \\  "iss":"auth.example",
+        \\  "sub":"service:image-worker",
+        \\  "aud":"qmsg://jobs.example",
+        \\  "exp":"2026-06-01T00:00:00Z",
+        \\  "jti":"token-1",
+        \\  "qmsg":{
+        \\    "patterns":["rep","pull"],
+        \\    "subjects":["jobs.image.*","presence.>"],
+        \\    "datagram":true,
+        \\    "max_message_size":1048576
+        \\  }
+        \\}
+    ;
+
+    var authorization = try Authorization.fromClaimsJson(allocator, claims, .{});
+    defer authorization.deinit(allocator);
+
+    try std.testing.expectEqualStrings("service:image-worker", authorization.subject);
+    try std.testing.expectEqualStrings("auth.example", authorization.issuer);
+    try std.testing.expectEqualStrings("token-1", authorization.token_id.?);
+    try std.testing.expect(authorization.allowsPattern(.rep));
+    try std.testing.expect(!authorization.allowsPattern(.@"pub"));
+    try std.testing.expect(authorization.allowsSubject("jobs.image.resize"));
+    try std.testing.expect(authorization.allowsSubject("presence.user.1"));
+    try std.testing.expect(!authorization.allowsSubject("jobs.video.resize"));
+    try std.testing.expect(authorization.datagram_allowed);
+    try std.testing.expectEqual(@as(?usize, 1_048_576), authorization.max_message_size);
+    try std.testing.expectEqual(@as(?i64, 1_780_272_000_000), authorization.expires_at_unix_ms);
+}
+
+test "Authorization rejects malformed qmsg claims" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        Error.InvalidClaims,
+        Authorization.fromClaimsJson(allocator, "{\"iss\":\"auth\",\"sub\":\"s\"}", .{}),
+    );
+    try std.testing.expectError(
+        Error.InvalidClaims,
+        Authorization.fromClaimsJson(
+            allocator,
+            "{\"iss\":\"auth\",\"sub\":\"s\",\"qmsg\":{\"patterns\":[\"bogus\"]}}",
+            .{},
+        ),
+    );
 }
 
 test "AuthConfig bounds token size and anonymous subject filters" {

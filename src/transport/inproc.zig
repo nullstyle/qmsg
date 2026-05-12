@@ -2,12 +2,14 @@ const std = @import("std");
 
 const queue = @import("../queue.zig");
 const protocol = @import("../protocol/root.zig");
+const pubsub = @import("../protocol/pubsub.zig");
 
 pub const EndpointId = usize;
 pub const Message = queue.Message;
 pub const QueueOptions = queue.QueueOptions;
 pub const PushResult = queue.PushResult;
 pub const Pattern = protocol.Pattern;
+pub const PullerFlow = protocol.pushpull.PullerFlow;
 
 pub const Error = error{
     InvalidEndpoint,
@@ -33,11 +35,35 @@ pub const EndpointStats = struct {
 
 pub const PatternEndpoint = struct {
     pattern: Pattern,
+    pubsub_id: pubsub.PeerId = 0,
+    recv_queue_options: QueueOptions = .{},
     context: *anyopaque,
     enqueue: *const fn (context: *anyopaque, msg: Message) anyerror!void,
     accepts: *const fn (context: *anyopaque, subject: []const u8) bool,
+    puller_flow: *const fn (context: *anyopaque) PullerFlow,
     connect_peer: *const fn (context: *anyopaque, peer: PatternEndpoint) anyerror!void,
+    subscribe_peer: *const fn (context: *anyopaque, peer_id: pubsub.PeerId, filter: []const u8, options: QueueOptions) anyerror!void = noopSubscribePeer,
+    unsubscribe_peer: *const fn (context: *anyopaque, peer_id: pubsub.PeerId, filter: []const u8) void = noopUnsubscribePeer,
+    sync_subscriptions: *const fn (context: *anyopaque, publisher: PatternEndpoint) anyerror!void = noopSyncSubscriptions,
 };
+
+fn noopSubscribePeer(context: *anyopaque, peer_id: pubsub.PeerId, filter: []const u8, options: QueueOptions) anyerror!void {
+    _ = context;
+    _ = peer_id;
+    _ = filter;
+    _ = options;
+}
+
+fn noopUnsubscribePeer(context: *anyopaque, peer_id: pubsub.PeerId, filter: []const u8) void {
+    _ = context;
+    _ = peer_id;
+    _ = filter;
+}
+
+fn noopSyncSubscriptions(context: *anyopaque, publisher: PatternEndpoint) anyerror!void {
+    _ = context;
+    _ = publisher;
+}
 
 pub const Delivery = struct {
     from: EndpointId,
@@ -684,6 +710,7 @@ const PatternHarness = struct {
             .context = @ptrCast(self),
             .enqueue = enqueue,
             .accepts = accepts,
+            .puller_flow = pullerFlow,
             .connect_peer = connectPeer,
         };
     }
@@ -698,6 +725,11 @@ const PatternHarness = struct {
         _ = context;
         _ = subject;
         return true;
+    }
+
+    fn pullerFlow(context: *anyopaque) PullerFlow {
+        _ = context;
+        return PullerFlow.fromQueue(.{}, 0, 0);
     }
 
     fn connectPeer(context: *anyopaque, peer: PatternEndpoint) anyerror!void {

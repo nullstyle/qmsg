@@ -1,4 +1,5 @@
 const std = @import("std");
+const auth = @import("auth.zig");
 const paseto = @import("paseto");
 
 pub const PaserkId = paseto.PaserkId;
@@ -36,12 +37,18 @@ pub const V4PublicCredential = struct {
 
 pub const VerifyOptions = struct {
     max_token_bytes: usize = 4096,
-    max_footer_bytes: usize = paserk_id_bytes,
+    max_footer_bytes: usize = 512,
     max_claims_bytes: usize = 16 * 1024,
     max_implicit_assertion_bytes: usize = 1024,
     require_footer_key_id: bool = true,
     require_hint_match: bool = true,
     validator: ?paseto.Validator = null,
+};
+
+pub const AuthOptions = struct {
+    verify: VerifyOptions = .{},
+    claims: auth.Authorization.ClaimParseOptions = .{},
+    replay_cache: ?auth.ReplayCache = null,
 };
 
 pub const VerifiedV4Public = struct {
@@ -114,6 +121,20 @@ pub fn parseV4PublicKeyId(raw: []const u8) Error!PaserkId {
     return key_id;
 }
 
+pub fn parseV4PublicFooterKeyId(allocator: std.mem.Allocator, raw: []const u8) Error!PaserkId {
+    if (std.mem.startsWith(u8, raw, "k4.")) return try parseV4PublicKeyId(raw);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+        return Error.InvalidKeyId;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return Error.InvalidKeyId;
+    const kid = parsed.value.object.get("kid") orelse return Error.InvalidKeyId;
+    if (kid != .string) return Error.InvalidKeyId;
+    return try parseV4PublicKeyId(kid.string);
+}
+
 pub fn requireV4PublicKeyId(key_id: PaserkId) Error!void {
     if (key_id.version != .v4) return Error.UnsupportedCredential;
     if (key_id.kind != .pid) return Error.UnsupportedCredential;
@@ -130,6 +151,7 @@ pub fn v4PublicKeyMatchesId(key: V4Public, key_id: PaserkId) bool {
 }
 
 pub fn resolveV4PublicKeyId(
+    allocator: std.mem.Allocator,
     token: paseto.Token,
     hint: ?PaserkId,
     options: VerifyOptions,
@@ -139,7 +161,7 @@ pub fn resolveV4PublicKeyId(
     const footer_id = if (token.footer.len == 0)
         null
     else
-        try parseV4PublicKeyId(token.footer);
+        try parseV4PublicFooterKeyId(allocator, token.footer);
 
     if (footer_id) |from_footer| {
         if (hint) |from_hint| {
@@ -177,7 +199,7 @@ pub fn verifyV4Public(
         return Error.ClaimsTooLarge;
     }
 
-    const key_id = try resolveV4PublicKeyId(token, credential.key_id_hint, options);
+    const key_id = try resolveV4PublicKeyId(allocator, token, credential.key_id_hint, options);
     const key = try keys.requireV4Public(key_id);
 
     const footer_copy = try allocator.dupe(u8, token.footer);
@@ -202,6 +224,34 @@ pub fn verifyV4Public(
         .footer = footer_copy,
         .allocator = allocator,
     };
+}
+
+pub fn authenticateV4Public(
+    allocator: std.mem.Allocator,
+    keys: KeyStore,
+    credential: V4PublicCredential,
+    options: AuthOptions,
+) !auth.Authorization {
+    var verified = try verifyV4Public(allocator, keys, credential, options.verify);
+    defer verified.deinit();
+
+    var authorization = try auth.Authorization.fromClaimsJson(
+        allocator,
+        verified.claims,
+        options.claims,
+    );
+    errdefer authorization.deinit(allocator);
+
+    if (options.replay_cache) |replay_cache| {
+        const token_id = authorization.token_id orelse return auth.Error.InvalidClaims;
+        try replay_cache.checkAndStore(.{
+            .issuer = authorization.issuer,
+            .token_id = token_id,
+            .expires_at_unix_ms = authorization.expires_at_unix_ms,
+        });
+    }
+
+    return authorization;
 }
 
 fn mapPasetoError(err: anyerror) VerifyError {
@@ -255,6 +305,10 @@ test "parse v4 public PASERK ID from generated key" {
 
     const parsed = try parseV4PublicKeyId(&encoded);
     try std.testing.expect(key_id.eql(parsed));
+    const footer_json = try std.fmt.allocPrint(std.testing.allocator, "{{\"kid\":\"{s}\"}}", .{&encoded});
+    defer std.testing.allocator.free(footer_json);
+    const parsed_json = try parseV4PublicFooterKeyId(std.testing.allocator, footer_json);
+    try std.testing.expect(key_id.eql(parsed_json));
 
     const local_key_bytes: [32]u8 = @splat(3);
     const local_id = try PaserkId.fromKey(.v4, .lid, &local_key_bytes);
@@ -358,6 +412,173 @@ test "verify rejects missing unknown and mismatched key ids fail closed" {
             .{},
             .{ .token = token_with_footer },
             .{},
+        ),
+    );
+}
+
+test "authenticate maps qmsg claims into Authorization and checks replay cache" {
+    const allocator = std.testing.allocator;
+    const key = try V4Public.fromSeed(&@as([32]u8, @splat(31)));
+    const key_id = try v4PublicKeyId(key);
+    const footer = key_id.toArray();
+
+    const claims =
+        \\{
+        \\  "iss":"issuer.example",
+        \\  "sub":"service:image-worker",
+        \\  "aud":"qmsg://jobs.example",
+        \\  "exp":"2026-06-01T00:00:00Z",
+        \\  "jti":"token-replay-1",
+        \\  "qmsg":{
+        \\    "patterns":["pull"],
+        \\    "subjects":["jobs.image.*"],
+        \\    "datagram":false,
+        \\    "max_message_size":4096
+        \\  }
+        \\}
+    ;
+    const token = try key.sign(allocator, claims, .{ .footer = &footer });
+    defer allocator.free(token);
+
+    const entries = [_]PublicKeyEntry{.{ .key_id = key_id, .key = key }};
+    const static = StaticKeyStore{ .v4_public_keys = &entries };
+    const audiences = [_][]const u8{"qmsg://jobs.example"};
+
+    const Replay = struct {
+        seen: bool = false,
+
+        fn checkAndStore(ptr: ?*anyopaque, entry: auth.ReplayEntry) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            try std.testing.expectEqualStrings("issuer.example", entry.issuer);
+            try std.testing.expectEqualStrings("token-replay-1", entry.token_id);
+            try std.testing.expectEqual(@as(?i64, 1_780_272_000_000), entry.expires_at_unix_ms);
+            if (self.seen) return auth.Error.ReplayedCredential;
+            self.seen = true;
+        }
+    };
+    var replay = Replay{};
+
+    var authorization = try authenticateV4Public(
+        allocator,
+        static.keyStore(),
+        .{ .token = token },
+        .{
+            .verify = .{
+                .validator = paseto.Validator{
+                    .expected_issuer = "issuer.example",
+                    .expected_audience = &audiences,
+                    .require_subject = true,
+                    .require_token_identifier = true,
+                    .now_override = 1_700_000_000,
+                },
+            },
+            .replay_cache = .{
+                .ptr = &replay,
+                .check_and_store_fn = Replay.checkAndStore,
+            },
+        },
+    );
+    defer authorization.deinit(allocator);
+
+    try std.testing.expectEqualStrings("service:image-worker", authorization.subject);
+    try authorization.check(.{ .pattern = .pull, .subject = "jobs.image.resize", .message_size = 4096 });
+    try std.testing.expectError(auth.Error.Unauthorized, authorization.check(.{ .pattern = .push }));
+
+    try std.testing.expectError(
+        auth.Error.ReplayedCredential,
+        authenticateV4Public(
+            allocator,
+            static.keyStore(),
+            .{ .token = token },
+            .{
+                .verify = .{
+                    .validator = paseto.Validator{
+                        .expected_issuer = "issuer.example",
+                        .expected_audience = &audiences,
+                        .require_subject = true,
+                        .require_token_identifier = true,
+                        .now_override = 1_700_000_000,
+                    },
+                },
+                .replay_cache = .{
+                    .ptr = &replay,
+                    .check_and_store_fn = Replay.checkAndStore,
+                },
+            },
+        ),
+    );
+}
+
+test "verify rejects footer key-id tampering and wrong trusted key" {
+    const allocator = std.testing.allocator;
+    const first = try V4Public.fromSeed(&@as([32]u8, @splat(41)));
+    const second = try V4Public.fromSeed(&@as([32]u8, @splat(42)));
+    const first_id = try v4PublicKeyId(first);
+    const second_id = try v4PublicKeyId(second);
+    const first_footer = first_id.toArray();
+    const second_footer = second_id.toArray();
+
+    const token = try first.sign(allocator, "{}", .{ .footer = &first_footer });
+    defer allocator.free(token);
+
+    var parsed = try paseto.token.parse(allocator, token);
+    defer parsed.deinit();
+    const tampered = try paseto.token.serialize(allocator, .v4, .public, parsed.payload, &second_footer);
+    defer allocator.free(tampered);
+
+    const entries = [_]PublicKeyEntry{
+        .{ .key_id = first_id, .key = first },
+        .{ .key_id = second_id, .key = second },
+    };
+    const static = StaticKeyStore{ .v4_public_keys = &entries };
+    try std.testing.expectError(
+        Error.InvalidSignature,
+        verifyV4Public(allocator, static.keyStore(), .{ .token = tampered }, .{}),
+    );
+
+    const wrong_entries = [_]PublicKeyEntry{.{ .key_id = first_id, .key = second }};
+    const wrong_static = StaticKeyStore{ .v4_public_keys = &wrong_entries };
+    try std.testing.expectError(
+        Error.KeyIdMismatch,
+        verifyV4Public(allocator, wrong_static.keyStore(), .{ .token = token }, .{}),
+    );
+}
+
+test "verify maps expiry and not-before validation errors" {
+    const allocator = std.testing.allocator;
+    const key = try V4Public.fromSeed(&@as([32]u8, @splat(51)));
+    const key_id = try v4PublicKeyId(key);
+    const footer = key_id.toArray();
+    const entries = [_]PublicKeyEntry{.{ .key_id = key_id, .key = key }};
+    const static = StaticKeyStore{ .v4_public_keys = &entries };
+
+    const expired_claims =
+        \\{"iss":"issuer.example","sub":"service","exp":"2022-01-01T00:00:00Z","qmsg":{"patterns":["pair"]}}
+    ;
+    const expired_token = try key.sign(allocator, expired_claims, .{ .footer = &footer });
+    defer allocator.free(expired_token);
+    try std.testing.expectError(
+        Error.CredentialExpired,
+        verifyV4Public(
+            allocator,
+            static.keyStore(),
+            .{ .token = expired_token },
+            .{ .validator = paseto.Validator{ .now_override = 1_700_000_000 } },
+        ),
+    );
+
+    const future_claims =
+        \\{"iss":"issuer.example","sub":"service","nbf":"2026-01-01T00:00:00Z","qmsg":{"patterns":["pair"]}}
+    ;
+    const future_token = try key.sign(allocator, future_claims, .{ .footer = &footer });
+    defer allocator.free(future_token);
+    try std.testing.expectError(
+        Error.CredentialNotYetValid,
+        verifyV4Public(
+            allocator,
+            static.keyStore(),
+            .{ .token = future_token },
+            .{ .validator = paseto.Validator{ .now_override = 1_700_000_000 } },
         ),
     );
 }

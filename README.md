@@ -18,17 +18,23 @@ tranches are building around:
 - `Message`, `OutgoingMessage`, `Header`, `Flags`, and `MessageId`;
 - `SubjectFilter` and `SubjectRouter`;
 - `Socket(.pair/.req/.rep/.@"pub"/.sub/.push/.pull)` and `SocketOptions`;
+- `ErrorReply` plus deadline/cancellation helpers for req/rep;
 - `QueueOptions` and `OnFull` for bounded queues and backpressure policy;
 - `InprocNetwork` and `Endpoint`;
 - `AuthConfig`, `Authorization`, and `SubjectPolicy`;
 - `PasetoAuth` for concrete PASETO/PASERK v4.public verification;
 - `control` for qmsg `HELLO`, `GOAWAY`, `SUBSCRIBE`, `UNSUBSCRIBE`, and
   `CREDIT` control-frame encoding;
+- `protocol.pubsub` and `protocol.pushpull` helpers for subscription and
+  credit accounting;
+- `transport.quic` for the qmsg-owned QUIC options/session/control-HELLO
+  skeleton over `quic-zig`;
 - `App`, `Context`, and `Session`.
 
 The inproc socket examples build and run against the current public API. The
-App facade can register and dispatch route handlers in memory. Network
-listeners and the QUIC transport adapter are still future work.
+App facade can now serve inproc REP routes through `runOnce`. Real UDP QUIC
+listen/dial loops and reliable-message mapping over QUIC streams are still
+future work.
 
 ## Package Use
 
@@ -133,7 +139,7 @@ pub fn main() !void {
 ```
 
 See [examples/app_ergonomics.zig](examples/app_ergonomics.zig) for the current
-facade route plan and handler shape.
+facade handler shape over inproc req/rep.
 
 ## Design Tenets
 
@@ -165,6 +171,8 @@ been validated. `qmsg.PasetoAuth` uses
 [`paseto-zig` `0.2.0`](https://github.com/nullstyle/paseto-zig/releases/tag/0.2.0)
 for typed PASERK IDs and bounded fail-closed v4.public token verification,
 while the rest of core keeps auth interfaces transport-independent.
+See [examples/auth_paseto.zig](examples/auth_paseto.zig) for the current
+PASERK key-rotation and v4.public verification shape.
 
 ## Development
 
@@ -172,6 +180,12 @@ Run the unit tests:
 
 ```sh
 zig build test
+```
+
+Run only the QUIC transport skeleton tests:
+
+```sh
+zig build quic-test
 ```
 
 Build the examples:

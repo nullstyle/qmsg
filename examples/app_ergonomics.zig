@@ -1,115 +1,64 @@
 const std = @import("std");
 const qmsg = @import("qmsg");
 
-// Route registration and in-memory dispatch work today. QUIC listeners are the
-// next integration layer, so this example keeps auth as an explicit session
-// policy plan without requiring a network transport.
+// App facade over inproc req/rep. QUIC listeners are the next integration
+// layer, but the handler/runtime shape is the same.
 
 pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
 
     const allocator = gpa.allocator();
-    const auth_plan = qmsg.AuthConfig{
-        .required = true,
-        .max_token_bytes = 4096,
-        .max_clock_skew_ms = 30_000,
-    };
+
+    var network = qmsg.InprocNetwork.init(allocator);
+    defer network.deinit();
 
     var app = try qmsg.App.init(allocator, .{});
     defer app.deinit();
 
-    if (comptime appFacadeReady()) {
-        try installRoutes(&app);
-        std.debug.print(
-            "qmsg app facade routes registered (auth plan required={}, token cap={d} bytes)\n",
-            .{ auth_plan.required, auth_plan.max_token_bytes },
-        );
-    } else {
-        printRoutePlan(&.{
-            .{
-                .pattern = .rep,
-                .subject_filter = "user.get",
-                .handler_name = "getUser",
-                .queue = .{ .max_messages = 32, .max_bytes = 512 * 1024, .on_full = .fail },
-            },
-            .{
-                .pattern = .pull,
-                .subject_filter = "jobs.image.resize",
-                .handler_name = "resizeImage",
-                .queue = .{ .max_messages = 64, .max_bytes = 8 * 1024 * 1024, .on_full = .block },
-            },
-            .{
-                .pattern = .sub,
-                .subject_filter = "metrics.*",
-                .handler_name = "observeMetric",
-                .queue = .{ .max_messages = 256, .max_bytes = 2 * 1024 * 1024, .on_full = .drop_oldest },
-            },
-        }, auth_plan);
-    }
-}
-
-const RoutePlan = struct {
-    pattern: qmsg.Pattern,
-    subject_filter: []const u8,
-    handler_name: []const u8,
-    queue: qmsg.QueueOptions,
-};
-
-fn appFacadeReady() bool {
-    return @hasDecl(qmsg.App, "rep") and
-        @hasDecl(qmsg.App, "pull") and
-        @hasDecl(qmsg.App, "sub") and
-        @hasDecl(qmsg.Context, "reply");
-}
-
-fn printRoutePlan(routes: []const RoutePlan, auth: qmsg.AuthConfig) void {
-    std.debug.print(
-        \\qmsg app facade example
-        \\  auth required: {}
-        \\  token cap:     {d} bytes
-        \\
-    , .{ auth.required, auth.max_token_bytes });
-
-    for (routes) |route| {
-        std.debug.print(
-            "  {s: <4} {s: <24} -> {s} (queue {d} msgs, {d} bytes, on_full={s})\n",
-            .{
-                @tagName(route.pattern),
-                route.subject_filter,
-                route.handler_name,
-                route.queue.max_messages,
-                route.queue.max_bytes,
-                @tagName(route.queue.on_full),
-            },
-        );
-    }
-
-    std.debug.print(
-        \\
-        \\The App facade is intentionally thin: it registers message handlers by
-        \\pattern and subject filter, then delegates transport and backpressure
-        \\behavior to qmsg Node and Socket internals. It is not an HTTP/3 router.
-        \\
-    , .{});
-}
-
-fn installRoutes(app: *qmsg.App) !void {
-    try app.rep("user.get", getUser);
+    try app.rep("user.*", getUser);
     try app.pull("jobs.image.resize", resizeImage);
     try app.sub("metrics.*", observeMetric);
+
+    var service_session = qmsg.Session{
+        .id = 7,
+        .transport = .inproc,
+    };
+    service_session.setAuthorization(.{
+        .subject = "service:users",
+        .issuer = "example",
+        .allowed_patterns = qmsg.auth.PatternSet.init(&.{.rep}),
+        .allowed_subjects = .{ .filters = &.{"user.*"} },
+    });
+
+    _ = try app.listenInprocRep(&network, "users", .{ .session = service_session });
+
+    var req = try qmsg.Socket(.req).init(allocator, .{});
+    defer req.deinit();
+    try req.dialInproc(&network, "users");
+
+    _ = try req.sendRequest(.{
+        .subject = "user.get",
+        .headers = &.{.{ .name = "accept", .value = "application/json" }},
+        .body = "user-42",
+        .deadline_ms = 250,
+    });
+
+    _ = try app.runOnce();
+
+    var reply = try req.recv();
+    defer reply.deinit();
+    std.debug.print("app facade received {s}: {s}\n", .{ reply.subject, reply.body });
 }
 
 fn getUser(ctx: *qmsg.Context, msg: qmsg.Message) !void {
     var owned = msg;
     defer owned.deinit();
 
-    // Next auth tranche: require the cached session authorization before reply.
-    // try ctx.requirePattern(.rep);
-    // try ctx.requireSubject("user.get");
+    try ctx.requireRouteAccess();
 
     try ctx.reply(.{
-        .subject = "user.get",
+        .subject = "",
         .headers = &.{
             .{ .name = "content-type", .value = "application/json" },
         },

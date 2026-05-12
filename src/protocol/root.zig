@@ -1,5 +1,8 @@
 const std = @import("std");
 
+pub const pushpull = @import("pushpull.zig");
+pub const pubsub = @import("pubsub.zig");
+
 pub const Pattern = enum(u8) {
     pair,
     req,

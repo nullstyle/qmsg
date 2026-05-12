@@ -102,8 +102,9 @@ Server validation flow:
 2. Parse the PASETO with `paseto.token.parse` and reject unsupported
    version/purpose before expensive work.
 3. Extract the PASERK key ID string from authenticated-looking metadata:
-   preferably the token footer (`{"kid":"k4.pid..."}`), otherwise the HELLO
-   `key_id_hint`. Treat both as untrusted lookup hints.
+   preferably the token footer (`{"kid":"k4.pid..."}` or a raw `k4.pid...`
+   value), otherwise the HELLO `key_id_hint`. Treat both as untrusted lookup
+   hints.
 4. Resolve the verification/decryption key from a trusted key store.
 5. Verify/decrypt the PASETO using the qmsg implicit assertion bytes.
 6. Validate registered claims with `paseto.Validator`: issuer, audience,
@@ -179,6 +180,17 @@ pub const Authorization = struct {
 Handlers should see authorization as session state, not parse tokens directly
 in every message handler.
 
+`src/auth.zig` owns the qmsg claim parser. `Authorization.fromClaimsJson`
+requires `iss`, `sub`, and a `qmsg` block by default, maps `jti` into
+`token_id`, maps `exp` into `expires_at_unix_ms`, and parses:
+
+- `qmsg.patterns`: non-empty list of `pair`, `req`, `rep`, `pub`, `sub`,
+  `push`, or `pull`;
+- `qmsg.subjects`: subject filters, `">"` for allow-all, or an empty list for
+  deny-all;
+- `qmsg.datagram`: optional boolean;
+- `qmsg.max_message_size`: optional byte limit.
+
 ## PASERK Key IDs
 
 PASERK key IDs are the right way to identify keys in token metadata.
@@ -240,6 +252,11 @@ with `paseto.v4.Public.fromPublicKeyBytes`. Signing keys created with
 `fromSeed`, `fromSecretKeyBytes`, or `generate` belong in the token issuer, not
 in ordinary qmsg listener processes.
 
+See `examples/auth_paseto.zig` for a compact rotation example. It keeps both
+the current and next verifier keys in a static store, signs a token with the
+next key, carries the next key's PASERK ID in the footer, and verifies through
+the same transport-independent authenticator used by sessions.
+
 ## Replay Defense
 
 PASETO verifies authenticity, not freshness by itself.
@@ -263,6 +280,12 @@ For service-to-service deployments, the clean model is:
 The MVP can skip challenge-response and document that deployments should use
 short-lived tokens plus TLS server authentication. The API should leave room for
 challenge-bound tokens.
+
+The concrete PASETO helper accepts an optional `auth.ReplayCache`. When present,
+`authenticateV4Public` requires `jti`, parses qmsg claims into an
+`Authorization`, then calls `checkAndStore` with `{ issuer, token_id,
+expires_at_unix_ms }`. The cache interface stays transport-independent so
+listeners can back it with memory, a process-wide store, or application state.
 
 ## Per-Message Authorization
 
@@ -414,6 +437,21 @@ const authz = try parseQmsgClaims(allocator, claims_json);
 The footer becomes authenticated only when `verifyToken` succeeds; if an
 attacker tampers with the footer to steer lookup to the wrong trusted key, token
 verification fails.
+
+Current concrete API:
+
+```zig
+var authorization = try qmsg.PasetoAuth.authenticateV4Public(
+    allocator,
+    key_store,
+    .{ .token = token, .implicit_assertion = assertion },
+    .{
+        .verify = .{ .validator = validator },
+        .replay_cache = replay_cache,
+    },
+);
+defer authorization.deinit(allocator);
+```
 
 ## Implementation Phases
 

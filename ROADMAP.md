@@ -3,6 +3,25 @@
 This roadmap assumes `quic-zig` is the underlying QUIC implementation and that
 HTTP/3 remains outside this project.
 
+## Implementation Status
+
+This table tracks the current implementation, not the final ambition of each
+phase.
+
+| Phase | Status | Notes |
+| --- | --- | --- |
+| 0 Decisions and spikes | Partial | Package, ALPN, envelope, inproc, auth boundary, and QUIC HELLO skeleton exist. A real QUIC stream/datagram spike is next. |
+| 1 Core package skeleton | Complete | Core message, envelope, subject, queue, transport boundary, and inproc transport are implemented and tested. |
+| 2 Pair and req/rep over inproc | Complete for inproc MVP | Pair and req/rep work over inproc with ids, deadlines, cancellation, queue pressure tests, and error replies. |
+| 3 QUIC transport MVP | Started | `quic-zig` is wired locally and `transport.quic` owns qmsg options/session/control-HELLO state. Real QUIC I/O and stream mapping remain. |
+| 4 App facade | Partial | Route registration, `Context`, in-memory dispatch, inproc REP `runOnce`, auth checks, and default REP error replies exist. QUIC runtime integration remains. |
+| 5 Pub/sub reliable | Partial | Inproc pub/sub, source-side subscription registry, replay/update, and slow-consumer behavior are implemented. QUIC subscription propagation remains. |
+| 6 QUIC datagrams | Not started | HELLO carries datagram capability, but no datagram envelope or transport path exists yet. |
+| 7 Push/pull | Partial | Inproc push/pull has fair selection, puller credit, queue policy handling, and at-most-once semantics. QUIC `CREDIT` integration remains. |
+| 8 Survey/respondent and bus | Not started | No public API or state machines yet. |
+| 9 Typed codecs and ergonomics | Not started | Raw bytes remain first-class; typed helpers are future work. |
+| 10 PASETO/PASERK auth kit | Partial | `paseto-zig` 0.2.0 is wired, v4.public verification, PASERK id lookup, qmsg claim parsing, replay hook, and key rotation example exist. Runtime HELLO integration and more purposes remain. |
+
 ## Phase 0: Decisions and Spikes
 
 Goal: reduce unknowns before writing much framework code.

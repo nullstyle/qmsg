@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const inproc = @import("inproc.zig");
+pub const quic = @import("quic.zig");
 
 pub const Kind = enum {
     inproc,

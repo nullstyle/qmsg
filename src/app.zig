@@ -1,15 +1,23 @@
 const std = @import("std");
+const auth = @import("auth.zig");
 const message = @import("message.zig");
 const node = @import("node.zig");
 const session = @import("session.zig");
 const subject = @import("subject.zig");
 const socket = @import("socket.zig");
+const transport = @import("transport/root.zig");
 
 pub const TlsConfig = struct {};
+
+pub const ErrorPolicy = enum {
+    propagate,
+    reply_error,
+};
 
 pub const AppOptions = struct {
     alpn: []const []const u8 = &.{"qmsg/1"},
     node: node.NodeOptions = .{},
+    error_policy: ErrorPolicy = .reply_error,
 };
 
 pub const ConnectHandler = *const fn (*Context) anyerror!void;
@@ -45,6 +53,13 @@ pub const DispatchOptions = struct {
     reply_hook: ?EmitHandler = null,
     publish_hook: ?EmitHandler = null,
 };
+
+pub const InprocRepOptions = struct {
+    socket: socket.SocketOptions(.rep) = .{},
+    session: ?session.Session = null,
+};
+
+pub const RunOnceResult = node.RunOnceResult;
 
 pub const ResponseSink = struct {
     allocator: std.mem.Allocator,
@@ -97,6 +112,7 @@ pub const Context = struct {
     request_subject: []const u8 = "",
     request_id: message.MessageId = 0,
     request_deadline_ms: ?u64 = null,
+    request_message_size: usize = 0,
     response_sink: ?*ResponseSink = null,
     reply_hook: ?EmitHandler = null,
     publish_hook: ?EmitHandler = null,
@@ -108,6 +124,32 @@ pub const Context = struct {
     pub fn authorization(self: *const Context) ?*const @import("auth.zig").Authorization {
         const sess = self.session orelse return null;
         return if (sess.authorization) |*authz| authz else null;
+    }
+
+    pub fn requireAuthenticated(self: *const Context) auth.Error!void {
+        const sess = self.session orelse return auth.Error.AuthenticationRequired;
+        try sess.requireAuthenticated();
+    }
+
+    pub fn requirePattern(self: *const Context, pattern: auth.Pattern) auth.Error!void {
+        const sess = self.session orelse return auth.Error.AuthenticationRequired;
+        try sess.requirePattern(pattern);
+    }
+
+    pub fn requireSubject(self: *const Context, subject_name: []const u8) auth.Error!void {
+        const sess = self.session orelse return auth.Error.AuthenticationRequired;
+        try sess.requireSubject(subject_name);
+    }
+
+    pub fn requireRouteAccess(self: *const Context) auth.Error!void {
+        const sess = self.session orelse return auth.Error.AuthenticationRequired;
+        const datagram = self.route_kind == .datagram;
+        try sess.check(.{
+            .pattern = if (self.pattern) |pattern| authPattern(pattern) else null,
+            .subject = if (self.request_subject.len == 0) null else self.request_subject,
+            .datagram = datagram,
+            .message_size = self.request_message_size,
+        });
     }
 
     pub fn reply(self: *Context, outgoing: message.OutgoingMessage) !void {
@@ -154,6 +196,7 @@ pub const Context = struct {
 pub const App = struct {
     allocator: std.mem.Allocator,
     node: node.Node,
+    error_policy: ErrorPolicy,
     rep_routes: subject.Router(MessageHandler),
     pull_routes: subject.Router(MessageHandler),
     sub_routes: subject.Router(MessageHandler),
@@ -167,6 +210,7 @@ pub const App = struct {
         return .{
             .allocator = allocator,
             .node = try node.Node.init(allocator, options.node),
+            .error_policy = options.error_policy,
             .rep_routes = subject.Router(MessageHandler).init(allocator),
             .pull_routes = subject.Router(MessageHandler).init(allocator),
             .sub_routes = subject.Router(MessageHandler).init(allocator),
@@ -196,6 +240,10 @@ pub const App = struct {
 
     pub fn onPublish(self: *App, handler: EmitHandler) void {
         self.publish_hook = handler;
+    }
+
+    pub fn setErrorPolicy(self: *App, policy: ErrorPolicy) void {
+        self.error_policy = policy;
     }
 
     pub fn rep(self: *App, filter: []const u8, handler: MessageHandler) !void {
@@ -299,6 +347,7 @@ pub const App = struct {
             .request_subject = owned.subject,
             .request_id = owned.id,
             .request_deadline_ms = owned.deadline_ms,
+            .request_message_size = messageSize(owned),
             .response_sink = &result,
             .reply_hook = options.reply_hook orelse self.reply_hook,
             .publish_hook = options.publish_hook orelse self.publish_hook,
@@ -339,10 +388,89 @@ pub const App = struct {
         return error.UnsupportedTransport;
     }
 
+    pub fn listenInprocRep(
+        self: *App,
+        network: *transport.inproc.Network,
+        address: []const u8,
+        options: InprocRepOptions,
+    ) !node.InprocRepId {
+        return self.node.listenInprocRep(network, address, .{
+            .socket = options.socket,
+            .session = options.session,
+        });
+    }
+
+    pub fn runOnce(self: *App) !RunOnceResult {
+        var dispatcher = InprocDispatcher{ .app = self };
+        return self.node.runOnce(&dispatcher);
+    }
+
+    pub fn tick(self: *App, now_us: u64) !RunOnceResult {
+        try self.node.tick(now_us);
+        return self.runOnce();
+    }
+
     pub fn run(self: *App) !void {
-        _ = self;
+        while (true) {
+            const result = try self.runOnce();
+            if (!result.didWork()) break;
+        }
     }
 };
+
+const InprocDispatcher = struct {
+    app: *App,
+
+    pub fn dispatchInprocRep(self: *@This(), endpoint: *node.InprocRepEndpoint) !bool {
+        var request = (try endpoint.socket.tryRecv()) orelse return false;
+        defer request.deinit();
+
+        const incoming = try request.message.clone(self.app.allocator);
+        var result = self.app.dispatchMessage(.rep, incoming, .{
+            .session = &endpoint.session,
+        }) catch |err| {
+            try handleRepError(self.app, &endpoint.socket, request, err);
+            return true;
+        };
+        defer result.deinit();
+
+        for (result.replies.items) |reply| {
+            try endpoint.socket.reply(request, reply.outgoing());
+        }
+
+        return true;
+    }
+};
+
+fn handleRepError(self: *App, rep_socket: *socket.Socket(.rep), request: socket.Request, err: anyerror) !void {
+    switch (self.error_policy) {
+        .propagate => return err,
+        .reply_error => return rep_socket.replyError(request, .{
+            .code = @errorName(err),
+            .message = @errorName(err),
+        }),
+    }
+}
+
+fn authPattern(pattern: socket.Pattern) auth.Pattern {
+    return switch (pattern) {
+        .pair => .pair,
+        .req => .req,
+        .rep => .rep,
+        .@"pub" => .@"pub",
+        .sub => .sub,
+        .push => .push,
+        .pull => .pull,
+    };
+}
+
+fn messageSize(msg: message.Message) usize {
+    var total = msg.subject.len + msg.body.len;
+    for (msg.headers) |header| {
+        total += header.name.len + header.value.len;
+    }
+    return total;
+}
 
 test {
     std.testing.refAllDecls(@This());
@@ -556,4 +684,98 @@ test "App connect and close dispatch handlers through node events" {
     try std.testing.expectEqual(@as(usize, 2), try app.node.poll(&events));
     try std.testing.expectEqual(@as(session.SessionId, 11), events[0].connected);
     try std.testing.expectEqual(@as(session.SessionId, 11), events[1].closed);
+}
+
+test "App runOnce serves real req rep through inproc facade with handler auth check" {
+    const allocator = std.testing.allocator;
+
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+
+    var app = try App.init(allocator, .{});
+    defer app.deinit();
+
+    const Handler = struct {
+        fn getUser(ctx: *Context, msg: message.Message) !void {
+            var owned = msg;
+            defer owned.deinit();
+
+            try ctx.requireRouteAccess();
+            try ctx.reply(.{
+                .subject = "",
+                .body = "Ada",
+            });
+        }
+    };
+
+    var sess = session.Session{
+        .id = 41,
+        .transport = .inproc,
+    };
+    sess.setAuthorization(.{
+        .subject = "service:users",
+        .issuer = "test",
+        .allowed_patterns = auth.PatternSet.init(&.{.rep}),
+        .allowed_subjects = .{ .filters = &.{"user.*"} },
+    });
+
+    try app.rep("user.*", Handler.getUser);
+    _ = try app.listenInprocRep(&network, "users", .{ .session = sess });
+
+    var req = try socket.Socket(.req).init(allocator, .{});
+    defer req.deinit();
+    try req.dialInproc(&network, "users");
+
+    const id = try req.sendRequest(.{
+        .subject = "user.get",
+        .body = "42",
+        .deadline_ms = 250,
+    });
+
+    const result = try app.runOnce();
+    try std.testing.expect(result.didWork());
+
+    var reply = try req.recv();
+    defer reply.deinit();
+    try std.testing.expectEqual(id, reply.id);
+    try std.testing.expectEqual(@as(?u64, 250), reply.deadline_ms);
+    try std.testing.expectEqualStrings("user.get", reply.subject);
+    try std.testing.expectEqualStrings("Ada", reply.body);
+    try std.testing.expect(!reply.flags.err);
+}
+
+test "App default inproc rep error policy returns message error replies" {
+    const allocator = std.testing.allocator;
+
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+
+    var app = try App.init(allocator, .{});
+    defer app.deinit();
+
+    const Handler = struct {
+        fn needsAuth(ctx: *Context, msg: message.Message) !void {
+            var owned = msg;
+            defer owned.deinit();
+            try ctx.requireRouteAccess();
+        }
+    };
+
+    try app.rep("user.*", Handler.needsAuth);
+    _ = try app.listenInprocRep(&network, "users", .{});
+
+    var req = try socket.Socket(.req).init(allocator, .{});
+    defer req.deinit();
+    try req.dialInproc(&network, "users");
+
+    _ = try req.sendRequest(.{ .subject = "user.get" });
+
+    const result = try app.runOnce();
+    try std.testing.expect(result.didWork());
+
+    var reply = try req.recv();
+    defer reply.deinit();
+    try std.testing.expect(reply.flags.err);
+    try std.testing.expectEqualStrings("user.get", reply.subject);
+    try std.testing.expectEqualStrings("AuthenticationRequired", reply.body);
 }

@@ -34,8 +34,12 @@ pub const Pattern = socket.Pattern;
 pub const Socket = socket.Socket;
 pub const SocketOptions = socket.SocketOptions;
 pub const Request = socket.Request;
+pub const ErrorReply = socket.ErrorReply;
 pub const QueueOptions = queue.QueueOptions;
 pub const OnFull = queue.OnFull;
+pub const PubSubRegistry = protocol.pubsub.Registry;
+pub const PubSubSubscriptionSet = protocol.pubsub.SubscriptionSet;
+pub const PubSubPeerId = protocol.pubsub.PeerId;
 
 pub const InprocNetwork = transport.inproc.Network;
 pub const Endpoint = transport.Endpoint;
@@ -51,6 +55,9 @@ pub const SessionId = session.SessionId;
 pub const App = app.App;
 pub const AppOptions = app.AppOptions;
 pub const Context = app.Context;
+pub const ErrorPolicy = app.ErrorPolicy;
+pub const InprocRepOptions = app.InprocRepOptions;
+pub const RunOnceResult = app.RunOnceResult;
 pub const TlsConfig = app.TlsConfig;
 
 pub const Error = error{
@@ -92,6 +99,7 @@ pub const Error = error{
     VersionMismatch,
     UnsupportedTransport,
     UnsupportedCredential,
+    TooManySessions,
     UnknownKey,
     Unauthorized,
     AuthenticationRequired,
@@ -99,6 +107,7 @@ pub const Error = error{
     ReplayedCredential,
     CredentialExpired,
     CredentialNotYetValid,
+    InvalidClaims,
 };
 
 pub const Limits = struct {

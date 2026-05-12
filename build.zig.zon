@@ -20,5 +20,8 @@
             .url = "https://github.com/nullstyle/paseto-zig/archive/refs/tags/0.2.0.tar.gz",
             .hash = "paseto-0.1.0-EBI95SatBQAMip3R6-1LtQp2Wb6fKvOA7vBRBThiMplw",
         },
+        .quic_zig = .{
+            .path = "../quic-zig",
+        },
     },
 }
