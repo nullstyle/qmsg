@@ -15,6 +15,9 @@ pub const Error = error{
     AuthenticationRequired,
     Unauthorized,
     TokenTooLarge,
+    ImplicitAssertionTooLarge,
+    ChallengeRequired,
+    ChallengeTooLarge,
     UnsupportedCredential,
     UnknownKey,
     ReplayedCredential,
@@ -142,6 +145,8 @@ pub const SubjectPolicy = union(enum) {
 pub const Authorization = struct {
     subject: []const u8,
     issuer: []const u8,
+    audience: ?[]const u8 = null,
+    purpose: ?[]const u8 = null,
     token_id: ?[]const u8 = null,
     allowed_patterns: PatternSet = .{},
     allowed_subjects: SubjectPolicy = .allow_all,
@@ -161,6 +166,10 @@ pub const Authorization = struct {
     pub const ClaimParseOptions = struct {
         require_qmsg_claim: bool = true,
         max_subject_filters: usize = 64,
+        expected_audiences: []const []const u8 = &.{},
+        require_audience: bool = false,
+        expected_purposes: []const []const u8 = &.{},
+        require_purpose: bool = false,
     };
 
     pub fn fromClaimsJson(
@@ -178,28 +187,44 @@ pub const Authorization = struct {
 
         const subject_value = requiredString(obj, "sub") catch return Error.InvalidClaims;
         const issuer_value = requiredString(obj, "iss") catch return Error.InvalidClaims;
+        const audience_value = optionalString(obj, "aud") catch return Error.InvalidClaims;
         const token_id_value = optionalString(obj, "jti") catch return Error.InvalidClaims;
         const expires_at = if (obj.get("exp")) |exp|
             parseUnixMs(exp) catch return Error.InvalidClaims
         else
             null;
+        try validateExpectedOptionalString(audience_value, options.expected_audiences, options.require_audience);
 
         const qmsg_value = obj.get("qmsg") orelse {
             if (options.require_qmsg_claim) return Error.InvalidClaims;
+            try validateExpectedOptionalString(null, options.expected_purposes, options.require_purpose);
             return try (Authorization{
                 .subject = subject_value,
                 .issuer = issuer_value,
+                .audience = audience_value,
                 .token_id = token_id_value,
                 .expires_at_unix_ms = expires_at,
             }).clone(allocator);
         };
         if (qmsg_value != .object) return Error.InvalidClaims;
         const qmsg_obj = qmsg_value.object;
+        const purpose_value = optionalString(qmsg_obj, "purpose") catch return Error.InvalidClaims;
+        try validateExpectedOptionalString(purpose_value, options.expected_purposes, options.require_purpose);
 
         const subject_copy = try allocator.dupe(u8, subject_value);
         errdefer allocator.free(subject_copy);
         const issuer_copy = try allocator.dupe(u8, issuer_value);
         errdefer allocator.free(issuer_copy);
+        const audience_copy = if (audience_value) |audience|
+            try allocator.dupe(u8, audience)
+        else
+            null;
+        errdefer if (audience_copy) |audience| allocator.free(audience);
+        const purpose_copy = if (purpose_value) |purpose|
+            try allocator.dupe(u8, purpose)
+        else
+            null;
+        errdefer if (purpose_copy) |purpose| allocator.free(purpose);
         const token_id_copy = if (token_id_value) |token_id|
             try allocator.dupe(u8, token_id)
         else
@@ -214,6 +239,8 @@ pub const Authorization = struct {
         var authz = Authorization{
             .subject = subject_copy,
             .issuer = issuer_copy,
+            .audience = audience_copy,
+            .purpose = purpose_copy,
             .token_id = token_id_copy,
             .allowed_patterns = try parsePatterns(qmsg_obj.get("patterns") orelse return Error.InvalidClaims),
             .allowed_subjects = subject_policy,
@@ -233,6 +260,18 @@ pub const Authorization = struct {
         const issuer_copy = try allocator.dupe(u8, self.issuer);
         errdefer allocator.free(issuer_copy);
 
+        const audience_copy = if (self.audience) |audience|
+            try allocator.dupe(u8, audience)
+        else
+            null;
+        errdefer if (audience_copy) |audience| allocator.free(audience);
+
+        const purpose_copy = if (self.purpose) |purpose|
+            try allocator.dupe(u8, purpose)
+        else
+            null;
+        errdefer if (purpose_copy) |purpose| allocator.free(purpose);
+
         const token_id_copy = if (self.token_id) |token_id|
             try allocator.dupe(u8, token_id)
         else
@@ -245,6 +284,8 @@ pub const Authorization = struct {
         return .{
             .subject = subject_copy,
             .issuer = issuer_copy,
+            .audience = audience_copy,
+            .purpose = purpose_copy,
             .token_id = token_id_copy,
             .allowed_patterns = self.allowed_patterns,
             .allowed_subjects = subject_policy_copy,
@@ -257,6 +298,8 @@ pub const Authorization = struct {
     pub fn deinit(self: *Authorization, allocator: std.mem.Allocator) void {
         allocator.free(self.subject);
         allocator.free(self.issuer);
+        if (self.audience) |audience| allocator.free(audience);
+        if (self.purpose) |purpose| allocator.free(purpose);
         if (self.token_id) |token_id| allocator.free(token_id);
         self.allowed_subjects.deinit(allocator);
         self.* = .{
@@ -323,6 +366,32 @@ pub const Credential = struct {
 };
 
 pub const hello_auth_scheme_paseto = "paseto";
+pub const hello_auth_purpose = "hello";
+pub const hello_implicit_assertion_prefix = "qmsg/hello-auth/v1";
+
+pub const HelloAuthContext = struct {
+    protocol: []const u8 = "qmsg/1",
+    purpose: []const u8 = hello_auth_purpose,
+    audience: []const u8 = "",
+    listener_id: []const u8 = "",
+    authority: []const u8 = "",
+    challenge: []const u8 = &.{},
+};
+
+pub const HelloBindingPolicy = struct {
+    context: ?HelloAuthContext = null,
+    require_challenge: bool = false,
+    max_challenge_bytes: usize = 128,
+
+    pub fn validate(self: HelloBindingPolicy) Error!void {
+        const context = self.context orelse {
+            if (self.require_challenge) return Error.ChallengeRequired;
+            return;
+        };
+        if (context.challenge.len > self.max_challenge_bytes) return Error.ChallengeTooLarge;
+        if (self.require_challenge and context.challenge.len == 0) return Error.ChallengeRequired;
+    }
+};
 
 pub const HelloCredentials = struct {
     peer_id: []const u8 = "",
@@ -372,6 +441,47 @@ pub fn credentialFromHello(
     return credential;
 }
 
+pub fn allocHelloImplicitAssertion(
+    allocator: std.mem.Allocator,
+    context: HelloAuthContext,
+) ![]u8 {
+    var bytes = std.ArrayList(u8).empty;
+    errdefer bytes.deinit(allocator);
+
+    try appendAssertionPart(allocator, &bytes, "format", hello_implicit_assertion_prefix);
+    try appendAssertionPart(allocator, &bytes, "protocol", context.protocol);
+    try appendAssertionPart(allocator, &bytes, "purpose", context.purpose);
+    try appendAssertionPart(allocator, &bytes, "audience", context.audience);
+    try appendAssertionPart(allocator, &bytes, "listener", context.listener_id);
+    try appendAssertionPart(allocator, &bytes, "authority", context.authority);
+    try appendAssertionPart(allocator, &bytes, "challenge", context.challenge);
+    return try bytes.toOwnedSlice(allocator);
+}
+
+fn appendAssertionPart(
+    allocator: std.mem.Allocator,
+    bytes: *std.ArrayList(u8),
+    label: []const u8,
+    value: []const u8,
+) !void {
+    try appendAssertionLen(allocator, bytes, label.len);
+    try bytes.appendSlice(allocator, label);
+    try appendAssertionLen(allocator, bytes, value.len);
+    try bytes.appendSlice(allocator, value);
+}
+
+fn appendAssertionLen(
+    allocator: std.mem.Allocator,
+    bytes: *std.ArrayList(u8),
+    len: usize,
+) !void {
+    const as_u32 = std.math.cast(u32, len) orelse return Error.InvalidClaims;
+    try bytes.append(allocator, @intCast((as_u32 >> 24) & 0xff));
+    try bytes.append(allocator, @intCast((as_u32 >> 16) & 0xff));
+    try bytes.append(allocator, @intCast((as_u32 >> 8) & 0xff));
+    try bytes.append(allocator, @intCast(as_u32 & 0xff));
+}
+
 pub const ReplayEntry = struct {
     issuer: []const u8,
     token_id: []const u8,
@@ -387,22 +497,50 @@ pub const ReplayCache = struct {
     }
 };
 
+pub const ReplayPolicy = struct {
+    require_expiration: bool = true,
+    now_unix_ms: ?i64 = null,
+    clock_skew_ms: u64 = 0,
+
+    pub fn validate(self: ReplayPolicy, authorization: Authorization) Error!void {
+        if (authorization.token_id == null) return Error.InvalidClaims;
+        if (authorization.expires_at_unix_ms == null and self.require_expiration) return Error.InvalidClaims;
+        if (self.now_unix_ms) |now| {
+            if (authorization.isExpired(now, self.clock_skew_ms)) return Error.CredentialExpired;
+        }
+    }
+};
+
 pub const AuthConfig = struct {
     paseto: PasetoOptions = .{},
     required: bool = false,
     max_token_bytes: usize = 4096,
+    max_implicit_assertion_bytes: usize = 1024,
     max_clock_skew_ms: u64 = 30_000,
     authenticator: ?Authenticator = null,
     replay_cache: ?ReplayCache = null,
     allow_anonymous_subjects: []const []const u8 = &.{},
+    hello_binding: HelloBindingPolicy = .{},
+    expected_audiences: []const []const u8 = &.{},
+    require_audience: bool = false,
+    expected_purposes: []const []const u8 = &.{},
+    require_purpose: bool = false,
 
     pub fn validateCredentialSize(self: AuthConfig, credential: Credential) Error!void {
         if (credential.token.len > self.max_token_bytes) return Error.TokenTooLarge;
+        if (credential.implicit_assertion.len > self.max_implicit_assertion_bytes) {
+            return Error.ImplicitAssertionTooLarge;
+        }
     }
 
     pub fn allowsAnonymousSubject(self: AuthConfig, candidate: []const u8) bool {
         if (self.allow_anonymous_subjects.len == 0) return !self.required;
         return (SubjectPolicy{ .filters = self.allow_anonymous_subjects }).allows(candidate);
+    }
+
+    pub fn validateAuthorization(self: AuthConfig, authorization: Authorization) Error!void {
+        try validateExpectedOptionalString(authorization.audience, self.expected_audiences, self.require_audience);
+        try validateExpectedOptionalString(authorization.purpose, self.expected_purposes, self.require_purpose);
     }
 };
 
@@ -482,6 +620,23 @@ fn optionalString(obj: std.json.ObjectMap, name: []const u8) !?[]const u8 {
     if (value == .null) return null;
     if (value != .string) return Error.InvalidClaims;
     return value.string;
+}
+
+fn validateExpectedOptionalString(
+    actual: ?[]const u8,
+    expected: []const []const u8,
+    required: bool,
+) Error!void {
+    if (actual == null) {
+        if (required or expected.len != 0) return Error.InvalidClaims;
+        return;
+    }
+
+    if (expected.len == 0) return;
+    for (expected) |candidate| {
+        if (std.mem.eql(u8, actual.?, candidate)) return;
+    }
+    return Error.InvalidClaims;
 }
 
 fn parsePatterns(value: std.json.Value) !PatternSet {
@@ -781,6 +936,7 @@ test "Authorization parses qmsg claim block" {
         \\  "exp":"2026-06-01T00:00:00Z",
         \\  "jti":"token-1",
         \\  "qmsg":{
+        \\    "purpose":"hello",
         \\    "patterns":["rep","pull"],
         \\    "subjects":["jobs.image.*","presence.>"],
         \\    "datagram":true,
@@ -794,6 +950,8 @@ test "Authorization parses qmsg claim block" {
 
     try std.testing.expectEqualStrings("service:image-worker", authorization.subject);
     try std.testing.expectEqualStrings("auth.example", authorization.issuer);
+    try std.testing.expectEqualStrings("qmsg://jobs.example", authorization.audience.?);
+    try std.testing.expectEqualStrings(hello_auth_purpose, authorization.purpose.?);
     try std.testing.expectEqualStrings("token-1", authorization.token_id.?);
     try std.testing.expect(authorization.allowsPattern(.rep));
     try std.testing.expect(!authorization.allowsPattern(.@"pub"));
@@ -821,17 +979,92 @@ test "Authorization rejects malformed qmsg claims" {
     );
 }
 
+test "Authorization enforces configured audience and purpose policy" {
+    const allocator = std.testing.allocator;
+    const claims =
+        \\{
+        \\  "iss":"auth",
+        \\  "sub":"service",
+        \\  "aud":"qmsg://jobs.example",
+        \\  "qmsg":{"purpose":"hello","patterns":["pair"]}
+        \\}
+    ;
+    const audiences = [_][]const u8{"qmsg://jobs.example"};
+    const purposes = [_][]const u8{hello_auth_purpose};
+
+    var authorization = try Authorization.fromClaimsJson(allocator, claims, .{
+        .expected_audiences = &audiences,
+        .expected_purposes = &purposes,
+    });
+    defer authorization.deinit(allocator);
+
+    const wrong_audiences = [_][]const u8{"qmsg://other.example"};
+    try std.testing.expectError(
+        Error.InvalidClaims,
+        Authorization.fromClaimsJson(allocator, claims, .{ .expected_audiences = &wrong_audiences }),
+    );
+    try std.testing.expectError(
+        Error.InvalidClaims,
+        Authorization.fromClaimsJson(
+            allocator,
+            "{\"iss\":\"auth\",\"sub\":\"service\",\"qmsg\":{\"patterns\":[\"pair\"]}}",
+            .{ .require_audience = true, .require_purpose = true },
+        ),
+    );
+}
+
 test "AuthConfig bounds token size and anonymous subject filters" {
     const config = AuthConfig{
         .required = true,
         .max_token_bytes = 4,
+        .max_implicit_assertion_bytes = 4,
         .allow_anonymous_subjects = &.{"health.*"},
     };
 
     try config.validateCredentialSize(.{ .token = "1234" });
     try std.testing.expectError(Error.TokenTooLarge, config.validateCredentialSize(.{ .token = "12345" }));
+    try std.testing.expectError(
+        Error.ImplicitAssertionTooLarge,
+        config.validateCredentialSize(.{ .token = "1234", .implicit_assertion = "12345" }),
+    );
     try std.testing.expect(config.allowsAnonymousSubject("health.ping"));
     try std.testing.expect(!config.allowsAnonymousSubject("admin.delete"));
+}
+
+test "HELLO implicit assertion encodes challenge-bound context" {
+    const allocator = std.testing.allocator;
+
+    const first = try allocHelloImplicitAssertion(allocator, .{
+        .audience = "qmsg://jobs.example",
+        .authority = "jobs.example:443",
+        .listener_id = "listener-a",
+        .challenge = "nonce-1",
+    });
+    defer allocator.free(first);
+
+    const second = try allocHelloImplicitAssertion(allocator, .{
+        .audience = "qmsg://jobs.example",
+        .authority = "jobs.example:443",
+        .listener_id = "listener-a",
+        .challenge = "nonce-2",
+    });
+    defer allocator.free(second);
+
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(std.mem.indexOf(u8, first, hello_implicit_assertion_prefix) != null);
+
+    try (HelloBindingPolicy{
+        .context = .{ .challenge = "nonce-1" },
+        .require_challenge = true,
+    }).validate();
+    try std.testing.expectError(Error.ChallengeRequired, (HelloBindingPolicy{ .require_challenge = true }).validate());
+    try std.testing.expectError(
+        Error.ChallengeTooLarge,
+        (HelloBindingPolicy{
+            .context = .{ .challenge = "12345" },
+            .max_challenge_bytes = 4,
+        }).validate(),
+    );
 }
 
 test "Hello credentials map to generic credentials and fail closed" {

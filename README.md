@@ -27,18 +27,22 @@ tranches are building around:
   `CREDIT` control-frame encoding;
 - `protocol.pubsub` and `protocol.pushpull` helpers for subscription and
   credit accounting;
-- `transport.quic` for the qmsg-owned QUIC options/session/control-HELLO
-  skeleton over `quic-zig`;
+- `transport.quic`, `transport.quic_runtime`, `transport.quic_streams`,
+  `transport.quic_cancel`, and `transport.quic_datagram` for the qmsg-owned
+  QUIC options, runtime, stream, cancellation, and datagram surfaces over
+  `quic-zig`;
 - `App`, `Context`, and `Session`.
 
 The inproc socket examples build and run against the current public API. The
 App facade can now serve inproc REP routes through `runOnce`, and can prepare
 QUIC listener/session placeholders for lifecycle plumbing. QUIC currently has
 a compiled `quic-zig` dependency, option wrappers, transport-parameter
-mapping, qmsg control-stream HELLO/session tests, and a hermetic quic-zig
-handshake test in progress. Real UDP QUIC listen/dial loops, reliable-message
-mapping over QUIC streams, datagram delivery, and qmsg-server/qmsg-client
-smoke binaries are still future work.
+mapping, socket-free runtime wrappers around `quic_zig.Server`/`Client`,
+incremental control/reliable stream pumps, cancellation/error mapping,
+compact DATAGRAM envelope helpers, and hermetic tests that drive quic-zig
+handshake, qmsg HELLO, and reliable req/rep over QUIC streams. Node-owned UDP
+sockets, public socket pattern APIs over QUIC, and split `qmsg-server` /
+`qmsg-client` binaries are still future work.
 
 ## Package Use
 
@@ -148,6 +152,20 @@ pub fn main() !void {
 See [examples/app_ergonomics.zig](examples/app_ergonomics.zig) for the current
 facade handler shape over inproc req/rep.
 
+## QUIC Runtime Smoke
+
+The current QUIC smoke example is intentionally one process: it drives
+`quic_zig.Client` and `quic_zig.Server` through qmsg's runtime wrappers, then
+exchanges qmsg HELLO and one reliable req/rep stream.
+
+```sh
+zig build examples
+./zig-out/bin/quic-runtime-reqrep
+```
+
+That path proves the qmsg protocol mapping without opening OS UDP sockets yet.
+Separate server/client binaries should land with the Node-owned UDP event loop.
+
 ## Design Tenets
 
 - QUIC-native, not HTTP-shaped.
@@ -203,7 +221,7 @@ zig build examples
 
 For internet-facing QUIC builds, follow `quic-zig`'s production posture and
 use `ReleaseSafe`; the current qmsg QUIC surface is still a skeleton and is not
-yet a production listener/dialer.
+yet a production listener/dialer with public socket APIs.
 
 ## Repository Notes
 

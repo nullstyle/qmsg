@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const control = @import("../control.zig");
 const queue = @import("../queue.zig");
 const subject_mod = @import("../subject.zig");
 
@@ -9,6 +10,53 @@ pub const Match = struct {
     peer_id: PeerId,
     queue_options: queue.QueueOptions,
 };
+
+pub const ApplyResult = enum {
+    subscribed,
+    duplicate,
+    unsubscribed,
+    not_subscribed,
+};
+
+pub fn emitSubscribe(sink: control.Sink, filter: []const u8, options: queue.QueueOptions) !void {
+    const frame: control.Frame = .{ .subscribe = .{
+        .filter = filter,
+        .options = optionsFromQueue(options),
+    } };
+    try validateEmitFrame(frame);
+    try sink.emitFrame(frame);
+}
+
+pub fn emitUnsubscribe(sink: control.Sink, filter: []const u8) !void {
+    const frame: control.Frame = .{ .unsubscribe = .{
+        .filter = filter,
+    } };
+    try validateEmitFrame(frame);
+    try sink.emitFrame(frame);
+}
+
+pub fn optionsFromQueue(options: queue.QueueOptions) u64 {
+    return switch (options.on_full) {
+        .block => 0,
+        .fail => 1,
+        .drop_oldest => 2,
+        .drop_newest => 3,
+    };
+}
+
+pub fn queueFromOptions(control_options: u64, defaults: queue.QueueOptions) !queue.QueueOptions {
+    if ((control_options & ~@as(u64, 0x3)) != 0) return error.InvalidControlFrame;
+
+    var options = defaults;
+    options.on_full = switch (control_options & 0x3) {
+        0 => .block,
+        1 => .fail,
+        2 => .drop_oldest,
+        3 => .drop_newest,
+        else => unreachable,
+    };
+    return options;
+}
 
 pub const SubscriptionSet = struct {
     allocator: std.mem.Allocator,
@@ -36,9 +84,7 @@ pub const SubscriptionSet = struct {
     }
 
     pub fn add(self: *SubscriptionSet, filter: []const u8) !bool {
-        for (self.entries.items) |entry| {
-            if (std.mem.eql(u8, entry.filter.text, filter)) return false;
-        }
+        if (self.contains(filter)) return false;
 
         var owned = try subject_mod.Filter.init(self.allocator, filter);
         errdefer owned.deinit();
@@ -52,6 +98,15 @@ pub const SubscriptionSet = struct {
         return true;
     }
 
+    pub fn addAndEmit(self: *SubscriptionSet, sink: control.Sink, filter: []const u8, options: queue.QueueOptions) !bool {
+        const added = try self.add(filter);
+        if (!added) return false;
+        errdefer _ = self.remove(filter);
+
+        try emitSubscribe(sink, filter, options);
+        return true;
+    }
+
     pub fn remove(self: *SubscriptionSet, filter: []const u8) bool {
         for (self.entries.items, 0..) |entry, index| {
             if (!std.mem.eql(u8, entry.filter.text, filter)) continue;
@@ -59,6 +114,20 @@ pub const SubscriptionSet = struct {
             var removed = self.entries.orderedRemove(index);
             removed.filter.deinit();
             return true;
+        }
+        return false;
+    }
+
+    pub fn removeAndEmit(self: *SubscriptionSet, sink: control.Sink, filter: []const u8) !bool {
+        if (!self.contains(filter)) return false;
+
+        try emitUnsubscribe(sink, filter);
+        return self.remove(filter);
+    }
+
+    pub fn contains(self: SubscriptionSet, filter: []const u8) bool {
+        for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.filter.text, filter)) return true;
         }
         return false;
     }
@@ -131,13 +200,42 @@ pub const Registry = struct {
     }
 
     pub fn subscribe(self: *Registry, peer_id: PeerId, filter: []const u8, options: queue.QueueOptions) !bool {
+        try validateFilter(self.allocator, filter);
+
+        if (self.findPeer(peer_id)) |peer| {
+            if (peer.subscriptions.contains(filter)) return false;
+            peer.queue_options = options;
+            return try peer.subscriptions.add(filter);
+        }
+
         try self.addPeer(peer_id, options);
+        errdefer _ = self.removePeer(peer_id);
         return try self.findPeer(peer_id).?.subscriptions.add(filter);
     }
 
     pub fn unsubscribe(self: *Registry, peer_id: PeerId, filter: []const u8) bool {
         const peer = self.findPeer(peer_id) orelse return false;
         return peer.subscriptions.remove(filter);
+    }
+
+    pub fn applyControlFrame(self: *Registry, peer_id: PeerId, frame: control.Frame, defaults: queue.QueueOptions) !ApplyResult {
+        return switch (frame) {
+            .subscribe => |subscribe_frame| {
+                const options = try queueFromOptions(subscribe_frame.options, defaults);
+                if (try self.subscribe(peer_id, subscribe_frame.filter, options)) {
+                    return .subscribed;
+                }
+                return .duplicate;
+            },
+            .unsubscribe => |unsubscribe_frame| {
+                try validateFilter(self.allocator, unsubscribe_frame.filter);
+                if (self.unsubscribe(peer_id, unsubscribe_frame.filter)) {
+                    return .unsubscribed;
+                }
+                return .not_subscribed;
+            },
+            else => error.UnexpectedFrame,
+        };
     }
 
     pub fn matches(self: Registry, peer_id: PeerId, subject: []const u8) bool {
@@ -180,6 +278,62 @@ pub const Registry = struct {
     }
 };
 
+fn validateFilter(allocator: std.mem.Allocator, filter: []const u8) !void {
+    var parsed = try subject_mod.Filter.init(allocator, filter);
+    parsed.deinit();
+}
+
+fn validateEmitFrame(frame: control.Frame) !void {
+    _ = try control.encodedSize(frame, .{
+        .max_frame_size = std.math.maxInt(usize),
+        .max_filter_len = std.math.maxInt(usize),
+    });
+}
+
+const RecordingSink = struct {
+    allocator: std.mem.Allocator,
+    frames: std.ArrayList(control.Frame) = .empty,
+
+    fn init(allocator: std.mem.Allocator) RecordingSink {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *RecordingSink) void {
+        for (self.frames.items) |*frame| {
+            frame.deinit();
+        }
+        self.frames.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn sink(self: *RecordingSink) control.Sink {
+        return .{
+            .context = @ptrCast(self),
+            .emit = emit,
+        };
+    }
+
+    fn emit(context: *anyopaque, frame: control.Frame) anyerror!void {
+        const self: *RecordingSink = @ptrCast(@alignCast(context));
+        try self.frames.append(self.allocator, try cloneFrame(self.allocator, frame));
+    }
+
+    fn cloneFrame(allocator: std.mem.Allocator, frame: control.Frame) !control.Frame {
+        return switch (frame) {
+            .subscribe => |subscribe| .{ .subscribe = .{
+                .allocator = allocator,
+                .filter = try allocator.dupe(u8, subscribe.filter),
+                .options = subscribe.options,
+            } },
+            .unsubscribe => |unsubscribe| .{ .unsubscribe = .{
+                .allocator = allocator,
+                .filter = try allocator.dupe(u8, unsubscribe.filter),
+            } },
+            else => error.UnexpectedFrame,
+        };
+    }
+};
+
 test "subscription set validates filters before enforcing capacity" {
     const allocator = std.testing.allocator;
     var set = SubscriptionSet.init(allocator, 0);
@@ -187,6 +341,32 @@ test "subscription set validates filters before enforcing capacity" {
 
     try std.testing.expectError(error.InvalidSubjectFilter, set.add("metrics*"));
     try std.testing.expectError(error.QueueFull, set.add("metrics.*"));
+}
+
+test "subscription set emits only effective local changes" {
+    const allocator = std.testing.allocator;
+
+    var sink = RecordingSink.init(allocator);
+    defer sink.deinit();
+
+    var set = SubscriptionSet.init(allocator, 8);
+    defer set.deinit();
+
+    try std.testing.expect(try set.addAndEmit(sink.sink(), "metrics.*", .{ .on_full = .drop_oldest }));
+    try std.testing.expect(!try set.addAndEmit(sink.sink(), "metrics.*", .{ .on_full = .fail }));
+    try std.testing.expect(try set.addAndEmit(sink.sink(), "presence.>", .{ .on_full = .drop_newest }));
+    try std.testing.expect(try set.removeAndEmit(sink.sink(), "metrics.*"));
+    try std.testing.expect(!try set.removeAndEmit(sink.sink(), "missing.*"));
+
+    try std.testing.expectEqual(@as(usize, 3), sink.frames.items.len);
+    try std.testing.expectEqual(control.Tag.subscribe, std.meta.activeTag(sink.frames.items[0]));
+    try std.testing.expectEqualStrings("metrics.*", sink.frames.items[0].subscribe.filter);
+    try std.testing.expectEqual(optionsFromQueue(.{ .on_full = .drop_oldest }), sink.frames.items[0].subscribe.options);
+    try std.testing.expectEqual(control.Tag.subscribe, std.meta.activeTag(sink.frames.items[1]));
+    try std.testing.expectEqualStrings("presence.>", sink.frames.items[1].subscribe.filter);
+    try std.testing.expectEqual(optionsFromQueue(.{ .on_full = .drop_newest }), sink.frames.items[1].subscribe.options);
+    try std.testing.expectEqual(control.Tag.unsubscribe, std.meta.activeTag(sink.frames.items[2]));
+    try std.testing.expectEqualStrings("metrics.*", sink.frames.items[2].unsubscribe.filter);
 }
 
 test "registry stores subscriptions per peer and matches at source" {
@@ -216,6 +396,59 @@ test "registry stores subscriptions per peer and matches at source" {
     try std.testing.expect(registry.unsubscribe(20, "metrics.cpu"));
     try std.testing.expect(!registry.matches(20, "metrics.cpu"));
     try std.testing.expectEqual(@as(usize, 0), registry.subscriptionCount(20));
+}
+
+test "registry applies subscription control frames idempotently" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    try std.testing.expectEqual(ApplyResult.subscribed, try registry.applyControlFrame(42, .{ .subscribe = .{
+        .filter = "metrics.*",
+        .options = optionsFromQueue(.{ .on_full = .drop_newest }),
+    } }, .{}));
+    try std.testing.expectEqual(ApplyResult.duplicate, try registry.applyControlFrame(42, .{ .subscribe = .{
+        .filter = "metrics.*",
+        .options = optionsFromQueue(.{ .on_full = .fail }),
+    } }, .{}));
+    try std.testing.expectEqual(@as(usize, 1), registry.subscriptionCount(42));
+
+    var matches: std.ArrayList(Match) = .empty;
+    defer matches.deinit(allocator);
+    try registry.collectMatches("metrics.cpu", &matches);
+    try std.testing.expectEqual(@as(usize, 1), matches.items.len);
+    try std.testing.expectEqual(queue.OnFull.drop_newest, matches.items[0].queue_options.on_full);
+
+    try std.testing.expectEqual(ApplyResult.unsubscribed, try registry.applyControlFrame(42, .{ .unsubscribe = .{
+        .filter = "metrics.*",
+    } }, .{}));
+    try std.testing.expectEqual(ApplyResult.not_subscribed, try registry.applyControlFrame(42, .{ .unsubscribe = .{
+        .filter = "metrics.*",
+    } }, .{}));
+}
+
+test "registry rejects invalid subscription control without mutating state" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    try std.testing.expectError(error.InvalidControlFrame, registry.applyControlFrame(7, .{ .subscribe = .{
+        .filter = "metrics.*",
+        .options = 4,
+    } }, .{}));
+    try std.testing.expectEqual(@as(usize, 0), registry.peerCount());
+
+    try std.testing.expectError(error.InvalidSubjectFilter, registry.applyControlFrame(7, .{ .subscribe = .{
+        .filter = "metrics*",
+        .options = 0,
+    } }, .{}));
+    try std.testing.expectEqual(@as(usize, 0), registry.peerCount());
+
+    try std.testing.expectError(error.UnexpectedFrame, registry.applyControlFrame(7, .{ .credit = .{
+        .subject_filter = "metrics.*",
+        .messages = 1,
+        .bytes = 1,
+    } }, .{}));
 }
 
 test "registry keeps peer order stable for deterministic fanout" {

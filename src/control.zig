@@ -165,6 +165,17 @@ pub const Frame = union(Tag) {
     }
 };
 
+pub const Sink = struct {
+    context: *anyopaque,
+    emit: *const fn (context: *anyopaque, frame: Frame) anyerror!void,
+
+    /// Emits a borrowed frame. Implementations must encode or copy any slices
+    /// they need before returning.
+    pub fn emitFrame(self: Sink, frame: Frame) !void {
+        try self.emit(self.context, frame);
+    }
+};
+
 pub fn encodedSize(frame: Frame, options: CodecOptions) !usize {
     try validateFrame(frame, options);
 

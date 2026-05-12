@@ -4,6 +4,8 @@ const quic_zig = @import("quic_zig");
 const control = @import("control.zig");
 const message = @import("message.zig");
 const quic = @import("transport/quic.zig");
+const quic_runtime = @import("transport/quic_runtime.zig");
+const quic_streams = @import("transport/quic_streams.zig");
 
 const test_cert_pem = @embedFile("testdata/test_cert.pem");
 const test_key_pem = @embedFile("testdata/test_key.pem");
@@ -50,6 +52,72 @@ fn pumpServerToClient(
         }
     }
     return n;
+}
+
+fn pumpRuntimeClientToServer(
+    client: *quic_runtime.ClientRuntime,
+    listener: *quic_runtime.ListenerRuntime,
+    rx: []u8,
+    client_addr: quic_runtime.Address,
+    now_us: u64,
+) !usize {
+    var n: usize = 0;
+    while (try client.drainOutbound(rx, now_us)) |out| {
+        _ = try listener.feedInbound(.{
+            .bytes = rx[0..out.len],
+            .from = client_addr,
+        }, now_us);
+        n += 1;
+    }
+    return n;
+}
+
+fn pumpRuntimeServerToClient(
+    listener: *quic_runtime.ListenerRuntime,
+    client: *quic_runtime.ClientRuntime,
+    rx: []u8,
+    now_us: u64,
+) !usize {
+    var n: usize = 0;
+    while (try listener.drainOutbound(rx, now_us)) |out| {
+        try client.feedInbound(.{
+            .bytes = rx[0..out.len],
+            .from = null,
+        }, now_us);
+        n += 1;
+    }
+    return n;
+}
+
+fn driveRuntime(
+    client: *quic_runtime.ClientRuntime,
+    listener: *quic_runtime.ListenerRuntime,
+    rx: []u8,
+    client_addr: quic_runtime.Address,
+    now_us: u64,
+) !void {
+    _ = try pumpRuntimeClientToServer(client, listener, rx, client_addr, now_us);
+    _ = try pumpRuntimeServerToClient(listener, client, rx, now_us);
+    try listener.tick(now_us);
+    try client.tick(now_us);
+}
+
+fn driveRuntimeReady(
+    client: *quic_runtime.ClientRuntime,
+    listener: *quic_runtime.ListenerRuntime,
+) !void {
+    var rx: [8192]u8 = undefined;
+    const client_addr: quic_runtime.Address = .{ .bytes = @splat(0x61) };
+
+    var step: u32 = 0;
+    while (step < 32) : (step += 1) {
+        const now_us: u64 = @as(u64, step + 1) * 1_000;
+        try driveRuntime(client, listener, &rx, client_addr, now_us);
+        if (client.connection().handshakeDone() and listener.connectionCount() > 0 and
+            listener.connection(0).?.handshakeDone()) return;
+    }
+
+    return error.WouldBlock;
 }
 
 fn driveHermeticQuicReady(
@@ -431,4 +499,126 @@ test "reliable message helper correlates req rep over one hermetic QUIC stream" 
     try correlation.expectReply(stream_id, reply);
     try std.testing.expectEqualStrings("user.get", reply.subject);
     try std.testing.expectEqualStrings("Alice Example", reply.body);
+}
+
+test "runtime wrappers drive qmsg HELLO and reliable req rep with stream adapter" {
+    const allocator = std.testing.allocator;
+
+    var listener = try quic_runtime.ListenerRuntime.init(allocator, "127.0.0.1:4433", .{
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .transport = .{
+            .peer_id = "server-runtime",
+            .role_flags = control.RoleFlags.server,
+            .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+        },
+    });
+    defer listener.deinit();
+
+    var client = try quic_runtime.ClientRuntime.init(allocator, "127.0.0.1:4433", .{
+        .server_name = "localhost",
+        .transport = .{
+            .peer_id = "client-runtime",
+            .role_flags = control.RoleFlags.client,
+            .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+        },
+    });
+    defer client.deinit();
+
+    try driveRuntimeReady(&client, &listener);
+    try std.testing.expectEqual(@as(usize, 1), listener.connectionCount());
+
+    var client_session = try quic.QuicSession.init(allocator, 30, .client, .{
+        .peer_id = "client-runtime",
+        .role_flags = control.RoleFlags.client,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    });
+    defer client_session.deinit();
+
+    var server_session = try quic.QuicSession.init(allocator, 31, .server, .{
+        .peer_id = "server-runtime",
+        .role_flags = control.RoleFlags.server,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    });
+    defer server_session.deinit();
+
+    try client_session.onQuicReady();
+    try server_session.onQuicReady();
+
+    var rx: [8192]u8 = undefined;
+    const client_addr: quic_runtime.Address = .{ .bytes = @splat(0x62) };
+
+    _ = try client_session.sendLocalHelloOnStream(client.connection());
+    try driveRuntime(&client, &listener, &rx, client_addr, 100_000);
+    try server_session.acceptPeerControlFromStream(listener.connection(0).?, quic.peerControlStreamId(.server), 64 * 1024);
+
+    _ = try server_session.sendLocalHelloOnStream(listener.connection(0).?);
+    try driveRuntime(&client, &listener, &rx, client_addr, 101_000);
+    try client_session.acceptPeerControlFromStream(client.connection(), quic.peerControlStreamId(.client), 64 * 1024);
+
+    try std.testing.expectEqual(quic.State.ready, client_session.state());
+    try std.testing.expectEqual(quic.State.ready, server_session.state());
+
+    var client_adapter = quic_streams.QuicConnectionAdapter.init(client.connection());
+    var server_adapter = quic_streams.QuicConnectionAdapter.init(listener.connection(0).?);
+    var client_ids = quic_streams.StreamIdAllocator.init(.client);
+    const stream_id = try client_ids.nextBidi();
+    const request_out: message.OutgoingMessage = .{
+        .subject = "user.get",
+        .id = 9001,
+        .deadline_ms = 1_000,
+        .body = "ada",
+    };
+    const correlation = try quic_streams.requestCorrelation(stream_id, request_out);
+
+    var request_sender = try quic_streams.ReliableMessageSender.init(allocator, stream_id, request_out, .{}, .{});
+    defer request_sender.deinit();
+
+    var server_receiver = quic_streams.ReliableMessageReceiver.init(allocator, stream_id, .{});
+    defer server_receiver.deinit();
+
+    var got_request: ?message.Message = null;
+    var step: u32 = 0;
+    while (step < 20_000 and got_request == null) : (step += 1) {
+        _ = try request_sender.pump(&client_adapter);
+        try driveRuntime(&client, &listener, &rx, client_addr, 200_000 + @as(u64, step) * 1_000);
+
+        if (listener.connection(0).?.stream(stream_id) != null) {
+            got_request = try server_receiver.pump(&server_adapter);
+        }
+    }
+    var request = got_request orelse return error.WouldBlock;
+    defer request.deinit();
+
+    try std.testing.expectEqual(@as(message.MessageId, 9001), request.id);
+    try std.testing.expectEqualStrings("user.get", request.subject);
+    try std.testing.expectEqualStrings("ada", request.body);
+
+    var reply_sender = try quic_streams.ReliableMessageSender.init(allocator, stream_id, .{
+        .subject = request.subject,
+        .id = request.id,
+        .flags = .{ .final = true },
+        .body = "Ada Lovelace",
+    }, .{}, .{ .open_bidi = false });
+    defer reply_sender.deinit();
+
+    var client_receiver = quic_streams.ReliableMessageReceiver.init(allocator, stream_id, .{});
+    defer client_receiver.deinit();
+
+    var got_reply: ?message.Message = null;
+    step = 0;
+    while (step < 20_000 and got_reply == null) : (step += 1) {
+        _ = try reply_sender.pump(&server_adapter);
+        try driveRuntime(&client, &listener, &rx, client_addr, 300_000 + @as(u64, step) * 1_000);
+
+        if (client.connection().stream(stream_id) != null) {
+            got_reply = try client_receiver.pump(&client_adapter);
+        }
+    }
+    var reply = got_reply orelse return error.WouldBlock;
+    defer reply.deinit();
+
+    try correlation.expectReply(stream_id, reply);
+    try std.testing.expectEqualStrings("user.get", reply.subject);
+    try std.testing.expectEqualStrings("Ada Lovelace", reply.body);
 }

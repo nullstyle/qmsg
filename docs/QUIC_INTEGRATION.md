@@ -30,7 +30,8 @@ loop without requiring an extra app thread.
 ## Current qmsg Status
 
 The repository already has the local `quic_zig` dependency wired through
-`build.zig.zon` and `build.zig`. `src/transport/quic.zig` currently owns:
+`build.zig.zon` and `build.zig`. The current QUIC implementation is split
+across qmsg-owned transport modules:
 
 - qmsg ALPN validation for `qmsg/1`;
 - `QuicOptions`, `QuicListener`, `QuicDialer`, and `QuicSession` wrappers;
@@ -39,14 +40,20 @@ The repository already has the local `quic_zig` dependency wired through
 - HELLO encode/decode and session readiness after QUIC readiness plus peer
   HELLO exchange;
 - `Node`/`App` lifecycle placeholders for QUIC listeners and sessions;
-- source-level hermetic quic-zig handshake coverage that marks qmsg sessions
-  QUIC-ready.
+- socket-free runtime wrappers for `quic_zig.Server` and `quic_zig.Client`;
+- reusable control-stream and reliable-message stream pumps with short-write
+  handling;
+- cancellation, close, and backpressure mapping helpers;
+- compact qmsg DATAGRAM envelope helpers and quic-zig send/receive adapters;
+- transport-agnostic SUBSCRIBE/UNSUBSCRIBE and CREDIT control helpers;
+- hermetic tests that drive quic-zig handshake, qmsg HELLO, pair-style
+  streams, and req/rep over a qmsg runtime wrapper;
+- a one-process `quic-runtime-reqrep` smoke example.
 
-This is still a skeleton. The runtime adapter does not yet own UDP sockets,
-drive `quic_zig.Server` or `quic_zig.Client` from `Node`, map qmsg messages
-onto QUIC streams, send QUIC DATAGRAM frames, expose working network
-`listenQuic`/`dialQuic`, or provide `qmsg-server` / `qmsg-client` smoke
-binaries.
+This is still not the final network transport. qmsg does not yet own OS UDP
+sockets in `Node`, expose public QUIC socket pattern APIs, dispatch App
+handlers over QUIC, send SUBSCRIBE/CREDIT over live control streams, or provide
+split `qmsg-server` / `qmsg-client` binaries.
 
 ## Build Integration
 

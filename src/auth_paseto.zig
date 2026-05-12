@@ -49,6 +49,7 @@ pub const AuthOptions = struct {
     verify: VerifyOptions = .{},
     claims: auth.Authorization.ClaimParseOptions = .{},
     replay_cache: ?auth.ReplayCache = null,
+    replay: auth.ReplayPolicy = .{},
 };
 
 pub const V4PublicAuthenticator = struct {
@@ -278,6 +279,7 @@ pub fn authenticateV4Public(
     errdefer authorization.deinit(allocator);
 
     if (options.replay_cache) |replay_cache| {
+        try options.replay.validate(authorization);
         const token_id = authorization.token_id orelse return auth.Error.InvalidClaims;
         try replay_cache.checkAndStore(.{
             .issuer = authorization.issuer,
@@ -408,6 +410,57 @@ test "verify v4 public token using PASERK ID footer and validator" {
     try std.testing.expect(key_id.eql(verified.key_id));
     try std.testing.expectEqualSlices(u8, &footer, verified.footer);
     try std.testing.expectEqualSlices(u8, claims, verified.claims);
+}
+
+test "verify v4 public token is bound to HELLO implicit assertion" {
+    const allocator = std.testing.allocator;
+    const key = try V4Public.fromSeed(&@as([32]u8, @splat(15)));
+    const key_id = try v4PublicKeyId(key);
+    const footer = key_id.toArray();
+    const entries = [_]PublicKeyEntry{.{ .key_id = key_id, .key = key }};
+    const static = StaticKeyStore{ .v4_public_keys = &entries };
+
+    const good_assertion = try auth.allocHelloImplicitAssertion(allocator, .{
+        .audience = "qmsg://jobs.example",
+        .authority = "jobs.example:443",
+        .listener_id = "listener-a",
+        .challenge = "nonce-1",
+    });
+    defer allocator.free(good_assertion);
+    const wrong_assertion = try auth.allocHelloImplicitAssertion(allocator, .{
+        .audience = "qmsg://jobs.example",
+        .authority = "jobs.example:443",
+        .listener_id = "listener-a",
+        .challenge = "nonce-2",
+    });
+    defer allocator.free(wrong_assertion);
+
+    const claims =
+        \\{"iss":"issuer.example","sub":"service:hello","aud":"qmsg://jobs.example","qmsg":{"purpose":"hello","patterns":["pair"]}}
+    ;
+    const token = try key.sign(allocator, claims, .{
+        .footer = &footer,
+        .implicit_assertion = good_assertion,
+    });
+    defer allocator.free(token);
+
+    var verified = try verifyV4Public(
+        allocator,
+        static.keyStore(),
+        .{ .token = token, .implicit_assertion = good_assertion },
+        .{},
+    );
+    defer verified.deinit();
+
+    try std.testing.expectError(
+        Error.InvalidSignature,
+        verifyV4Public(
+            allocator,
+            static.keyStore(),
+            .{ .token = token, .implicit_assertion = wrong_assertion },
+            .{},
+        ),
+    );
 }
 
 test "verify rejects missing unknown and mismatched key ids fail closed" {
@@ -542,6 +595,68 @@ test "authenticate maps qmsg claims into Authorization and checks replay cache" 
             },
         ),
     );
+}
+
+test "authenticate replay cache requires expiry and rejects expired entries before store" {
+    const allocator = std.testing.allocator;
+    const key = try V4Public.fromSeed(&@as([32]u8, @splat(33)));
+    const key_id = try v4PublicKeyId(key);
+    const footer = key_id.toArray();
+    const entries = [_]PublicKeyEntry{.{ .key_id = key_id, .key = key }};
+    const static = StaticKeyStore{ .v4_public_keys = &entries };
+
+    const Replay = struct {
+        calls: usize = 0,
+
+        fn checkAndStore(ptr: ?*anyopaque, _: auth.ReplayEntry) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+        }
+    };
+    var replay = Replay{};
+
+    const missing_exp_claims =
+        \\{"iss":"issuer.example","sub":"service","jti":"token-no-exp","qmsg":{"patterns":["pair"]}}
+    ;
+    const missing_exp_token = try key.sign(allocator, missing_exp_claims, .{ .footer = &footer });
+    defer allocator.free(missing_exp_token);
+    try std.testing.expectError(
+        auth.Error.InvalidClaims,
+        authenticateV4Public(
+            allocator,
+            static.keyStore(),
+            .{ .token = missing_exp_token },
+            .{
+                .replay_cache = .{
+                    .ptr = &replay,
+                    .check_and_store_fn = Replay.checkAndStore,
+                },
+            },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), replay.calls);
+
+    const expired_claims =
+        \\{"iss":"issuer.example","sub":"service","jti":"token-expired","exp":"2022-01-01T00:00:00Z","qmsg":{"patterns":["pair"]}}
+    ;
+    const expired_token = try key.sign(allocator, expired_claims, .{ .footer = &footer });
+    defer allocator.free(expired_token);
+    try std.testing.expectError(
+        auth.Error.CredentialExpired,
+        authenticateV4Public(
+            allocator,
+            static.keyStore(),
+            .{ .token = expired_token },
+            .{
+                .replay_cache = .{
+                    .ptr = &replay,
+                    .check_and_store_fn = Replay.checkAndStore,
+                },
+                .replay = .{ .now_unix_ms = 1_700_000_000_000 },
+            },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), replay.calls);
 }
 
 test "V4PublicAuthenticator adapts generic HELLO credentials" {

@@ -138,16 +138,22 @@ payload.
 Recommended implicit assertion input:
 
 ```text
-"qmsg/1" ||
-listener identity ||
-server authority ||
-required pattern set ||
-optional server nonce/challenge
+length-prefixed fields:
+  format = "qmsg/hello-auth/v1"
+  protocol = "qmsg/1"
+  purpose = "hello"
+  audience = qmsg audience string
+  listener = listener identity
+  authority = server authority
+  challenge = server nonce/challenge
 ```
 
-The exact byte format should be fixed before implementation. The purpose is to
-stop a token minted for one protocol, listener, or audience from being replayed
-as a valid `qmsg` credential somewhere else.
+`auth.allocHelloImplicitAssertion` builds this byte string without depending on
+PASETO. `AuthConfig.hello_binding.context` lets a transport provide the
+per-session values, and `require_challenge` fails closed when a listener expects
+challenge-bound credentials but no nonce/challenge was installed. The purpose is
+to stop a token minted for one protocol, listener, or audience from being
+replayed as a valid `qmsg` credential somewhere else.
 
 For deployments that cannot use implicit assertions, put protocol and audience
 constraints in claims and require strict claim validation.
@@ -167,6 +173,7 @@ Suggested claims:
   "nbf": "2026-05-11T00:00:00Z",
   "jti": "unique-token-id",
   "qmsg": {
+    "purpose": "hello",
     "patterns": ["rep", "pull"],
     "subjects": ["jobs.image.*"],
     "datagram": false,
@@ -181,6 +188,8 @@ Suggested claims:
 pub const Authorization = struct {
     subject: []const u8,
     issuer: []const u8,
+    audience: ?[]const u8,
+    purpose: ?[]const u8,
     token_id: ?[]const u8,
     allowed_patterns: PatternSet,
     allowed_subjects: SubjectPolicy,
@@ -195,8 +204,12 @@ in every message handler.
 
 `src/auth.zig` owns the qmsg claim parser. `Authorization.fromClaimsJson`
 requires `iss`, `sub`, and a `qmsg` block by default, maps `jti` into
-`token_id`, maps `exp` into `expires_at_unix_ms`, and parses:
+`token_id`, maps top-level `aud` into `audience`, maps `qmsg.purpose` into
+`purpose`, maps `exp` into `expires_at_unix_ms`, and parses:
 
+- `qmsg.purpose`: optional purpose string. HELLO credentials should use
+  `"hello"` and deployments can require it through
+  `Authorization.ClaimParseOptions` or `AuthConfig`;
 - `qmsg.patterns`: non-empty list of `pair`, `req`, `rep`, `pub`, `sub`,
   `push`, or `pull`;
 - `qmsg.subjects`: subject filters, `">"` for allow-all, or an empty list for
@@ -255,7 +268,11 @@ pub const AuthConfig = struct {
     required: bool = true,
     allow_anonymous_subjects: []const []const u8 = &.{},
     max_token_bytes: usize = 4096,
+    max_implicit_assertion_bytes: usize = 1024,
     max_clock_skew_ms: u64 = 30_000,
+    hello_binding: HelloBindingPolicy = .{},
+    expected_audiences: []const []const u8 = &.{},
+    expected_purposes: []const []const u8 = &.{},
     replay_cache: ?*ReplayCache = null,
 };
 ```
@@ -290,15 +307,18 @@ For service-to-service deployments, the clean model is:
 3. client presents PASETO bound to `qmsg/1` and the challenge;
 4. server verifies and consumes the challenge.
 
-The MVP can skip challenge-response and document that deployments should use
-short-lived tokens plus TLS server authentication. The API should leave room for
-challenge-bound tokens.
+The core API now leaves room for this without changing the HELLO wire shape:
+transport code can attach a per-session `HelloAuthContext` to `AuthConfig`, or
+pass prebuilt implicit assertion bytes through `HelloCredentials`. The QUIC
+adapter still needs to allocate, advertise, and consume the server challenge.
 
 The concrete PASETO helper accepts an optional `auth.ReplayCache`. When present,
 `authenticateV4Public` requires `jti`, parses qmsg claims into an
-`Authorization`, then calls `checkAndStore` with `{ issuer, token_id,
-expires_at_unix_ms }`. The cache interface stays transport-independent so
-listeners can back it with memory, a process-wide store, or application state.
+`Authorization`, requires an expiration by default, rejects expired entries
+before storage when `ReplayPolicy.now_unix_ms` is configured, then calls
+`checkAndStore` with `{ issuer, token_id, expires_at_unix_ms }`. The cache
+interface stays transport-independent so listeners can back it with memory, a
+process-wide store, or application state.
 
 ## Per-Message Authorization
 

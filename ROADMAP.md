@@ -10,17 +10,17 @@ phase.
 
 | Phase | Status | Notes |
 | --- | --- | --- |
-| 0 Decisions and spikes | Partial | Package, ALPN, envelope, inproc, auth boundary, local `quic-zig` dependency, transport-parameter mapping, and QUIC HELLO skeleton exist. A real QUIC stream/datagram spike is next. |
+| 0 Decisions and spikes | Complete enough to proceed | Package, ALPN, envelope, inproc, auth boundary, local `quic-zig` dependency, transport-parameter mapping, QUIC HELLO, reliable stream, DATAGRAM, and cancellation spikes exist. |
 | 1 Core package skeleton | Complete | Core message, envelope, subject, queue, transport boundary, and inproc transport are implemented and tested. |
 | 2 Pair and req/rep over inproc | Complete for inproc MVP | Pair and req/rep work over inproc with ids, deadlines, cancellation, queue pressure tests, and error replies. |
-| 3 QUIC transport MVP | Started | `quic-zig` is wired locally and `transport.quic` owns qmsg options/session/control-HELLO state with skeleton tests. Hermetic quic-zig handshake coverage is being wired. Real QUIC I/O, stream mapping, and smoke binaries remain. |
+| 3 QUIC transport MVP | In progress | `quic-zig` is wired locally. qmsg now has socket-free runtime wrappers, qmsg HELLO over control streams, reliable stream pumps, req/rep over hermetic QUIC runtime tests, and a one-process `quic-runtime-reqrep` smoke example. Node-owned UDP sockets and public QUIC socket APIs remain. |
 | 4 App facade | Partial | Route registration, `Context`, in-memory dispatch, inproc REP `runOnce`, auth checks, default REP error replies, and QUIC listener/session lifecycle placeholders exist. QUIC message dispatch remains. |
-| 5 Pub/sub reliable | Partial | Inproc pub/sub, source-side subscription registry, replay/update, and slow-consumer behavior are implemented. QUIC subscription propagation remains. |
-| 6 QUIC datagrams | Not started | HELLO carries datagram capability, but no datagram envelope or transport path exists yet. |
-| 7 Push/pull | Partial | Inproc push/pull has fair selection, puller credit, queue policy handling, and at-most-once semantics. QUIC `CREDIT` integration remains. |
+| 5 Pub/sub reliable | Partial | Inproc pub/sub, source-side subscription registry, replay/update, slow-consumer behavior, and transport-agnostic SUBSCRIBE/UNSUBSCRIBE control helpers are implemented. QUIC control-stream wiring remains. |
+| 6 QUIC datagrams | Started | HELLO carries datagram capability and qmsg has compact datagram envelope plus send/receive/error-mapping helpers. Runtime dispatch and app handlers remain. |
+| 7 Push/pull | Partial | Inproc push/pull has fair selection, puller credit, queue policy handling, at-most-once semantics, and transport-agnostic CREDIT helpers. QUIC control-stream wiring remains. |
 | 8 Survey/respondent and bus | Not started | No public API or state machines yet. |
 | 9 Typed codecs and ergonomics | Not started | Raw bytes remain first-class; typed helpers are future work. |
-| 10 PASETO/PASERK auth kit | Partial | `paseto-zig` 0.2.0 is wired, v4.public verification, PASERK id lookup, qmsg claim parsing, replay hook, and key rotation example exist. Runtime HELLO integration and more purposes remain. |
+| 10 PASETO/PASERK auth kit | Partial | `paseto-zig` 0.2.0 is wired, v4.public verification, PASERK id lookup, qmsg claim parsing, replay hook, key rotation example, HELLO implicit assertion binding, and audience/purpose policy exist. QUIC challenge minting/propagation remains. |
 
 ## Phase 0: Decisions and Spikes
 
@@ -314,11 +314,11 @@ Unit tests:
 Integration tests:
 
 - inproc pair/req/rep/pub/sub;
-- QUIC skeleton control-HELLO/session tests via `zig build quic-test`;
-- future QUIC localhost pair/req/rep once real UDP or hermetic stream I/O
-  lands;
-- future QUIC close/reset/cancel;
-- future datagram delivery/drop behavior.
+- QUIC control-HELLO/session tests via `zig build quic-test`;
+- hermetic QUIC runtime req/rep tests over `quic_zig.Server`/`Client`;
+- QUIC close/reset/cancel helper tests;
+- datagram envelope/error-mapping tests;
+- future real-UDP localhost pair/req/rep once Node owns sockets.
 
 Fuzz/property tests:
 
@@ -328,8 +328,9 @@ Fuzz/property tests:
 
 Interop tests:
 
-- future `qmsg-client` and `qmsg-server` binaries once real QUIC transport
-  surfaces land;
+- current one-process `quic-runtime-reqrep` smoke binary;
+- future split `qmsg-client` and `qmsg-server` binaries once Node-owned UDP
+  socket transport lands;
 - scripted smoke tests for each pattern;
 - packet loss/reorder tests once transport hooks support them.
 
@@ -347,7 +348,7 @@ The smallest useful public MVP:
 - handler facade for `rep`;
 - deadlines and cancellation;
 - basic examples;
-- no datagrams yet.
+- datagram helper surface but no app dispatch yet.
 
 This MVP is enough to prove the core idea: nng-style messaging patterns with
 Zig ergonomics over QUIC, without HTTP/3 in the design.

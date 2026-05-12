@@ -48,6 +48,7 @@ pub fn build(b: *std.Build) void {
     addExample(b, examples_step, qmsg_mod, paseto_mod, target, optimize, "inproc-reqrep", "examples/inproc_reqrep.zig");
     addExample(b, examples_step, qmsg_mod, paseto_mod, target, optimize, "app-ergonomics", "examples/app_ergonomics.zig");
     addExample(b, examples_step, qmsg_mod, paseto_mod, target, optimize, "auth-paseto", "examples/auth_paseto.zig");
+    addExample(b, examples_step, qmsg_mod, paseto_mod, target, optimize, "quic-runtime-reqrep", "examples/quic_runtime_reqrep.zig");
 
     const test_step = b.step("test", "Run qmsg unit tests");
     test_step.dependOn(&run_unit_tests.step);
