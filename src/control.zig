@@ -182,7 +182,7 @@ pub const Sink = struct {
 pub fn encodedSize(frame: Frame, options: CodecOptions) !usize {
     try validateFrame(frame, options);
 
-    var size = try varIntLen(@intFromEnum(std.meta.activeTag(frame)));
+    var size = try varIntLen(@backingInt(std.meta.activeTag(frame)));
     switch (frame) {
         .hello => |hello| {
             size = try addSize(size, try varIntLen(hello.wire_version));
@@ -233,7 +233,7 @@ pub fn encode(allocator: std.mem.Allocator, frame: Frame, options: CodecOptions)
     var bytes = try std.ArrayList(u8).initCapacity(allocator, expected_size);
     errdefer bytes.deinit(allocator);
 
-    try appendVarInt(allocator, &bytes, @intFromEnum(std.meta.activeTag(frame)));
+    try appendVarInt(allocator, &bytes, @backingInt(std.meta.activeTag(frame)));
     switch (frame) {
         .hello => |hello| {
             try appendVarInt(allocator, &bytes, hello.wire_version);
