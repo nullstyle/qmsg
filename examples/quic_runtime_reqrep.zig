@@ -54,6 +54,7 @@ pub fn main() !void {
 
     var client = try quic_runtime.ClientRuntime.init(allocator, "127.0.0.1:4433", .{
         .server_name = "localhost",
+        .insecure_skip_verify = true, // self-signed demo/test fixture
         .transport = .{
             .peer_id = "client",
             .role_flags = control.RoleFlags.client,

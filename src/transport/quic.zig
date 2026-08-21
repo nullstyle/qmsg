@@ -1,5 +1,5 @@
 const std = @import("std");
-const quic_zig = @import("quic_zig");
+const quic_zig = @import("quic");
 
 const auth = @import("../auth.zig");
 const control = @import("../control.zig");

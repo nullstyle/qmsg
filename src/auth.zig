@@ -1062,7 +1062,7 @@ fn subjectFilterMatches(filter: []const u8, candidate: []const u8) bool {
     const Filter = subject.Filter;
 
     if (comptime @hasDecl(Filter, "init") and @hasDecl(Filter, "matches")) {
-        const init_params = @typeInfo(@TypeOf(Filter.init)).@"fn".params.len;
+        const init_params = @typeInfo(@TypeOf(Filter.init)).@"fn".param_types.len;
         var buffer: [1024]u8 = undefined;
         var fixed = std.heap.FixedBufferAllocator.init(&buffer);
 

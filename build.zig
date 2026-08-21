@@ -9,11 +9,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const paseto_mod = paseto_dep.module("paseto");
-    const quic_zig_dep = b.dependency("quic_zig", .{
+    const quic_dep = b.dependency("quic", .{
         .target = target,
         .optimize = optimize,
     });
-    const quic_zig_mod = quic_zig_dep.module("quic_zig");
+    const quic_mod = quic_dep.module("quic");
 
     const qmsg_mod = b.addModule("qmsg", .{
         .root_source_file = b.path("src/root.zig"),
@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     qmsg_mod.addImport("paseto", paseto_mod);
-    qmsg_mod.addImport("quic_zig", quic_zig_mod);
+    qmsg_mod.addImport("quic", quic_mod);
 
     const lib = b.addLibrary(.{
         .name = "qmsg",
@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    quic_tests_mod.addImport("quic_zig", quic_zig_mod);
+    quic_tests_mod.addImport("quic", quic_mod);
     const quic_tests = b.addTest(.{ .root_module = quic_tests_mod });
     const run_quic_tests = b.addRunArtifact(quic_tests);
     const quic_test_step = b.step("quic-test", "Run qmsg QUIC transport skeleton tests");

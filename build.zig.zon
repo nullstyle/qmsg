@@ -2,7 +2,7 @@
     .name = .qmsg,
     .version = "0.1.0",
     .fingerprint = 0x650c9e5831497a83,
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.0-dev.1683+5ceec001b",
     .paths = .{
         "build.zig",
         "build.zig.zon",
@@ -20,7 +20,7 @@
             .url = "https://github.com/nullstyle/paseto-zig/archive/refs/tags/0.2.0.tar.gz",
             .hash = "paseto-0.1.0-EBI95SatBQAMip3R6-1LtQp2Wb6fKvOA7vBRBThiMplw",
         },
-        .quic_zig = .{
+        .quic = .{
             .path = "../quic-zig",
         },
     },

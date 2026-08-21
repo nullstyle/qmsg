@@ -1,0 +1,13 @@
+[tools]
+# Same exact Zig master pin as ../quic-zig (the path dependency): the
+# two repos MUST agree, and quic-zig enforces this as its
+# build.zig.zon minimum_zig_version floor. When quic-zig bumps its
+# pin, bump this in the same change.
+zig = "0.17.0-dev.1683+5ceec001b"
+
+[env]
+ZIG_GLOBAL_CACHE_DIR = "{{config_root}}/.zig-global-cache"
+
+[tasks.test]
+description = "Run the qmsg test suite (unit + QUIC transport)"
+run = "zig build test"

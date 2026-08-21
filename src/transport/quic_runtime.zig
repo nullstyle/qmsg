@@ -1,5 +1,5 @@
 const std = @import("std");
-const quic_zig = @import("quic_zig");
+const quic_zig = @import("quic");
 
 const quic = @import("quic.zig");
 
@@ -53,6 +53,10 @@ pub const ClientOptions = struct {
     server_name: []const u8,
     transport: quic.QuicOptions = .{},
     ca_pem: ?[]const u8 = null,
+    /// Test-only escape hatch: skip server certificate verification
+    /// (mirrors quic.Client.Config.insecure_skip_verify). Production
+    /// dials pin trust via `ca_pem` instead.
+    insecure_skip_verify: bool = false,
 };
 
 pub const Inbound = struct {
@@ -335,6 +339,7 @@ pub const ClientRuntime = struct {
             .alpn_protocols = options.transport.alpn_protocols,
             .transport_params = transportParamsFromOptions(options.transport),
             .ca_pem = options.ca_pem,
+            .insecure_skip_verify = options.insecure_skip_verify,
         }) catch |err| return mapQuicError(err);
         errdefer client.deinit();
 

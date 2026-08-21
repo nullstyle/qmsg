@@ -1,5 +1,5 @@
 const std = @import("std");
-const quic_zig = @import("quic_zig");
+const quic_zig = @import("quic");
 
 const control = @import("control.zig");
 const message = @import("message.zig");
@@ -144,6 +144,7 @@ fn driveHermeticQuicReady(
     defer srv.deinit();
 
     var cli = try quic_zig.Client.connect(.{
+        .insecure_skip_verify = true, // self-signed test fixture
         .allocator = allocator,
         .server_name = "localhost",
         .alpn_protocols = &protos,
@@ -205,6 +206,7 @@ const HermeticQuicPair = struct {
         errdefer srv.deinit();
 
         var cli = try quic_zig.Client.connect(.{
+            .insecure_skip_verify = true, // self-signed test fixture
             .allocator = allocator,
             .server_name = "localhost",
             .alpn_protocols = &protos,
@@ -303,6 +305,7 @@ test "qmsg QUIC sessions exchange HELLO over real QUIC uni streams" {
     defer srv.deinit();
 
     var cli = try quic_zig.Client.connect(.{
+        .insecure_skip_verify = true, // self-signed test fixture
         .allocator = allocator,
         .server_name = "localhost",
         .alpn_protocols = &protos,
@@ -524,6 +527,7 @@ test "runtime wrappers drive qmsg HELLO and reliable req rep with stream adapter
 
     var client = try quic_runtime.ClientRuntime.init(allocator, "127.0.0.1:4433", .{
         .server_name = "localhost",
+        .insecure_skip_verify = true, // self-signed demo/test fixture
         .transport = .{
             .peer_id = "client-runtime",
             .role_flags = control.RoleFlags.client,
