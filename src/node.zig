@@ -80,18 +80,25 @@ pub const QuicListenerRuntime = struct {
     id: QuicListenerId,
     listener: transport.quic_udp.Listener,
     transport_options: transport.quic.QuicOptions,
-    sessions: std.ArrayList(ListenerConnection) = .empty,
+    /// quic.app.Driver-based session dispatch: sessions ride
+    /// `Slot.user_data` (identity-stable across reaps) instead of the
+    /// old slot-INDEX binding, which `Server.reap`'s swapRemove could
+    /// silently cross-wire onto the wrong connection.
+    dispatch: NodeServerDispatch,
 
     pub fn localAddress(self: QuicListenerRuntime) std.Io.net.IpAddress {
         return self.listener.localAddress();
     }
 
     fn deinit(self: *QuicListenerRuntime, allocator: std.mem.Allocator) void {
-        self.sessions.deinit(allocator);
+        _ = allocator;
+        self.dispatch.deinit();
         self.listener.deinit();
         self.* = undefined;
     }
 };
+
+pub const NodeServerDispatch = transport.quic_app_server.ServerDispatch(Node);
 
 pub const QuicClientRuntime = struct {
     client: transport.quic_udp.Client,
@@ -110,6 +117,9 @@ pub const QuicClientRuntime = struct {
 pub const QuicSessionRuntime = struct {
     runtime: transport.quic_session_runtime.QuicSessionRuntime,
     transport_ready: bool = false,
+    /// True when the listener-side Driver owns this session's
+    /// lifecycle (created on handshake, destroyed via will-close).
+    driver_owned: bool = false,
     datagram_inbox: std.ArrayList(transport.quic_datagram.ReceivedDatagram) = .empty,
     datagram_outbox: std.ArrayList(message.Message) = .empty,
 
@@ -210,11 +220,6 @@ pub const QuicSocketAttachment = struct {
     endpoint: socket.QuicSocketEndpoint,
 };
 
-pub const ListenerConnection = struct {
-    connection_index: usize,
-    runtime: *QuicSessionRuntime,
-};
-
 pub const Node = struct {
     allocator: std.mem.Allocator,
     options: NodeOptions,
@@ -308,8 +313,15 @@ pub const Node = struct {
                 .receive_timeout = options.receive_timeout,
             }),
             .transport_options = options.transport,
+            .dispatch = undefined,
         };
-        errdefer if (owns_runtime) runtime.deinit(self.allocator);
+        errdefer if (owns_runtime) runtime.listener.deinit();
+
+        // In place: the runtime is at its final heap address, which
+        // the Driver requires (it stores &dispatch.app).
+        try runtime.dispatch.init(self.allocator, self, options.transport);
+        errdefer if (owns_runtime) runtime.dispatch.deinit();
+        runtime.dispatch.attach(&runtime.listener.runtime.server);
 
         try self.quic_listeners.append(self.allocator, runtime);
         owns_runtime = false;
@@ -394,10 +406,15 @@ pub const Node = struct {
         for (self.quic_sessions.items, 0..) |runtime, index| {
             if (runtime.id() != id) continue;
 
+            // Driver-owned (listener-side) sessions are destroyed by
+            // the will-close teardown when their connection reaps;
+            // freeing them here would leave the Driver's ConnState
+            // dangling and double-free on disconnect.
+            if (runtime.driver_owned) return error.InvalidState;
+
             runtime.runtime.session.close();
             try self.emit(.{ .closed = id });
             _ = self.quic_sessions.orderedRemove(index);
-            self.removeListenerSessionRefs(runtime);
             self.removeSocketSessionRefs(id);
             runtime.deinit();
             self.allocator.destroy(runtime);
@@ -578,13 +595,65 @@ pub const Node = struct {
         return self.events.items.len;
     }
 
+    // ---- ServerDispatch owner contract (quic.app.Driver hooks) ----
+
+    pub const DriverSession = *QuicSessionRuntime;
+
+    pub fn driverSessionRuntime(sess: DriverSession) *transport.quic_session_runtime.QuicSessionRuntime {
+        return &sess.runtime;
+    }
+
+    pub fn driverServerSessionCreate(
+        self: *Node,
+        options: transport.quic.QuicOptions,
+    ) !DriverSession {
+        const runtime = try self.createQuicSession(.server, options, null);
+        errdefer self.destroyQuicSession(runtime);
+        runtime.driver_owned = true;
+        runtime.transport_ready = true;
+        try runtime.runtime.onQuicReady();
+        return runtime;
+    }
+
+    pub fn driverServerSessionDestroy(self: *Node, sess: DriverSession) void {
+        self.destroyQuicSession(sess);
+    }
+
+    pub fn driverSessionPass(
+        self: *Node,
+        sess: DriverSession,
+        conn: *transport.quic_runtime.Connection,
+    ) !void {
+        _ = self;
+        _ = try sess.pumpDatagramOutbox(conn);
+    }
+
+    pub fn driverDatagramReceived(
+        self: *Node,
+        sess: DriverSession,
+        received: transport.quic_datagram.ReceivedDatagram,
+    ) !void {
+        var owned = received;
+        errdefer owned.deinit();
+        try sess.datagram_inbox.append(self.allocator, owned);
+    }
+
+    pub fn driverDatagramDropped(self: *Node, sess: DriverSession, bytes: usize) !void {
+        try self.emit(.{ .message_dropped = .{
+            .session_id = sess.id(),
+            .bytes = bytes,
+        } });
+    }
+
     fn tickQuicListeners(self: *Node, now_us: u64) !void {
         for (self.quic_listeners.items) |listener| {
             _ = try listener.listener.recvAndFeedOne(now_us);
-            try listener.listener.tick(now_us);
-            try self.ensureListenerSessions(listener);
-            try self.pumpListenerSessions(listener);
+            // Service BEFORE tick: quic-zig's ordering contract — the
+            // stream GC inside tick must never reap a stream whose
+            // arrived bytes the app has not read yet.
+            try listener.dispatch.service(&listener.listener.runtime.server);
             while (try listener.listener.drainAndSendOne(now_us)) |_| {}
+            try listener.listener.tick(now_us);
             _ = listener.listener.runtime.reap();
         }
     }
@@ -599,37 +668,11 @@ pub const Node = struct {
         }
     }
 
-    fn ensureListenerSessions(self: *Node, listener: *QuicListenerRuntime) !void {
-        const count = listener.listener.runtime.connectionCount();
-        var index: usize = 0;
-        while (index < count) : (index += 1) {
-            const conn = listener.listener.runtime.connection(index) orelse continue;
-            if (!conn.handshakeDone()) continue;
-            if (listenerSession(listener, index) != null) continue;
-
-            const runtime = try self.createQuicSession(.server, listener.transport_options, null);
-            errdefer self.destroyQuicSession(runtime);
-            runtime.transport_ready = true;
-            try runtime.runtime.onQuicReady();
-            try listener.sessions.append(self.allocator, .{
-                .connection_index = index,
-                .runtime = runtime,
-            });
-        }
-    }
-
     fn ensureClientReady(_: *Node, client: *QuicClientRuntime) !void {
         if (client.runtime.transport_ready) return;
         if (!client.client.runtime.connection().handshakeDone()) return;
         client.runtime.transport_ready = true;
         try client.runtime.runtime.onQuicReady();
-    }
-
-    fn pumpListenerSessions(self: *Node, listener: *QuicListenerRuntime) !void {
-        for (listener.sessions.items) |entry| {
-            const conn = listener.listener.runtime.connection(entry.connection_index) orelse continue;
-            try self.pumpQuicSessionConnection(entry.runtime, conn);
-        }
     }
 
     fn pumpClientSession(self: *Node, client: *QuicClientRuntime) !void {
@@ -717,28 +760,15 @@ pub const Node = struct {
     }
 
     fn destroyQuicSession(self: *Node, runtime: *QuicSessionRuntime) void {
+        self.emit(.{ .closed = runtime.id() }) catch {};
         for (self.quic_sessions.items, 0..) |candidate, index| {
             if (candidate != runtime) continue;
             _ = self.quic_sessions.orderedRemove(index);
             break;
         }
-        self.removeListenerSessionRefs(runtime);
         self.removeSocketSessionRefs(runtime.id());
         runtime.deinit();
         self.allocator.destroy(runtime);
-    }
-
-    fn removeListenerSessionRefs(self: *Node, runtime: *QuicSessionRuntime) void {
-        for (self.quic_listeners.items) |listener| {
-            var index: usize = 0;
-            while (index < listener.sessions.items.len) {
-                if (listener.sessions.items[index].runtime == runtime) {
-                    _ = listener.sessions.orderedRemove(index);
-                } else {
-                    index += 1;
-                }
-            }
-        }
     }
 
     fn removeSocketSessionRefs(self: *Node, id: QuicSessionId) void {
@@ -804,13 +834,6 @@ fn quicSocketAttachmentSupported(pattern: socket.Pattern) bool {
         .pair, .req, .rep => true,
         .@"pub", .sub, .push, .pull => false,
     };
-}
-
-fn listenerSession(listener: *QuicListenerRuntime, connection_index: usize) ?*QuicSessionRuntime {
-    for (listener.sessions.items) |entry| {
-        if (entry.connection_index == connection_index) return entry.runtime;
-    }
-    return null;
 }
 
 fn dispatcherHas(comptime Dispatcher: type, comptime name: []const u8) bool {
@@ -1100,4 +1123,190 @@ test "Node runOnce dispatches one inproc rep request through dispatcher" {
     defer reply.deinit();
     try std.testing.expectEqualStrings("user.get", reply.subject);
     try std.testing.expectEqualStrings("42", reply.body);
+}
+
+// ---- ServerDispatch end-to-end (hermetic: no sockets) ----------------------
+
+const dispatch_test_cert_pem = @embedFile("testdata/test_cert.pem");
+const dispatch_test_key_pem = @embedFile("testdata/test_key.pem");
+
+const DispatchTestPeers = struct {
+    listener: transport.quic_runtime.ListenerRuntime,
+    dispatch: NodeServerDispatch,
+    client: transport.quic_runtime.ClientRuntime,
+    rx: [8192]u8 = undefined,
+    now_us: u64 = 1_000,
+
+    fn drive(self: *DispatchTestPeers) !void {
+        const from: transport.quic_runtime.Address = .{ .ipv4 = .{
+            .addr = .{ 0x7f, 0, 0, 1 },
+            .port = 40_000,
+        } };
+        while (try self.client.drainOutbound(&self.rx, self.now_us)) |out| {
+            _ = try self.listener.feedInbound(.{
+                .bytes = self.rx[0..out.len],
+                .from = from,
+            }, self.now_us);
+        }
+        try self.dispatch.service(&self.listener.server);
+        while (try self.listener.drainOutbound(&self.rx, self.now_us)) |out| {
+            try self.client.feedInbound(.{ .bytes = self.rx[0..out.len] }, self.now_us);
+        }
+        try self.listener.tick(self.now_us);
+        try self.client.tick(self.now_us);
+        self.now_us += 1_000;
+    }
+};
+
+test "listener dispatch drives qmsg sessions through quic.app.Driver end to end" {
+    const allocator = std.testing.allocator;
+    const control = @import("control.zig");
+
+    const server_opts: transport.quic.QuicOptions = .{
+        .peer_id = "dispatch-server",
+        .role_flags = control.RoleFlags.server,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+    const client_opts: transport.quic.QuicOptions = .{
+        .peer_id = "dispatch-client",
+        .role_flags = control.RoleFlags.client,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+
+    var node = try Node.init(allocator, .{});
+    defer node.deinit();
+
+    var p: DispatchTestPeers = undefined;
+    p.now_us = 1_000;
+    p.listener = try transport.quic_runtime.ListenerRuntime.init(allocator, "127.0.0.1:4433", .{
+        .tls_cert_pem = dispatch_test_cert_pem,
+        .tls_key_pem = dispatch_test_key_pem,
+        .transport = server_opts,
+    });
+    defer p.listener.deinit();
+    try p.dispatch.init(allocator, &node, server_opts);
+    defer p.dispatch.deinit();
+    p.dispatch.attach(&p.listener.server);
+    p.client = try transport.quic_runtime.ClientRuntime.init(allocator, "127.0.0.1:4433", .{
+        .server_name = "localhost",
+        .insecure_skip_verify = true, // self-signed test fixture
+        .transport = client_opts,
+    });
+    defer p.client.deinit();
+
+    // Client-side qmsg session: manual (the Driver dispatch is
+    // server-side only); registered on the node so deinit owns it.
+    const client_sess = try node.openQuicSession(.{
+        .role = .client,
+        .transport = client_opts,
+    });
+
+    // Handshake: the dispatch must create the server session on its
+    // own (on_handshake) — nothing else in this test does.
+    var step: u32 = 0;
+    while (step < 4_000) : (step += 1) {
+        try p.drive();
+        if (p.client.connection().handshakeDone() and
+            p.listener.connectionCount() > 0 and
+            p.listener.connection(0).?.handshakeDone()) break;
+    }
+    try std.testing.expect(p.client.connection().handshakeDone());
+
+    client_sess.transport_ready = true;
+    try client_sess.runtime.onQuicReady();
+
+    // HELLO exchange: client pumps manually; the server side is pumped
+    // entirely by dispatch.service inside drive().
+    var server_sess: ?*QuicSessionRuntime = null;
+    step = 0;
+    while (step < 4_000) : (step += 1) {
+        _ = try client_sess.runtime.pumpConnection(p.client.connection());
+        try p.drive();
+        if (server_sess == null) {
+            for (node.quic_sessions.items) |candidate| {
+                if (candidate != client_sess) server_sess = candidate;
+            }
+        }
+        const server_ready = if (server_sess) |sess| sess.state() == .ready else false;
+        if (client_sess.state() == .ready and server_ready) break;
+    }
+    try std.testing.expectEqual(transport.quic.State.ready, client_sess.state());
+    const srv_sess = server_sess orelse return error.ServerSessionMissing;
+    try std.testing.expectEqual(transport.quic.State.ready, srv_sess.state());
+    try std.testing.expect(srv_sess.driver_owned);
+    try std.testing.expectEqualStrings("dispatch-client", srv_sess.runtime.peerId());
+
+    // Request: client -> server through the dispatch-accepted stream.
+    const stream_id = try client_sess.queueReliable(.{
+        .subject = "user.get",
+        .id = 4242,
+        .deadline_ms = 1_000,
+        .body = "ada",
+    });
+    step = 0;
+    while (step < 4_000 and srv_sess.runtime.inboxLen() == 0) : (step += 1) {
+        _ = try client_sess.runtime.pumpConnection(p.client.connection());
+        try p.drive();
+    }
+    var request = srv_sess.runtime.recvReliable() orelse return error.RequestMissing;
+    defer request.deinit();
+    try std.testing.expectEqual(@as(u64, stream_id), request.stream_id);
+    try std.testing.expectEqualStrings("user.get", request.message.subject);
+    try std.testing.expectEqualStrings("ada", request.message.body);
+
+    // Reply: server -> client on the same stream; the send side rides
+    // dispatch.service's session pump.
+    try srv_sess.replyReliableOnStream(stream_id, .{
+        .subject = request.message.subject,
+        .id = request.message.id,
+        .flags = .{ .final = true },
+        .body = "Ada Lovelace",
+    });
+    // Reply receiver on the client's own request stream: request/
+    // reply correlation is app-driven on the dial side (the server
+    // side is what the dispatch automates).
+    try client_sess.runtime.acceptReliableStream(stream_id);
+    var reply: ?transport.quic_session_runtime.ReceivedReliable = null;
+    step = 0;
+    while (step < 4_000 and reply == null) : (step += 1) {
+        try p.drive();
+        _ = try client_sess.runtime.pumpConnection(p.client.connection());
+        reply = client_sess.runtime.recvReliable();
+    }
+    var got = reply orelse return error.ReplyMissing;
+    defer got.deinit();
+    try std.testing.expectEqualStrings("Ada Lovelace", got.message.body);
+
+    // Driver-owned sessions refuse the manual close path (their
+    // lifecycle belongs to the will-close teardown).
+    const srv_sess_id = srv_sess.id();
+    try std.testing.expectError(error.InvalidState, node.closeQuicSession(srv_sess_id));
+
+    // Teardown: close the client connection; the reap-driven
+    // will-close hook must destroy the server session exactly once.
+    p.client.connection().close(false, 0, "done");
+    step = 0;
+    while (step < 400 and p.listener.connectionCount() > 0) : (step += 1) {
+        try p.drive();
+        p.now_us += 10_000;
+        try p.listener.tick(p.now_us);
+        _ = p.listener.reap();
+    }
+    try std.testing.expectEqual(@as(usize, 0), p.listener.connectionCount());
+    try std.testing.expectEqual(@as(usize, 1), node.quic_sessions.items.len);
+    try std.testing.expect(node.quic_sessions.items[0] == client_sess);
+
+    var saw_connected_server = false;
+    var saw_closed_server = false;
+    for (node.events.items) |event| switch (event) {
+        .connected => |id| {
+            if (id == srv_sess_id) saw_connected_server = true;
+        },
+        .closed => |id| {
+            if (id == srv_sess_id) saw_closed_server = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_connected_server);
+    try std.testing.expect(saw_closed_server);
 }

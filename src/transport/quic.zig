@@ -10,6 +10,11 @@ const session_mod = @import("../session.zig");
 pub const alpn = "qmsg/1";
 pub const control_stream_type: u64 = 0x51;
 
+/// Application CONNECTION_CLOSE code for a session-level protocol
+/// violation (malformed control/reliable framing). Same 0x51_xx
+/// family as `quic_cancel.CloseReason`'s stream codes.
+pub const protocol_error_code: u64 = 0x51_05;
+
 const default_alpn_protocols = [_][]const u8{alpn};
 
 pub const Role = enum {
