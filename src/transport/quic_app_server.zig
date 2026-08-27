@@ -267,7 +267,7 @@ pub fn ServerDispatch(comptime Owner: type) type {
             }
         }
 
-        fn onDatagram(app: *App, s: *D.Session, data: []const u8) anyerror!void {
+        fn onDatagram(app: *App, s: *D.Session, datagram: D.Datagram) anyerror!void {
             const sess = s.app.sess orelse return;
             const rt = Owner.driverSessionRuntime(sess);
             if (!rt.appSession().datagram_enabled) return;
@@ -276,15 +276,16 @@ pub fn ServerDispatch(comptime Owner: type) type {
             var received = quic_datagram.decodeIncomingDatagram(
                 app.allocator,
                 // The Driver hands full payloads (the delivery buffer
-                // is sized to the advertised frame limit above). The
-                // early-data flag is not surfaced through on_datagram;
-                // qmsg does not consume it on the server path today.
-                .{ .len = data.len, .arrived_in_early_data = false },
-                data,
+                // is sized to the advertised frame limit above).
+                .{
+                    .len = datagram.bytes.len,
+                    .arrived_in_early_data = datagram.arrived_in_early_data,
+                },
+                datagram.bytes,
                 .{ .codec = codec },
             ) catch |err| switch (err) {
                 error.MalformedFrame, error.MessageTooLarge => {
-                    try app.owner.driverDatagramDropped(sess, data.len);
+                    try app.owner.driverDatagramDropped(sess, datagram.bytes.len);
                     return;
                 },
                 else => return err,

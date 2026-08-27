@@ -1,9 +1,9 @@
 [tools]
-# Same exact Zig master pin as ../quic-zig (the path dependency): the
-# two repos MUST agree, and quic-zig enforces this as its
-# build.zig.zon minimum_zig_version floor. When quic-zig bumps its
-# pin, bump this in the same change.
-zig = "0.17.0-dev.1683+5ceec001b"
+# Zig master pin verified for this release. quic-zig is now a
+# tarball pin (v0.19.0), whose floor is dev.1683; qmsg is verified
+# on the consumer's toolchain (mruby-quic's pin) so the published
+# package compiles where it is consumed.
+zig = "0.17.0-dev.1786+75044cb04"
 
 [env]
 ZIG_GLOBAL_CACHE_DIR = "{{config_root}}/.zig-global-cache"
