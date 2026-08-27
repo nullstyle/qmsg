@@ -127,6 +127,19 @@ pub const Request = struct {
     }
 };
 
+/// The correlation data a rep socket needs to answer a request:
+/// everything `RepSocket.reply` reads off a received request, so
+/// event-driven embedders that did not keep the owned `Request` alive
+/// (they reply later, from just the id they saw in an event) can still
+/// answer correctly.
+pub const ReplyKey = struct {
+    id: message.MessageId,
+    deadline_ms: ?u64 = null,
+    /// Echoed as the reply subject when the outgoing reply leaves the
+    /// subject empty. Borrowed for the duration of the send call only.
+    subject: []const u8 = "",
+};
+
 pub const ErrorReply = struct {
     pub const code_header = "qmsg-error-code";
     pub const message_header = "qmsg-error-message";
@@ -403,6 +416,20 @@ pub const ReqSocket = struct {
         };
         return reply;
     }
+
+    /// Pops one queued reply without any inflight bookkeeping.
+    ///
+    /// For embedders that correlate replies against their own pending
+    /// tables (and classify late or unmatched replies themselves) —
+    /// the socket's inflight state is then theirs to clear via
+    /// `cancelRequest`.
+    pub fn tryRecvRaw(self: *ReqSocket) !?message.Message {
+        return self.core.recvOrNull();
+    }
+
+    pub fn queueStats(self: *const ReqSocket) queue.QueueStats {
+        return self.core.inbox.stats();
+    }
 };
 
 pub const RepSocket = struct {
@@ -484,6 +511,23 @@ pub const RepSocket = struct {
         });
     }
 
+    /// Replies by explicit correlation key instead of a live `Request`.
+    ///
+    /// Same semantics as `reply`: the key's subject is echoed when the
+    /// outgoing reply leaves its subject empty, and the request's
+    /// deadline travels back on the reply.
+    pub fn replyKey(self: *RepSocket, key: ReplyKey, outgoing: message.OutgoingMessage) !void {
+        try self.core.sendToFirst(.req, outgoing, .{
+            .id = key.id,
+            .deadline_ms = key.deadline_ms,
+            .subject = if (outgoing.subject.len == 0 and key.subject.len != 0) key.subject else null,
+        });
+    }
+
+    pub fn queueStats(self: *const RepSocket) queue.QueueStats {
+        return self.core.inbox.stats();
+    }
+
     pub fn replyError(self: *RepSocket, request_to_answer: Request, app_error: ErrorReply) !void {
         const headers = [_]message.Header{
             .{ .name = ErrorReply.code_header, .value = app_error.code },
@@ -491,6 +535,21 @@ pub const RepSocket = struct {
         };
 
         try self.reply(request_to_answer, .{
+            .subject = app_error.subject,
+            .flags = .{ .err = true },
+            .headers = &headers,
+            .body = app_error.message,
+        });
+    }
+
+    /// `replyError` by explicit correlation key (see `ReplyKey`).
+    pub fn replyErrorKey(self: *RepSocket, key: ReplyKey, app_error: ErrorReply) !void {
+        const headers = [_]message.Header{
+            .{ .name = ErrorReply.code_header, .value = app_error.code },
+            .{ .name = ErrorReply.message_header, .value = app_error.message },
+        };
+
+        try self.replyKey(key, .{
             .subject = app_error.subject,
             .flags = .{ .err = true },
             .headers = &headers,
@@ -580,6 +639,19 @@ pub const SubSocket = struct {
 
     pub fn unsubscribe(self: *SubSocket, filter: []const u8) void {
         self.core.unsubscribe(filter);
+    }
+
+    /// Returns the subscription filter that would claim `subject`
+    /// (first match in subscription order), or null when nothing
+    /// matches. The returned slice is borrowed from the socket's
+    /// filter storage and stays valid until the filter is removed or
+    /// the socket deinits.
+    pub fn matchedFilter(self: *SubSocket, subject: []const u8) ?[]const u8 {
+        return self.core.local_subscriptions.matchedFilter(subject);
+    }
+
+    pub fn queueStats(self: *const SubSocket) queue.QueueStats {
+        return self.core.inbox.stats();
     }
 
     pub fn recv(self: *SubSocket) !message.Message {

@@ -139,6 +139,16 @@ pub const SubscriptionSet = struct {
         return false;
     }
 
+    /// The filter that claims `subject`: first match in subscription
+    /// order, matching `matches` above. Borrowed text — valid until
+    /// that filter is removed or the set deinits.
+    pub fn matchedFilter(self: SubscriptionSet, subject: []const u8) ?[]const u8 {
+        for (self.entries.items) |entry| {
+            if (entry.filter.matches(subject) catch false) return entry.filter.text;
+        }
+        return null;
+    }
+
     pub fn len(self: SubscriptionSet) usize {
         return self.entries.items.len;
     }

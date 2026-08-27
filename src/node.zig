@@ -1,30 +1,187 @@
 const std = @import("std");
 const message = @import("message.zig");
+const queue = @import("queue.zig");
 const socket = @import("socket.zig");
 const session = @import("session.zig");
 const transport = @import("transport/root.zig");
 
 pub const NodeOptions = struct {
     max_sessions: usize = 1024,
+    /// Bound on queued `Event`s. When the embedder stops draining,
+    /// new events are dropped and counted (`Stats.events_dropped`)
+    /// instead of growing without limit. Message-carrying events
+    /// dropped here also free their payloads and count in
+    /// `Stats.dropped`.
+    max_events: usize = 1024,
+    /// Options for the node-owned subscription socket created by the
+    /// first `dialInprocSub`/`subscribeInproc` call. Its receive-queue
+    /// policy is the slow-consumer policy for embedded deliveries.
+    inproc_sub: socket.SocketOptions(.sub) = .{},
     io: std.Io = std.Io.Threaded.global_single_threaded.io(),
+};
+
+/// Why an embedded request will never receive a reply event.
+///
+/// The tag names are the stable script/metrics vocabulary. Sync-side
+/// send failures (`requestInproc`/`replyInproc` errors) classify
+/// through `classifyRequestError` into the same names, so an
+/// embedder renders one error space from both paths.
+pub const RequestFailure = enum {
+    deadline_exceeded,
+    canceled,
+    queue_full,
+    peer_closed,
+    no_route,
+};
+
+/// Maps synchronous send-path errors onto `RequestFailure` names, so
+/// embedders can surface `error.QueueFull` from `requestInproc` and
+/// a `request_failed` event through one vocabulary. Returns null for
+/// errors that are not request-outcome classifications.
+pub fn classifyRequestError(err: anyerror) ?RequestFailure {
+    return switch (err) {
+        error.QueueFull, error.FlowControlled => .queue_full,
+        error.EndpointClosed => .peer_closed,
+        error.NoPeer, error.EndpointNotFound => .no_route,
+        else => null,
+    };
+}
+
+/// A message qmsg received but could not deliver: queue-policy
+/// drops, malformed/oversized datagrams, and late replies whose
+/// request was already canceled or expired.
+pub const MessageDropped = struct {
+    session_id: ?session.SessionId = null,
+    bytes: usize,
+};
+
+/// An incoming request on a node-served inproc endpoint.
+///
+/// `msg` is owned by the event. Reply through `Node.replyInproc`
+/// (or `replyErrorInproc`) while the event is alive, then `deinit`.
+pub const RequestEvent = struct {
+    endpoint_id: InprocRepId,
+    session_id: session.SessionId,
+    /// `msg.id` is the reply correlation id; `msg.deadline_ms` the
+    /// request deadline.
+    msg: message.Message,
+
+    pub fn deinit(self: *RequestEvent) void {
+        self.msg.deinit();
+        self.* = undefined;
+    }
+};
+
+/// A peer reply completing one of the node's outbound requests.
+///
+/// `msg` is owned by the event. `msg.id` is the correlation id the
+/// request was sent under. Peer error replies carry `flags.err` and
+/// the `qmsg-error-code` / `qmsg-error-message` headers.
+pub const ReplyEvent = struct {
+    dial_id: InprocDialId,
+    msg: message.Message,
+
+    pub fn deinit(self: *ReplyEvent) void {
+        self.msg.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Terminal outcome for one of the node's outbound requests: no
+/// reply event will follow this id.
+pub const RequestFailedEvent = struct {
+    dial_id: InprocDialId,
+    id: message.MessageId,
+    failure: RequestFailure,
+};
+
+/// A pub/sub delivery matching one of the node's subscriptions.
+///
+/// `msg` is owned by the event. `filter` is the subscription that
+/// claimed the subject (first match in subscription order) and is
+/// borrowed from the node's filter storage — valid until that filter
+/// is unsubscribed or the node deinits. Copy it if retention is
+/// needed.
+pub const DeliveryEvent = struct {
+    filter: []const u8,
+    msg: message.Message,
+
+    pub fn deinit(self: *DeliveryEvent) void {
+        self.msg.deinit();
+        self.* = undefined;
+    }
 };
 
 pub const Event = union(enum) {
     connected: session.SessionId,
     closed: session.SessionId,
-    message_dropped: struct {
-        session_id: ?session.SessionId = null,
-        bytes: usize,
-    },
+    message_dropped: MessageDropped,
+    request: RequestEvent,
+    reply: ReplyEvent,
+    request_failed: RequestFailedEvent,
+    delivery: DeliveryEvent,
+
+    /// Releases memory the event owns. Every event pulled out of
+    /// `Node.poll` must be deinited by the embedder after handling.
+    pub fn deinit(self: *Event) void {
+        switch (self.*) {
+            .request => |*ev| ev.deinit(),
+            .reply => |*ev| ev.deinit(),
+            .delivery => |*ev| ev.deinit(),
+            .connected, .closed, .message_dropped, .request_failed => {},
+        }
+    }
+};
+
+/// Plain, allocation-free observability snapshot for embedder
+/// metrics: no metrics dependency, just readable fields.
+///
+/// `dropped` counts messages received but not delivered (queue
+/// policy drops on node-owned queues, late replies whose request
+/// already ended, message events dropped by the event-queue bound).
+/// `queue_high_water` is the deepest any node-owned receive queue
+/// has been.
+pub const Stats = struct {
+    sent: usize = 0,
+    recv: usize = 0,
+    dropped: usize = 0,
+    queue_high_water: usize = 0,
+    events_dropped: usize = 0,
+
+    fn accumulate(self: *Stats, qs: queue.QueueStats) void {
+        self.dropped += qs.dropped_oldest + qs.dropped_newest;
+        self.queue_high_water = @max(self.queue_high_water, qs.high_water_messages);
+    }
+};
+
+const Counters = struct {
+    sent: usize = 0,
+    recv: usize = 0,
+    dropped: usize = 0,
+    events_dropped: usize = 0,
 };
 
 pub const InprocRepId = usize;
 pub const QuicListenerId = usize;
 pub const QuicSessionId = session.SessionId;
+/// Identifies one node-dialed inproc req transport (see
+/// `Node.dialInprocReq`).
+pub const InprocDialId = usize;
+/// Identifies one node-bound inproc pub endpoint (see
+/// `Node.listenInprocPub`).
+pub const InprocPubId = usize;
 
 pub const InprocRepOptions = struct {
     socket: socket.SocketOptions(.rep) = .{},
     session: ?session.Session = null,
+};
+
+pub const InprocDialOptions = struct {
+    socket: socket.SocketOptions(.req) = .{},
+};
+
+pub const InprocPubOptions = struct {
+    socket: socket.SocketOptions(.@"pub") = .{},
 };
 
 pub const RunOnceResult = struct {
@@ -48,6 +205,63 @@ pub const InprocRepEndpoint = struct {
         self.socket.deinit();
         allocator.free(self.address);
         self.* = undefined;
+    }
+};
+
+/// One node-owned inproc req socket, dialed to a serving peer.
+/// Outbound requests correlate through the node's pending table; see
+/// `Node.requestInproc`.
+pub const InprocDial = struct {
+    id: InprocDialId,
+    address: []u8,
+    socket: socket.Socket(.req),
+
+    fn deinit(self: *InprocDial, allocator: std.mem.Allocator) void {
+        self.socket.deinit();
+        allocator.free(self.address);
+        self.* = undefined;
+    }
+};
+
+/// One node-owned inproc pub endpoint. Publications fan out to every
+/// subscriber dialed to the bound address.
+pub const InprocPubEndpoint = struct {
+    id: InprocPubId,
+    network: *transport.inproc.Network,
+    address: []u8,
+    socket: socket.Socket(.@"pub"),
+
+    fn deinit(self: *InprocPubEndpoint, allocator: std.mem.Allocator) void {
+        self.network.unbindPattern(self.address) catch {};
+        self.socket.deinit();
+        allocator.free(self.address);
+        self.* = undefined;
+    }
+};
+
+/// The node's single subscription socket. Created lazily by the
+/// first `dialInprocSub`/`subscribeInproc` call, configured by
+/// `NodeOptions.inproc_sub`.
+const InprocSubEndpoint = struct {
+    socket: socket.Socket(.sub),
+
+    fn deinit(self: *InprocSubEndpoint) void {
+        self.socket.deinit();
+        self.* = undefined;
+    }
+};
+
+/// One outbound request awaiting a reply event. Deadlines are
+/// evaluated against the node clock (`tick`'s `now_us`).
+const PendingInprocRequest = struct {
+    dial_id: InprocDialId,
+    id: message.MessageId,
+    deadline_ms: ?u64,
+    sent_at_ms: u64,
+
+    fn isExpired(self: PendingInprocRequest, now_ms: u64) bool {
+        const deadline_ms = self.deadline_ms orelse return false;
+        return now_ms >= self.sent_at_ms +| deadline_ms;
     }
 };
 
@@ -225,6 +439,11 @@ pub const Node = struct {
     options: NodeOptions,
     events: std.ArrayList(Event) = .empty,
     inproc_rep_endpoints: std.ArrayList(*InprocRepEndpoint) = .empty,
+    inproc_dials: std.ArrayList(*InprocDial) = .empty,
+    inproc_pubs: std.ArrayList(*InprocPubEndpoint) = .empty,
+    inproc_sub: ?*InprocSubEndpoint = null,
+    inproc_pending: std.ArrayList(PendingInprocRequest) = .empty,
+    counters: Counters = .{},
     quic_listeners: std.ArrayList(*QuicListenerRuntime) = .empty,
     quic_clients: std.ArrayList(*QuicClientRuntime) = .empty,
     quic_sessions: std.ArrayList(*QuicSessionRuntime) = .empty,
@@ -240,6 +459,21 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        self.inproc_pending.deinit(self.allocator);
+        if (self.inproc_sub) |sub| {
+            sub.deinit();
+            self.allocator.destroy(sub);
+        }
+        for (self.inproc_pubs.items) |endpoint| {
+            endpoint.deinit(self.allocator);
+            self.allocator.destroy(endpoint);
+        }
+        self.inproc_pubs.deinit(self.allocator);
+        for (self.inproc_dials.items) |req_dial| {
+            req_dial.deinit(self.allocator);
+            self.allocator.destroy(req_dial);
+        }
+        self.inproc_dials.deinit(self.allocator);
         for (self.quic_clients.items) |client| {
             client.deinit();
             self.allocator.destroy(client);
@@ -261,6 +495,9 @@ pub const Node = struct {
             self.allocator.destroy(endpoint);
         }
         self.inproc_rep_endpoints.deinit(self.allocator);
+        for (self.events.items) |*event| {
+            event.deinit();
+        }
         self.events.deinit(self.allocator);
         self.* = undefined;
     }
@@ -467,6 +704,344 @@ pub const Node = struct {
         return id;
     }
 
+    // ---- embedded inproc service surface -------------------------
+    //
+    // The socketless embedding contract: the node owns every socket,
+    // the embedder owns the clock and the loop. `tick` advances the
+    // clock (and pumps QUIC transports when present); `poll` pumps
+    // the inproc service state into the event queue and hands events
+    // out. This event-drain path and `runOnce`'s dispatcher path are
+    // alternative consumption models for the same endpoints — pick
+    // one per endpoint.
+
+    /// Dials one inproc req transport to a serving peer. Requests on
+    /// this dial correlate through `requestInproc`/`ReplyEvent`.
+    pub fn dialInprocReq(
+        self: *Node,
+        network: *transport.inproc.Network,
+        address: []const u8,
+        options: InprocDialOptions,
+    ) !InprocDialId {
+        if (self.inproc_dials.items.len >= self.options.max_sessions) return error.TooManySessions;
+
+        const owned_address = try self.allocator.dupe(u8, address);
+        var owns_address = true;
+        errdefer if (owns_address) self.allocator.free(owned_address);
+
+        const id = self.inproc_dials.items.len;
+        const req_dial = try self.allocator.create(InprocDial);
+        var owns_dial = true;
+        errdefer if (owns_dial) self.allocator.destroy(req_dial);
+
+        req_dial.* = .{
+            .id = id,
+            .address = owned_address,
+            .socket = try socket.Socket(.req).init(self.allocator, options.socket),
+        };
+        owns_address = false;
+        errdefer if (owns_dial) req_dial.deinit(self.allocator);
+
+        try req_dial.socket.dialInproc(network, address);
+        try self.inproc_dials.append(self.allocator, req_dial);
+        owns_dial = false;
+        return id;
+    }
+
+    pub fn inprocDial(self: *Node, id: InprocDialId) ?*InprocDial {
+        if (id >= self.inproc_dials.items.len) return null;
+        return self.inproc_dials.items[id];
+    }
+
+    /// Sends one request on a dialed inproc transport and records it
+    /// for event-side correlation. The correlation id is assigned and
+    /// returned; the reply (or terminal failure) arrives later as a
+    /// `poll` event keyed by that id.
+    ///
+    /// Send-path pressure is synchronous and observable:
+    /// `error.QueueFull`/`error.FlowControlled` (peer queue full),
+    /// `error.EndpointClosed` (peer closed), `error.NoPeer`. Map them
+    /// through `classifyRequestError` for the shared failure
+    /// vocabulary.
+    pub fn requestInproc(
+        self: *Node,
+        dial_id: InprocDialId,
+        outgoing: message.OutgoingMessage,
+    ) !message.MessageId {
+        const req_dial = self.inprocDial(dial_id) orelse return error.EndpointNotFound;
+
+        // Keep the node's pending table and the socket's inflight
+        // state in lockstep before adding a new entry, so a reply for
+        // anything already expired classifies as late (dropped), not
+        // as an unexpected correlation miss.
+        try self.expireInprocPending(self.nowMs());
+
+        const now_ms = self.nowMs();
+        const id = try req_dial.socket.sendRequestAt(outgoing, now_ms);
+        errdefer _ = req_dial.socket.cancelRequest(id);
+
+        try self.inproc_pending.append(self.allocator, .{
+            .dial_id = dial_id,
+            .id = id,
+            .deadline_ms = outgoing.deadline_ms,
+            .sent_at_ms = now_ms,
+        });
+        self.counters.sent += 1;
+        return id;
+    }
+
+    /// Cancels a pending outbound request. Emits `request_failed`
+    /// with `.canceled` so the correlating consumer learns the
+    /// outcome; a reply arriving later is dropped and counted.
+    pub fn cancelInprocRequest(self: *Node, dial_id: InprocDialId, id: message.MessageId) !bool {
+        for (self.inproc_pending.items, 0..) |pending, index| {
+            if (pending.dial_id != dial_id or pending.id != id) continue;
+
+            _ = self.inproc_pending.orderedRemove(index);
+            if (self.inprocDial(dial_id)) |req_dial| {
+                _ = req_dial.socket.cancelRequest(id);
+            }
+            try self.emit(.{ .request_failed = .{
+                .dial_id = dial_id,
+                .id = id,
+                .failure = .canceled,
+            } });
+            return true;
+        }
+        return false;
+    }
+
+    /// Replies to a request surfaced as a `request` event, while the
+    /// event is still alive (its subject is echoed when the outgoing
+    /// reply leaves the subject empty).
+    pub fn replyInproc(
+        self: *Node,
+        request: *const RequestEvent,
+        outgoing: message.OutgoingMessage,
+    ) !void {
+        const endpoint = self.inprocRepEndpoint(request.endpoint_id) orelse return error.EndpointNotFound;
+        try endpoint.socket.replyKey(.{
+            .id = request.msg.id,
+            .deadline_ms = request.msg.deadline_ms,
+            .subject = request.msg.subject,
+        }, outgoing);
+        self.counters.sent += 1;
+    }
+
+    /// Replies with an error message instead of a payload; the
+    /// requester's `ReplyEvent` carries `flags.err` plus the
+    /// `qmsg-error-code` / `qmsg-error-message` headers.
+    pub fn replyErrorInproc(
+        self: *Node,
+        request: *const RequestEvent,
+        app_error: socket.ErrorReply,
+    ) !void {
+        const endpoint = self.inprocRepEndpoint(request.endpoint_id) orelse return error.EndpointNotFound;
+        try endpoint.socket.replyErrorKey(.{
+            .id = request.msg.id,
+            .deadline_ms = request.msg.deadline_ms,
+            .subject = request.msg.subject,
+        }, app_error);
+        self.counters.sent += 1;
+    }
+
+    /// Binds one inproc pub endpoint; subscribers dial this address
+    /// to receive `publishInproc` fanout.
+    pub fn listenInprocPub(
+        self: *Node,
+        network: *transport.inproc.Network,
+        address: []const u8,
+        options: InprocPubOptions,
+    ) !InprocPubId {
+        if (self.inproc_pubs.items.len >= self.options.max_sessions) return error.TooManySessions;
+
+        const owned_address = try self.allocator.dupe(u8, address);
+        var owns_address = true;
+        errdefer if (owns_address) self.allocator.free(owned_address);
+
+        const id = self.inproc_pubs.items.len;
+        const endpoint = try self.allocator.create(InprocPubEndpoint);
+        var owns_endpoint = true;
+        errdefer if (owns_endpoint) self.allocator.destroy(endpoint);
+
+        endpoint.* = .{
+            .id = id,
+            .network = network,
+            .address = owned_address,
+            .socket = try socket.Socket(.@"pub").init(self.allocator, options.socket),
+        };
+        owns_address = false;
+        errdefer if (owns_endpoint) endpoint.deinit(self.allocator);
+
+        try endpoint.socket.listenInproc(network, address);
+        try self.inproc_pubs.append(self.allocator, endpoint);
+        owns_endpoint = false;
+        return id;
+    }
+
+    pub fn inprocPub(self: *Node, id: InprocPubId) ?*InprocPubEndpoint {
+        if (id >= self.inproc_pubs.items.len) return null;
+        return self.inproc_pubs.items[id];
+    }
+
+    /// Publishes one message to every subscriber of a node-bound pub
+    /// endpoint. Slow-peer pressure is synchronous: with a `.fail`
+    /// subscriber queue the error surfaces here (classify through
+    /// `classifyRequestError`); with drop policies the drop is
+    /// counted on the subscriber's own queue, not the node's.
+    pub fn publishInproc(self: *Node, pub_id: InprocPubId, outgoing: message.OutgoingMessage) !void {
+        const endpoint = self.inprocPub(pub_id) orelse return error.EndpointNotFound;
+        try endpoint.socket.publish(outgoing);
+        self.counters.sent += 1;
+    }
+
+    /// Dials one external inproc publisher into the node's
+    /// subscription socket (created on first use with
+    /// `NodeOptions.inproc_sub`).
+    pub fn dialInprocSub(self: *Node, network: *transport.inproc.Network, address: []const u8) !void {
+        try self.ensureInprocSub();
+        try self.inproc_sub.?.socket.dialInproc(network, address);
+    }
+
+    /// Adds a subscription filter; matching deliveries arrive as
+    /// `delivery` events carrying the filter that matched. Filters
+    /// replay to publishers whenever they are dialed, so subscribe
+    /// and dial order is free.
+    pub fn subscribeInproc(self: *Node, filter: []const u8) !void {
+        try self.ensureInprocSub();
+        try self.inproc_sub.?.socket.subscribe(filter);
+    }
+
+    pub fn unsubscribeInproc(self: *Node, filter: []const u8) void {
+        if (self.inproc_sub) |sub| sub.socket.unsubscribe(filter);
+    }
+
+    /// Live observability snapshot. Plain fields, computed from the
+    /// node counters plus the queue stats of every node-owned socket.
+    pub fn stats(self: *const Node) Stats {
+        var out = Stats{
+            .sent = self.counters.sent,
+            .recv = self.counters.recv,
+            .dropped = self.counters.dropped,
+            .events_dropped = self.counters.events_dropped,
+        };
+
+        for (self.inproc_rep_endpoints.items) |endpoint| {
+            out.accumulate(endpoint.socket.queueStats());
+        }
+        for (self.inproc_dials.items) |req_dial| {
+            out.accumulate(req_dial.socket.queueStats());
+        }
+        if (self.inproc_sub) |sub| {
+            out.accumulate(sub.socket.queueStats());
+        }
+        return out;
+    }
+
+    fn ensureInprocSub(self: *Node) !void {
+        if (self.inproc_sub != null) return;
+
+        const sub = try self.allocator.create(InprocSubEndpoint);
+        var owns_sub = true;
+        errdefer if (owns_sub) self.allocator.destroy(sub);
+
+        sub.* = .{ .socket = try socket.Socket(.sub).init(self.allocator, self.options.inproc_sub) };
+        errdefer if (owns_sub) sub.deinit();
+
+        self.inproc_sub = sub;
+        owns_sub = false;
+    }
+
+    fn inprocRepEndpoint(self: *Node, id: InprocRepId) ?*InprocRepEndpoint {
+        if (id >= self.inproc_rep_endpoints.items.len) return null;
+        return self.inproc_rep_endpoints.items[id];
+    }
+
+    fn nowMs(self: *const Node) u64 {
+        return self.now_us / std.time.us_per_ms;
+    }
+
+    /// Pumps embedded inproc state into the event queue: expired
+    /// request deadlines first, then served requests, request
+    /// replies, and subscription deliveries. Called from `poll` so
+    /// the embedder's tick/poll loop is the only driver.
+    fn pumpInproc(self: *Node) !void {
+        try self.expireInprocPending(self.nowMs());
+
+        for (self.inproc_rep_endpoints.items) |endpoint| {
+            while (try endpoint.socket.tryRecv()) |received| {
+                try self.emit(.{ .request = .{
+                    .endpoint_id = endpoint.id,
+                    .session_id = endpoint.session.id,
+                    .msg = received.message,
+                } });
+            }
+        }
+
+        for (self.inproc_dials.items) |req_dial| {
+            while (try req_dial.socket.tryRecvRaw()) |received| {
+                try self.completeInprocReply(req_dial, received);
+            }
+        }
+
+        if (self.inproc_sub) |sub| {
+            while (try sub.socket.tryRecv()) |received| {
+                const filter = sub.socket.matchedFilter(received.subject) orelse {
+                    // Filter removed between enqueue and pump: the
+                    // delivery no longer has a claiming subscription.
+                    self.counters.dropped += 1;
+                    var dropped = received;
+                    dropped.deinit();
+                    continue;
+                };
+                try self.emit(.{ .delivery = .{
+                    .filter = filter,
+                    .msg = received,
+                } });
+            }
+        }
+    }
+
+    /// Correlates one popped reply against the pending table. Late
+    /// replies (request already canceled or expired) are dropped,
+    /// counted, and surfaced as `message_dropped`.
+    fn completeInprocReply(self: *Node, req_dial: *InprocDial, msg_in: message.Message) !void {
+        var msg = msg_in;
+        for (self.inproc_pending.items, 0..) |pending, index| {
+            if (pending.dial_id != req_dial.id or pending.id != msg.id) continue;
+
+            _ = self.inproc_pending.orderedRemove(index);
+            _ = req_dial.socket.cancelRequest(msg.id);
+            try self.emit(.{ .reply = .{ .dial_id = req_dial.id, .msg = msg } });
+            return;
+        }
+
+        self.counters.dropped += 1;
+        const dropped_bytes = queue.messageByteSize(msg);
+        msg.deinit();
+        try self.emit(.{ .message_dropped = .{ .bytes = dropped_bytes } });
+    }
+
+    fn expireInprocPending(self: *Node, now_ms: u64) !void {
+        var index: usize = 0;
+        while (index < self.inproc_pending.items.len) {
+            const pending = self.inproc_pending.items[index];
+            if (!pending.isExpired(now_ms)) {
+                index += 1;
+                continue;
+            }
+
+            _ = self.inproc_pending.orderedRemove(index);
+            if (self.inprocDial(pending.dial_id)) |req_dial| {
+                _ = req_dial.socket.cancelRequest(pending.id);
+            }
+            try self.emit(.{ .request_failed = .{
+                .dial_id = pending.dial_id,
+                .id = pending.id,
+                .failure = .deadline_exceeded,
+            } });
+        }
+    }
+
     pub fn runOnce(self: *Node, dispatcher: anytype) !RunOnceResult {
         if (comptime dispatcherHas(@TypeOf(dispatcher), "dispatchInprocRep")) {
             for (self.inproc_rep_endpoints.items) |endpoint| {
@@ -561,7 +1136,18 @@ pub const Node = struct {
         return .{ .events_pending = self.eventCount() };
     }
 
+    /// Drains node state into the event queue and hands events out.
+    ///
+    /// This is the embedder's pump: it first drives the embedded
+    /// inproc service surface (request deadlines, served requests,
+    /// request replies, subscription deliveries) into the event
+    /// queue, then moves up to `out.len` events out (ownership of
+    /// each event's payload transfers to the caller — `deinit` each
+    /// one after handling). Call `tick` first so deadlines evaluate
+    /// against a fresh clock.
     pub fn poll(self: *Node, out: []Event) !usize {
+        try self.pumpInproc();
+
         const count = @min(out.len, self.events.items.len);
         for (out[0..count], 0..) |*slot, index| {
             slot.* = self.events.items[index];
@@ -587,8 +1173,25 @@ pub const Node = struct {
         return best;
     }
 
+    /// Queues one event for the embedder. Enforces the
+    /// `NodeOptions.max_events` bound: overflow drops the event
+    /// (freeing any payload it owns, counting message drops and
+    /// `Stats.events_dropped`) instead of growing without limit.
     pub fn emit(self: *Node, event: Event) !void {
-        try self.events.append(self.allocator, event);
+        if (self.events.items.len >= self.options.max_events) {
+            self.counters.events_dropped += 1;
+            if (eventCarriesMessage(event)) self.counters.dropped += 1;
+            var dropped = event;
+            dropped.deinit();
+            return;
+        }
+
+        self.events.append(self.allocator, event) catch |err| {
+            var dropped = event;
+            dropped.deinit();
+            return err;
+        };
+        if (eventCarriesMessage(event)) self.counters.recv += 1;
     }
 
     pub fn eventCount(self: *const Node) usize {
@@ -803,6 +1406,13 @@ pub const Node = struct {
         return id;
     }
 };
+
+fn eventCarriesMessage(event: Event) bool {
+    return switch (event) {
+        .request, .reply, .delivery => true,
+        .connected, .closed, .message_dropped, .request_failed => false,
+    };
+}
 
 fn sendSocketMessage(context: *anyopaque, msg: message.Message, meta: socket.QuicSendMeta) anyerror!void {
     var owned = msg;
@@ -1123,6 +1733,415 @@ test "Node runOnce dispatches one inproc rep request through dispatcher" {
     defer reply.deinit();
     try std.testing.expectEqualStrings("user.get", reply.subject);
     try std.testing.expectEqualStrings("42", reply.body);
+}
+
+// ---- embedded inproc service surface (socketless Node) ----------------------
+
+test "embedded Node serves requests and replies through poll events" {
+    const allocator = std.testing.allocator;
+
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    _ = try n.listenInprocRep(&network, "svc", .{});
+
+    var req = try socket.Socket(.req).init(allocator, .{});
+    defer req.deinit();
+    try req.dialInproc(&network, "svc");
+
+    const sent_id = try req.sendRequest(.{
+        .subject = "user.get",
+        .body = "42",
+        .deadline_ms = 250,
+    });
+
+    var events: [4]Event = undefined;
+    const count = try n.poll(&events);
+    defer for (events[0..count]) |*event| {
+        event.deinit();
+    };
+
+    var request_event: ?*RequestEvent = null;
+    for (events[0..count]) |*event| switch (event.*) {
+        .request => |*ev| request_event = ev,
+        else => {},
+    };
+
+    const served = request_event orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(InprocRepId, 0), served.endpoint_id);
+    try std.testing.expectEqual(sent_id, served.msg.id);
+    try std.testing.expectEqualStrings("user.get", served.msg.subject);
+    try std.testing.expectEqualStrings("42", served.msg.body);
+    try std.testing.expectEqual(@as(?u64, 250), served.msg.deadline_ms);
+
+    try n.replyInproc(served, .{ .subject = "", .body = "Ada" });
+
+    var reply = try req.recv();
+    defer reply.deinit();
+    try std.testing.expectEqual(sent_id, reply.id);
+    try std.testing.expectEqualStrings("user.get", reply.subject);
+    try std.testing.expectEqualStrings("Ada", reply.body);
+}
+
+test "embedded Node error replies carry the stable error shape" {
+    const allocator = std.testing.allocator;
+
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    _ = try n.listenInprocRep(&network, "svc", .{});
+
+    var req = try socket.Socket(.req).init(allocator, .{});
+    defer req.deinit();
+    try req.dialInproc(&network, "svc");
+
+    _ = try req.sendRequest(.{ .subject = "user.get", .body = "42" });
+
+    var events: [2]Event = undefined;
+    const count = try n.poll(&events);
+    defer for (events[0..count]) |*event| {
+        event.deinit();
+    };
+
+    var request_event: ?*RequestEvent = null;
+    for (events[0..count]) |*event| switch (event.*) {
+        .request => |*ev| request_event = ev,
+        else => {},
+    };
+
+    try n.replyErrorInproc(request_event orelse return error.TestUnexpectedResult, .{
+        .code = "not_found",
+        .message = "user not found",
+    });
+
+    var reply = try req.recv();
+    defer reply.deinit();
+    try std.testing.expect(reply.flags.err);
+    try std.testing.expectEqualStrings("not_found", reply.headers[0].value);
+    try std.testing.expectEqualStrings("user not found", reply.body);
+}
+
+test "embedded Node outbound request completes through reply event" {
+    const allocator = std.testing.allocator;
+
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    var rep = try socket.Socket(.rep).init(allocator, .{});
+    defer rep.deinit();
+    try rep.listenInproc(&network, "svc");
+
+    try n.tick(1_000_000);
+    const dial_id = try n.dialInprocReq(&network, "svc", .{});
+    const id = try n.requestInproc(dial_id, .{
+        .subject = "user.get",
+        .body = "42",
+        .deadline_ms = 500,
+    });
+    try std.testing.expectEqual(@as(usize, 1), n.inprocDial(dial_id).?.socket.inflightCount());
+
+    var request = try rep.recv();
+    defer request.deinit();
+    try std.testing.expectEqual(id, request.id());
+    try std.testing.expectEqualStrings("42", request.message.body);
+
+    try rep.reply(request, .{ .subject = "user.ok", .body = "Ada" });
+
+    var events: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try n.poll(&events));
+    defer events[0].deinit();
+
+    try std.testing.expectEqual(dial_id, events[0].reply.dial_id);
+    try std.testing.expectEqual(id, events[0].reply.msg.id);
+    try std.testing.expectEqualStrings("user.ok", events[0].reply.msg.subject);
+    try std.testing.expectEqualStrings("Ada", events[0].reply.msg.body);
+    try std.testing.expectEqual(@as(usize, 0), n.inprocDial(dial_id).?.socket.inflightCount());
+    try std.testing.expectEqual(@as(usize, 0), n.inproc_pending.items.len);
+}
+
+test "embedded Node request deadline expires into classified failure and drops late reply" {
+    const allocator = std.testing.allocator;
+
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    var rep = try socket.Socket(.rep).init(allocator, .{});
+    defer rep.deinit();
+    try rep.listenInproc(&network, "svc");
+
+    try n.tick(1_000_000);
+    const dial_id = try n.dialInprocReq(&network, "svc", .{});
+    const id = try n.requestInproc(dial_id, .{
+        .subject = "user.get",
+        .deadline_ms = 100,
+    });
+
+    var request = try rep.recv();
+    defer request.deinit();
+
+    try n.tick(1_100_000);
+    var events: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try n.poll(&events));
+
+    try std.testing.expectEqual(dial_id, events[0].request_failed.dial_id);
+    try std.testing.expectEqual(id, events[0].request_failed.id);
+    try std.testing.expectEqual(RequestFailure.deadline_exceeded, events[0].request_failed.failure);
+    events[0].deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), n.inprocDial(dial_id).?.socket.inflightCount());
+
+    // The reply lands after the deadline already fired: dropped,
+    // counted, surfaced as message_dropped.
+    try rep.reply(request, .{ .subject = "user.ok", .body = "late" });
+    try std.testing.expectEqual(@as(usize, 1), try n.poll(&events));
+    try std.testing.expectEqual(@as(usize, 0), events[0].message_dropped.session_id orelse 0);
+    try std.testing.expect(events[0].message_dropped.bytes > 0);
+    events[0].deinit();
+
+    const stats = n.stats();
+    try std.testing.expectEqual(@as(usize, 1), stats.dropped);
+}
+
+test "embedded Node cancel emits canceled failure and drops late reply" {
+    const allocator = std.testing.allocator;
+
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    var rep = try socket.Socket(.rep).init(allocator, .{});
+    defer rep.deinit();
+    try rep.listenInproc(&network, "svc");
+
+    try n.tick(1_000_000);
+    const dial_id = try n.dialInprocReq(&network, "svc", .{});
+    const id = try n.requestInproc(dial_id, .{ .subject = "user.get" });
+
+    var request = try rep.recv();
+    defer request.deinit();
+
+    try std.testing.expect(try n.cancelInprocRequest(dial_id, id));
+    try std.testing.expect(!try n.cancelInprocRequest(dial_id, id));
+
+    var events: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try n.poll(&events));
+    try std.testing.expectEqual(RequestFailure.canceled, events[0].request_failed.failure);
+    try std.testing.expectEqual(id, events[0].request_failed.id);
+    events[0].deinit();
+
+    try rep.reply(request, .{ .subject = "user.ok", .body = "late" });
+    try std.testing.expectEqual(@as(usize, 1), try n.poll(&events));
+    try std.testing.expect(events[0] == .message_dropped);
+    events[0].deinit();
+}
+
+test "embedded Node surfaces synchronous send pressure for classification" {
+    const allocator = std.testing.allocator;
+
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    _ = try n.listenInprocRep(&network, "svc", .{
+        .socket = .{ .recv_queue = .{
+            .max_messages = 1,
+            .max_bytes = 1024,
+            .on_full = .fail,
+        } },
+    });
+
+    const err = n.requestInproc(999, .{ .subject = "user.get" });
+    try std.testing.expectError(error.EndpointNotFound, err);
+    try std.testing.expectEqual(RequestFailure.no_route, classifyRequestError(error.EndpointNotFound));
+
+    const dial_id = try n.dialInprocReq(&network, "svc", .{});
+    _ = try n.requestInproc(dial_id, .{ .subject = "user.get" });
+    try std.testing.expectError(error.QueueFull, n.requestInproc(dial_id, .{ .subject = "user.get" }));
+    try std.testing.expectEqual(RequestFailure.queue_full, classifyRequestError(error.QueueFull));
+    try std.testing.expectEqual(RequestFailure.peer_closed, classifyRequestError(error.EndpointClosed));
+    try std.testing.expectEqual(@as(?RequestFailure, null), classifyRequestError(error.OutOfMemory));
+}
+
+test "embedded Node deliveries carry the matched filter and honor unsubscribe" {
+    const allocator = std.testing.allocator;
+
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    var publisher = try socket.Socket(.@"pub").init(allocator, .{});
+    defer publisher.deinit();
+    try publisher.listenInproc(&network, "events");
+
+    try n.subscribeInproc("metrics.*");
+    try n.dialInprocSub(&network, "events");
+
+    try publisher.publish(.{ .subject = "metrics.cpu", .body = "91" });
+    try publisher.publish(.{ .subject = "jobs.resize", .body = "ignored" });
+
+    var events: [2]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try n.poll(&events));
+    defer events[0].deinit();
+
+    try std.testing.expectEqualStrings("metrics.cpu", events[0].delivery.msg.subject);
+    try std.testing.expectEqualStrings("91", events[0].delivery.msg.body);
+    try std.testing.expectEqualStrings("metrics.*", events[0].delivery.filter);
+
+    n.unsubscribeInproc("metrics.*");
+    try publisher.publish(.{ .subject = "metrics.mem", .body = "92" });
+    try std.testing.expectEqual(@as(usize, 0), try n.poll(&events));
+}
+
+test "embedded Node publishes to dialed subscribers" {
+    const allocator = std.testing.allocator;
+
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    const pub_id = try n.listenInprocPub(&network, "feed", .{});
+
+    var subscriber = try socket.Socket(.sub).init(allocator, .{});
+    defer subscriber.deinit();
+    try subscriber.dialInproc(&network, "feed");
+    try subscriber.subscribe("presence.>");
+
+    try n.publishInproc(pub_id, .{ .subject = "presence.ada", .body = "online" });
+
+    var received = try subscriber.recv();
+    defer received.deinit();
+    try std.testing.expectEqualStrings("presence.ada", received.subject);
+    try std.testing.expectEqualStrings("online", received.body);
+
+    try std.testing.expectError(error.EndpointNotFound, n.publishInproc(pub_id + 1, .{ .subject = "presence.grace" }));
+}
+
+test "embedded Node stats count sent recv dropped and queue high water" {
+    const allocator = std.testing.allocator;
+
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    var rep = try socket.Socket(.rep).init(allocator, .{});
+    defer rep.deinit();
+    try rep.listenInproc(&network, "svc");
+
+    try n.tick(1_000_000);
+    const dial_id = try n.dialInprocReq(&network, "svc", .{});
+    const id = try n.requestInproc(dial_id, .{
+        .subject = "user.get",
+        .body = "42",
+        .deadline_ms = 500,
+    });
+
+    var request = try rep.recv();
+    defer request.deinit();
+    try rep.reply(request, .{ .subject = "user.ok", .body = "Ada" });
+
+    var events: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try n.poll(&events));
+    defer events[0].deinit();
+    try std.testing.expectEqual(id, events[0].reply.msg.id);
+
+    const stats = n.stats();
+    try std.testing.expectEqual(@as(usize, 1), stats.sent);
+    try std.testing.expectEqual(@as(usize, 1), stats.recv);
+    try std.testing.expectEqual(@as(usize, 0), stats.dropped);
+    try std.testing.expectEqual(@as(usize, 1), stats.queue_high_water);
+    try std.testing.expectEqual(@as(usize, 0), stats.events_dropped);
+}
+
+test "embedded Node slow-consumer drops are counted through sub queue policy" {
+    const allocator = std.testing.allocator;
+
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+
+    var n = try Node.init(allocator, .{
+        .inproc_sub = .{ .recv_queue = .{
+            .max_messages = 1,
+            .max_bytes = 1024,
+            .on_full = .drop_oldest,
+        } },
+    });
+    defer n.deinit();
+
+    var publisher = try socket.Socket(.@"pub").init(allocator, .{});
+    defer publisher.deinit();
+    try publisher.listenInproc(&network, "events");
+
+    try n.dialInprocSub(&network, "events");
+    try n.subscribeInproc("metrics.*");
+
+    try publisher.publish(.{ .subject = "metrics.cpu", .body = "first" });
+    try publisher.publish(.{ .subject = "metrics.mem", .body = "second" });
+
+    var events: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try n.poll(&events));
+    defer events[0].deinit();
+    try std.testing.expectEqualStrings("second", events[0].delivery.msg.body);
+
+    const stats = n.stats();
+    try std.testing.expectEqual(@as(usize, 1), stats.dropped);
+}
+
+test "embedded Node event queue bound drops and counts overflow" {
+    const allocator = std.testing.allocator;
+
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+
+    var n = try Node.init(allocator, .{ .max_events = 2 });
+    defer n.deinit();
+
+    _ = try n.listenInprocRep(&network, "svc", .{});
+
+    // Drain the bind-time connected event so the queue starts empty.
+    var setup: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try n.poll(&setup));
+    setup[0].deinit();
+
+    var req = try socket.Socket(.req).init(allocator, .{});
+    defer req.deinit();
+    try req.dialInproc(&network, "svc");
+
+    _ = try req.sendRequest(.{ .subject = "user.one" });
+    _ = try req.sendRequest(.{ .subject = "user.two" });
+    _ = try req.sendRequest(.{ .subject = "user.three" });
+
+    var events: [4]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try n.poll(&events));
+    for (events[0..2]) |*event| {
+        event.deinit();
+    }
+
+    const stats = n.stats();
+    try std.testing.expectEqual(@as(usize, 1), stats.events_dropped);
+    try std.testing.expectEqual(@as(usize, 1), stats.dropped);
+    try std.testing.expectEqual(@as(usize, 2), stats.recv);
 }
 
 // ---- ServerDispatch end-to-end (hermetic: no sockets) ----------------------
