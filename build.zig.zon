@@ -10,6 +10,7 @@
         "examples",
         "docs",
         "README.md",
+        "CHANGELOG.md",
         "DESIGN.md",
         "WIRE.md",
         "AUTH.md",
