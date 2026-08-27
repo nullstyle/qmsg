@@ -10,9 +10,10 @@ phase.
 
 | Phase | Status | Notes |
 | --- | --- | --- |
-| 0 Decisions and spikes | Complete enough to proceed | Package, ALPN, envelope, inproc, auth boundary, local `quic-zig` dependency, transport-parameter mapping, QUIC HELLO, reliable stream, DATAGRAM, and cancellation spikes exist. |
+| 0 Decisions and spikes | Complete enough to proceed | Package, ALPN, envelope, inproc, auth boundary, released `quic-zig` tarball pin (v0.19.0), transport-parameter mapping, QUIC HELLO, reliable stream, DATAGRAM, and cancellation spikes exist. |
 | 1 Core package skeleton | Complete | Core message, envelope, subject, queue, transport boundary, and inproc transport are implemented and tested. |
 | 2 Pair and req/rep over inproc | Complete for inproc MVP | Pair and req/rep work over inproc with ids, deadlines, cancellation, queue pressure tests, and error replies. |
+| 2b Embedded inproc Node | Complete for inproc MVP | Socketless embedder contract (`tick`/`poll`, node-owned sockets, event-complete req/rep + pub/sub, `RequestFailure` classification, bounded events, `Stats`) is implemented, tested, and documented in docs/EMBEDDING.md with examples/embedded_inproc_node.zig as the executable contract. QUIC dial-side deadline outcomes and inbound attach remain (see docs/QUIC_EMBED_SEAM.md). |
 | 3 QUIC transport MVP | In progress | `quic-zig` is wired locally. qmsg now has socket-free runtime wrappers, Node-embeddable UDP socket owners, qmsg HELLO over control streams, a per-session QUIC driver, Node listener/client tick wiring, socket attachment helpers, reliable stream pumps, req/rep over hermetic QUIC runtime tests, hermetic QUIC App dispatch examples, and an opt-in Node/App localhost smoke example. Public QUIC socket convenience APIs remain. |
 | 4 App facade | Partial | Route registration, `Context`, in-memory dispatch, inproc REP `runOnce`, auth checks, default REP error replies, QUIC listener/session lifecycle hooks, decoded QUIC message/datagram dispatch, socket hook examples, and an initial live Node/App localhost example exist. Full socket-attached App-over-live-UDP examples remain. |
 | 5 Pub/sub reliable | Partial | Inproc pub/sub, source-side subscription registry, replay/update, slow-consumer behavior, transport-agnostic SUBSCRIBE/UNSUBSCRIBE helpers, and QUIC control-frame queue/apply state are implemented. Automatic live-session emission remains. |
@@ -354,7 +355,9 @@ The smallest useful public MVP:
 - handler facade for `rep`;
 - deadlines and cancellation;
 - basic examples;
-- datagram helper surface and decoded App dispatch.
+- datagram helper surface and decoded App dispatch;
+- the socketless embedded inproc Node surface (`tick`/`poll` events,
+  request-failure classification, `Stats`).
 
 This MVP is enough to prove the core idea: nng-style messaging patterns with
 Zig ergonomics over QUIC, without HTTP/3 in the design.

@@ -33,12 +33,20 @@ tranches are building around:
   `transport.quic_control` for qmsg-owned QUIC options, UDP ownership,
   session driving, stream, cancellation, datagram, and live control-frame
   surfaces over `quic-zig`;
-- `App`, `Context`, and `Session`.
+- `App`, `Context`, and `Session`;
+- an embeddable socketless `Node` surface: the embedder owns the
+  loop and clock (`tick`/`poll`), the Node owns every inproc socket,
+  and all outcomes render from poll events — requests with
+  correlation ids and deadlines, replies, classified request
+  failures (`RequestFailure`), pub/sub deliveries with the matched
+  filter, drop accounting, and plain `Stats` counters. See
+  [docs/EMBEDDING.md](docs/EMBEDDING.md) and
+  [examples/embedded_inproc_node.zig](examples/embedded_inproc_node.zig).
 
 The inproc socket examples build and run against the current public API. The
 App facade can now serve inproc REP routes through `runOnce`, and can prepare
-QUIC listener/session runtime plumbing. QUIC currently has
-a compiled `quic-zig` dependency, option wrappers, transport-parameter
+QUIC listener/session runtime plumbing. QUIC has a pinned released
+`quic-zig` dependency (URL+hash tarball, v0.19.0), option wrappers, transport-parameter
 mapping, socket-free runtime wrappers around `quic_zig.Server`/`Client`,
 Node-embeddable UDP socket owners, per-session QUIC drivers, socket QUIC
 attachment callbacks, App dispatch for already-decoded QUIC messages,
@@ -160,6 +168,38 @@ pub fn main() !void {
 
 See [examples/app_ergonomics.zig](examples/app_ergonomics.zig) for the current
 facade handler shape over inproc req/rep.
+
+## Embedding a Node (socketless inproc)
+
+For host runtimes that own their own loop — scripting bridges, actor
+frameworks, supervisors — a `Node` embeds without sockets, threads,
+or a hidden runtime. The embedder drives `tick(now_us)` and
+`poll(&events)`; the Node owns every inproc socket and renders every
+outcome from events alone:
+
+```zig
+node.tick(now_us) catch {};
+var events: [16]qmsg.node.Event = undefined;
+const count = try node.poll(&events);
+for (events[0..count]) |*event| {
+    defer event.deinit();
+    switch (event.*) {
+        .request => |*ev| try node.replyInproc(ev, .{ .subject = "", .body = "ok" }),
+        .reply, .request_failed, .delivery, .message_dropped, .connected, .closed => {},
+    }
+}
+```
+
+Backpressure is observable (synchronous send errors plus a bounded
+event queue with drop counters) and `node.stats()` returns plain
+fields. The full contract — wiring, event semantics, error
+classification, ownership — is
+[docs/EMBEDDING.md](docs/EMBEDDING.md), and
+[examples/embedded_inproc_node.zig](examples/embedded_inproc_node.zig)
+is the executable form of it (run it with
+`zig build examples && ./zig-out/bin/embedded-inproc-node` — deterministic,
+virtual clock, no sockets). Inbound QUIC attach for embedders is a
+designed, reviewable seam: [docs/QUIC_EMBED_SEAM.md](docs/QUIC_EMBED_SEAM.md).
 
 ## Embeddable QUIC Hooks
 
@@ -306,3 +346,6 @@ The design files remain the source of intent while implementation lands:
 - [WIRE.md](WIRE.md): initial QUIC wire protocol sketch.
 - [AUTH.md](AUTH.md): PASETO/PASERK authentication and key-management plan.
 - [ROADMAP.md](ROADMAP.md): implementation milestones and validation plan.
+- [docs/EMBEDDING.md](docs/EMBEDDING.md): the socketless embedded Node contract.
+- [docs/QUIC_EMBED_SEAM.md](docs/QUIC_EMBED_SEAM.md): the inbound QUIC
+  embed seam design (embedder-owned listener and Driver).
