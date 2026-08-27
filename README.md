@@ -338,6 +338,19 @@ For internet-facing QUIC builds, follow `quic-zig`'s production posture and
 use `ReleaseSafe`; the current qmsg QUIC surface has embeddable runtime pieces
 but is not yet a production listener/dialer with public socket APIs.
 
+### Package resolution note (macOS)
+
+If a tarball pin fails with `hash mismatch: manifest declares
+<name>-<version>-… but the fetched package has N-V-__8AA…`, the
+global package cache is stale, not the pin: clear the global cache
+(default `~/.cache/zig`, or your `ZIG_GLOBAL_CACHE_DIR`) — and the
+project's `zig-pkg` if an `N-V-__8AA…` entry appeared in it — and
+re-resolve. Interrupted fetches leave temp dirs that make subsequent
+resolution hash the unstripped package (unnamed id) even though the
+same URL hashes correctly on a clean cache. Fetching with
+`COPYFILE_DISABLE=1` avoids the AppleDouble variant of the same
+poisoning.
+
 ## Repository Notes
 
 The design files remain the source of intent while implementation lands:
