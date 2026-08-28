@@ -197,6 +197,30 @@ will-close path — is
 [examples/embedded_quic_attach.zig](../examples/embedded_quic_attach.zig)
 is the executable form.
 
+### Outbound requests over QUIC: outcomes, not just replies
+
+`Node.requestQuic(session_id, outgoing)` sends a request on a QUIC
+session AND records it for terminal-outcome classification — the
+QUIC twin of `requestInproc`. It returns the stream the request
+rides; the `(session_id, stream_id)` pair keys every later surface: a
+`quic_reply` event (or a `recvReliable` pop — the session wrapper
+settles the pending entry for you), or exactly one
+`quic_request_failed` event when the request dies without one:
+
+- `.deadline_exceeded` — the deadline passed against the node clock
+  (`tick`'s `now_us`),
+- `.canceled` — you called `Node.cancelQuicRequest` (which also
+  RESET/STOP_SENDINGs the stream when the node owns the connection),
+- `.peer_closed` — the session closed or was torn down.
+
+Classification is first-wins and idempotent with a consumer's own
+pending table: whichever side observes an outcome first, the other
+ignores — see
+[QUIC_REQUEST_OUTCOMES.md](QUIC_REQUEST_OUTCOMES.md). Raw
+`queueReliable` sends remain untracked (a plain reliable send is not
+a request); send-path errors from `requestQuic` stay synchronous and
+map through `classifyRequestError` like the inproc ones.
+
 ## Relation to the App facade
 
 `App` (the handler-registration facade over the same Node) consumes

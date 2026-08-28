@@ -192,23 +192,21 @@ Because there is one Driver and it is the embedder's:
 
 The inproc embedded surface classifies outcomes
 (`RequestFailure`: deadline/canceled/queue-full/peer-closed/no-route)
-from the node's pending table (`Node.requestInproc`). Over QUIC
-dials, the same table extends naturally: `queueReliable` returns the
-stream id to key on, deadline expiry is evaluated in `tick` against
-the node clock, and wire-level cancellation maps onto the existing
-CANCEL control-frame helpers (`transport/quic_cancel.zig`) plus
-stream reset. What is NOT built today: no QUIC-side request timeout
-fires in `Node.tick` — the hermetic end-to-end dispatch test
-completes req/rep with deadlines carried on the wire, but an
-unserved request does not yet surface a deadline outcome. That state
-machine (pending table + `request_failed` events over QUIC) is the
-first Phase B work item after this sprint, and it reuses the
-embedded event vocabulary unchanged.
+from the node's pending table (`Node.requestInproc`). Over QUIC dials
+the same table now exists: `Node.requestQuic` records the
+`(session, stream)` pair, deadline expiry is evaluated in `tick`
+against the node clock, `Node.cancelQuicRequest` maps onto the
+existing cancel plans (`transport/quic_cancel.zig`, app code
+`0x51_01`, applied where the node owns the connection), and a dying
+session classifies its pending as `.peer_closed`. The full contract —
+including the first-classification-wins idempotency with a consumer's
+own pending table — is recorded in docs/QUIC_REQUEST_OUTCOMES.md.
 
 ## Deferred (recorded, not built)
 
-- QUIC dial-side request deadline/cancellation outcomes (Phase B):
-  no timeout fires on `Node.tick` for outbound QUIC requests yet.
-  The consumer's pending table (keyed by session+stream, first
-  classification wins) and qmsg's planned classification are
-  idempotent together by construction.
+- Per-stream inbound RESET observation on the dial side: individual
+  stream resets are covered by the connection-level `.peer_closed`
+  path; surfacing recv-state per stream would need a consumer ask.
+- A wire action on deadline expiry (STOP_SENDING for the expired
+  request's reply half): deliberately not sent today, matching
+  consumer-side deadline enforcement behavior.

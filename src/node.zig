@@ -154,6 +154,18 @@ pub const QuicDeliveryEvent = struct {
     }
 };
 
+/// Terminal outcome for one of the node's outbound QUIC requests
+/// (sent with `requestQuic`): no reply event will follow this
+/// `(session_id, stream_id)` pair. Classifications are first-wins and
+/// idempotent with a consumer's own pending table — whichever side
+/// observes an outcome first, the other ignores.
+pub const QuicRequestFailedEvent = struct {
+    session_id: QuicSessionId,
+    stream_id: u64,
+    id: message.MessageId,
+    failure: RequestFailure,
+};
+
 pub const Event = union(enum) {
     connected: session.SessionId,
     closed: session.SessionId,
@@ -165,6 +177,7 @@ pub const Event = union(enum) {
     quic_request: QuicRequestEvent,
     quic_reply: QuicReplyEvent,
     quic_delivery: QuicDeliveryEvent,
+    quic_request_failed: QuicRequestFailedEvent,
 
     /// Releases memory the event owns. Every event pulled out of
     /// `Node.poll` must be deinited by the embedder after handling.
@@ -176,7 +189,7 @@ pub const Event = union(enum) {
             .quic_request => |*ev| ev.deinit(),
             .quic_reply => |*ev| ev.deinit(),
             .quic_delivery => |*ev| ev.deinit(),
-            .connected, .closed, .message_dropped, .request_failed => {},
+            .connected, .closed, .message_dropped, .request_failed, .quic_request_failed => {},
         }
     }
 };
@@ -313,6 +326,25 @@ const PendingInprocRequest = struct {
     }
 };
 
+/// One outbound QUIC request awaiting its reply, keyed by the
+/// `(session_id, stream_id)` pair the reply event carries — the same
+/// key a consumer's correlation table uses. Outcomes are
+/// first-classification-wins: whichever of the reply surfacing, the
+/// deadline, an explicit cancel, or the session dying is observed
+/// first settles the entry; later observations are no-ops.
+const PendingQuicRequest = struct {
+    session_id: QuicSessionId,
+    stream_id: u64,
+    id: message.MessageId,
+    deadline_ms: ?u64,
+    sent_at_ms: u64,
+
+    fn isExpired(self: PendingQuicRequest, now_ms: u64) bool {
+        const deadline_ms = self.deadline_ms orelse return false;
+        return now_ms >= self.sent_at_ms +| deadline_ms;
+    }
+};
+
 pub const QuicListenOptions = struct {
     tls_cert_pem: []const u8 = "",
     tls_key_pem: []const u8 = "",
@@ -391,6 +423,11 @@ pub const QuicClientRuntime = struct {
 
 pub const QuicSessionRuntime = struct {
     runtime: transport.quic_session_runtime.QuicSessionRuntime,
+    /// The node that owns this session, for pending-request
+    /// bookkeeping (`recvReliable` settles the request a popped
+    /// reply completes). Sessions only exist through node creation
+    /// paths, so the pointer is always set.
+    node: *Node,
     transport_ready: bool = false,
     /// True when the listener-side Driver owns this session's
     /// lifecycle (created on handshake, destroyed via will-close).
@@ -412,6 +449,17 @@ pub const QuicSessionRuntime = struct {
 
     pub fn queueReliable(self: *QuicSessionRuntime, outgoing: message.OutgoingMessage) !u64 {
         return self.runtime.queueReliable(outgoing);
+    }
+
+    /// Pops one received reliable message. Replies popped here settle
+    /// the node's pending entry for their `(session, stream)` — a
+    /// later sweep cannot misclassify a reply the consumer already
+    /// holds. (Draining through `.runtime.recvReliable` directly
+    /// bypasses settlement; see `Node.settleQuicRequest`.)
+    pub fn recvReliable(self: *QuicSessionRuntime) ?transport.quic_session_runtime.ReceivedReliable {
+        const received = self.runtime.recvReliable() orelse return null;
+        _ = self.node.settleQuicRequest(self.id(), received.stream_id);
+        return received;
     }
 
     pub fn replyReliableOnStream(self: *QuicSessionRuntime, stream_id: u64, outgoing: message.OutgoingMessage) !void {
@@ -504,6 +552,7 @@ pub const Node = struct {
     inproc_pubs: std.ArrayList(*InprocPubEndpoint) = .empty,
     inproc_sub: ?*InprocSubEndpoint = null,
     inproc_pending: std.ArrayList(PendingInprocRequest) = .empty,
+    quic_pending: std.ArrayList(PendingQuicRequest) = .empty,
     counters: Counters = .{},
     quic_listeners: std.ArrayList(*QuicListenerRuntime) = .empty,
     quic_clients: std.ArrayList(*QuicClientRuntime) = .empty,
@@ -543,6 +592,7 @@ pub const Node = struct {
         self.quic_sessions.deinit(self.allocator);
         self.quic_socket_attachments.deinit(self.allocator);
         self.inproc_pending.deinit(self.allocator);
+        self.quic_pending.deinit(self.allocator);
         if (self.inproc_sub) |sub| {
             sub.deinit();
             self.allocator.destroy(sub);
@@ -593,6 +643,7 @@ pub const Node = struct {
         self.now_us = now_us;
         try self.tickQuicListeners(now_us);
         try self.tickQuicClients(now_us);
+        try self.sweepQuicPending(self.nowMs());
     }
 
     pub fn listenQuic(self: *Node, endpoint: []const u8, options: QuicListenOptions) !QuicListenerId {
@@ -1092,6 +1143,10 @@ pub const Node = struct {
                         .msg = incoming,
                     } });
                 } else {
+                    // A reply completes its pending request (if the
+                    // consumer registered one): first classification
+                    // wins, and the reply is the outcome.
+                    _ = self.settleQuicRequest(runtime.id(), stream_id);
                     try self.emit(.{ .quic_reply = .{
                         .session_id = runtime.id(),
                         .stream_id = stream_id,
@@ -1165,6 +1220,166 @@ pub const Node = struct {
         const runtime = self.quicSession(session_id) orelse return error.EndpointNotFound;
         try runtime.queueDatagram(outgoing);
         self.counters.sent += 1;
+    }
+
+    // ---- outbound QUIC request outcomes (docs/QUIC_REQUEST_OUTCOMES.md) ----
+
+    /// Sends one request on a QUIC session and records it for
+    /// event-side outcome classification. Returns the stream the
+    /// request rides — the `(session_id, stream_id)` pair keys the
+    /// reply (`quic_reply`) and every terminal outcome
+    /// (`quic_request_failed`). Raw `queueReliable` sends stay
+    /// untracked: a plain reliable send is not a request.
+    ///
+    /// Send-path pressure is synchronous (`error.QueueFull` /
+    /// `FlowControlled` / `EndpointClosed` / `InvalidState` before
+    /// the session is ready); map it through `classifyRequestError`.
+    /// Deadlines are relative milliseconds against the node clock
+    /// (`tick`'s `now_us`), exactly like `requestInproc`.
+    pub fn requestQuic(
+        self: *Node,
+        session_id: QuicSessionId,
+        outgoing: message.OutgoingMessage,
+    ) !u64 {
+        const runtime = self.quicSession(session_id) orelse return error.EndpointNotFound;
+
+        // Keep the pending table in lockstep before adding a new
+        // entry, so an outcome for anything already expired or
+        // settled classifies before a new request joins the table.
+        try self.sweepQuicPending(self.nowMs());
+
+        const stream_id = try runtime.queueReliable(outgoing);
+        try self.quic_pending.append(self.allocator, .{
+            .session_id = session_id,
+            .stream_id = stream_id,
+            .id = outgoing.id,
+            .deadline_ms = outgoing.deadline_ms,
+            .sent_at_ms = self.nowMs(),
+        });
+        self.counters.sent += 1;
+        return stream_id;
+    }
+
+    /// Cancels a pending outbound QUIC request: removes its pending
+    /// entry and emits `quic_request_failed{.canceled}`. When the
+    /// node owns the request's connection (dial clients) the cancel
+    /// also reaches the wire — RESET of our send half plus
+    /// STOP_SENDING for the reply half (app code `0x51_01`) — so a
+    /// conforming peer stops computing the reply. First-wins: a
+    /// request that already settled (reply observed, deadline fired,
+    /// session died) returns false and nothing is emitted.
+    pub fn cancelQuicRequest(
+        self: *Node,
+        session_id: QuicSessionId,
+        stream_id: u64,
+    ) !bool {
+        const pending = self.takeQuicPending(session_id, stream_id) orelse return false;
+
+        if (self.quicClientConnection(session_id)) |conn| {
+            const plan = transport.quic_cancel.cancelPlan(
+                stream_id,
+                .explicit,
+                .bidirectional,
+            );
+            _ = transport.quic_cancel.applyCancelPlan(conn, plan, .{}) catch {};
+        }
+
+        try self.emit(.{ .quic_request_failed = .{
+            .session_id = session_id,
+            .stream_id = stream_id,
+            .id = pending.id,
+            .failure = .canceled,
+        } });
+        return true;
+    }
+
+    /// Settles a pending request because its reply was observed —
+    /// silently: the reply itself is the outcome. Called
+    /// automatically by the session wrapper's `recvReliable` and by
+    /// the `quic_reply` event drain; consumers draining replies
+    /// through the inner runtime directly call this when they pop a
+    /// reply they registered via `requestQuic`. Returns whether a
+    /// pending entry was removed.
+    pub fn settleQuicRequest(
+        self: *Node,
+        session_id: QuicSessionId,
+        stream_id: u64,
+    ) bool {
+        const pending = self.takeQuicPending(session_id, stream_id) orelse return false;
+        _ = pending;
+        return true;
+    }
+
+    fn takeQuicPending(
+        self: *Node,
+        session_id: QuicSessionId,
+        stream_id: u64,
+    ) ?PendingQuicRequest {
+        for (self.quic_pending.items, 0..) |pending, index| {
+            if (pending.session_id != session_id or pending.stream_id != stream_id) continue;
+            return self.quic_pending.orderedRemove(index);
+        }
+        return null;
+    }
+
+    /// The connection of a node-owned dial client, when one exists
+    /// for `session_id`. Listener-side and embedded sessions ride
+    /// connections the node does not own — no cancel plan can be
+    /// applied there.
+    fn quicClientConnection(self: *Node, session_id: QuicSessionId) ?*transport.quic_runtime.Connection {
+        for (self.quic_clients.items) |client| {
+            if (client.id() != session_id) continue;
+            return client.client.runtime.connection();
+        }
+        return null;
+    }
+
+    /// One outcome pass over the QUIC pending table, in
+    /// first-observation order per entry: a dead session classifies
+    /// `.peer_closed`; a reply already sitting in the session's
+    /// inbox settles silently (the consumer has not popped it yet,
+    /// but the outcome is no longer in doubt); a passed deadline
+    /// classifies `.deadline_exceeded`. Called from `tick` and
+    /// before each `requestQuic` append.
+    fn sweepQuicPending(self: *Node, now_ms: u64) !void {
+        var index: usize = 0;
+        while (index < self.quic_pending.items.len) {
+            const pending = self.quic_pending.items[index];
+
+            const runtime = self.quicSession(pending.session_id);
+            const dead = runtime == null or
+                runtime.?.runtime.isClosingOrClosed();
+            if (dead) {
+                _ = self.quic_pending.orderedRemove(index);
+                try self.emit(.{ .quic_request_failed = .{
+                    .session_id = pending.session_id,
+                    .stream_id = pending.stream_id,
+                    .id = pending.id,
+                    .failure = .peer_closed,
+                } });
+                continue;
+            }
+
+            if (runtime.?.runtime.inboxHasStream(pending.stream_id)) {
+                // The reply arrived; the consumer just has not popped
+                // it yet. Settled — no event.
+                _ = self.quic_pending.orderedRemove(index);
+                continue;
+            }
+
+            if (pending.isExpired(now_ms)) {
+                _ = self.quic_pending.orderedRemove(index);
+                try self.emit(.{ .quic_request_failed = .{
+                    .session_id = pending.session_id,
+                    .stream_id = pending.stream_id,
+                    .id = pending.id,
+                    .failure = .deadline_exceeded,
+                } });
+                continue;
+            }
+
+            index += 1;
+        }
     }
 
     /// Correlates one popped reply against the pending table. Late
@@ -1536,6 +1751,7 @@ pub const Node = struct {
         errdefer if (owns_runtime) self.allocator.destroy(runtime);
 
         runtime.* = .{
+            .node = self,
             .runtime = try transport.quic_session_runtime.QuicSessionRuntime.init(
                 self.allocator,
                 self.nextSessionId(),
@@ -1600,7 +1816,7 @@ pub const Node = struct {
 fn eventCarriesMessage(event: Event) bool {
     return switch (event) {
         .request, .reply, .delivery, .quic_request, .quic_reply, .quic_delivery => true,
-        .connected, .closed, .message_dropped, .request_failed => false,
+        .connected, .closed, .message_dropped, .request_failed, .quic_request_failed => false,
     };
 }
 
@@ -3244,6 +3460,205 @@ test "foreign embedder: two requests on one session, one unanswered, keep the co
     try std.testing.expectEqual(transport.quic.State.ready, srv_sess.state());
 }
 
+// ---- outbound QUIC request outcomes (docs/QUIC_REQUEST_OUTCOMES.md) --------
+
+fn outcomeTestSession(n: *Node) !*QuicSessionRuntime {
+    const sess = try n.openQuicSession(.{
+        .role = .client,
+        .transport = .{ .peer_id = "outcome-client" },
+    });
+    sess.transport_ready = true;
+    try sess.runtime.onQuicReady();
+
+    const allocator = sess.runtime.allocator;
+    const peer_hello = try transport.quic.encodeHelloControlStream(allocator, .{
+        .peer_id = "outcome-server",
+    });
+    defer allocator.free(peer_hello);
+    try sess.runtime.session.acceptPeerControl(peer_hello);
+    return sess;
+}
+
+fn injectReplyForTest(
+    sess: *QuicSessionRuntime,
+    stream_id: u64,
+    id: message.MessageId,
+) !void {
+    const allocator = sess.runtime.allocator;
+    var incoming = try message.Message.init(allocator, .{
+        .subject = "user.get",
+        .id = id,
+        .flags = .{ .final = true },
+        .body = "reply",
+    });
+    errdefer incoming.deinit();
+    try sess.runtime.inbox.append(allocator, .{
+        .stream_id = stream_id,
+        .message = incoming,
+    });
+}
+
+fn pollForQuicRequestFailed(
+    n: *Node,
+    events: []Event,
+) !?QuicRequestFailedEvent {
+    const count = try n.poll(events);
+    var found: ?QuicRequestFailedEvent = null;
+    for (events[0..count]) |*event| {
+        defer event.deinit();
+        switch (event.*) {
+            .quic_request_failed => |ev| found = ev,
+            else => {},
+        }
+    }
+    return found;
+}
+
+test "quic request outcomes: deadline, reply-wins, cancel, close, first-wins" {
+    const allocator = std.testing.allocator;
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    // Deadline expiry classifies once, keyed (session, stream), and
+    // never re-classifies.
+    {
+        const sess = try outcomeTestSession(&n);
+        const stream_id = try n.requestQuic(sess.id(), .{
+            .subject = "remote.slow",
+            .id = 1,
+            .deadline_ms = 100,
+            .body = "x",
+        });
+        try n.tick(1_000);
+        var events: [4]Event = undefined;
+        try std.testing.expectEqual(
+            @as(?QuicRequestFailedEvent, null),
+            try pollForQuicRequestFailed(&n, &events),
+        );
+
+        try n.tick(150_000); // deadline (sent_at 1ms + 100ms) passed
+        const failed = (try pollForQuicRequestFailed(&n, &events)).?;
+        try std.testing.expectEqual(sess.id(), failed.session_id);
+        try std.testing.expectEqual(stream_id, failed.stream_id);
+        try std.testing.expectEqual(@as(message.MessageId, 1), failed.id);
+        try std.testing.expectEqual(RequestFailure.deadline_exceeded, failed.failure);
+
+        try n.tick(500_000);
+        try std.testing.expectEqual(
+            @as(?QuicRequestFailedEvent, null),
+            try pollForQuicRequestFailed(&n, &events),
+        );
+    }
+
+    // A reply already in the inbox settles the request silently — the
+    // reply IS the outcome — and popping it through the wrapper
+    // settles too; no deadline fires afterwards either way.
+    {
+        const sess = try outcomeTestSession(&n);
+        const stream_id = try n.requestQuic(sess.id(), .{
+            .subject = "remote.echo",
+            .id = 2,
+            .deadline_ms = 100,
+            .body = "y",
+        });
+        try injectReplyForTest(sess, stream_id, 2);
+        try n.tick(150_000); // deadline passed, but the reply won
+        var events: [4]Event = undefined;
+        try std.testing.expectEqual(
+            @as(?QuicRequestFailedEvent, null),
+            try pollForQuicRequestFailed(&n, &events),
+        );
+        try std.testing.expectEqual(@as(usize, 0), n.quic_pending.items.len);
+
+        // Wrapper pop settles requests whose reply was injected.
+        const stream_id_b = try n.requestQuic(sess.id(), .{
+            .subject = "remote.echo",
+            .id = 3,
+            .deadline_ms = 100,
+            .body = "z",
+        });
+        try injectReplyForTest(sess, stream_id_b, 3);
+        var popped = sess.recvReliable() orelse return error.ReplyMissing;
+        popped.deinit();
+        try n.tick(150_000);
+        try std.testing.expectEqual(
+            @as(?QuicRequestFailedEvent, null),
+            try pollForQuicRequestFailed(&n, &events),
+        );
+    }
+
+    // Explicit cancel classifies .canceled exactly once; a second
+    // cancel is a no-op.
+    {
+        const sess = try outcomeTestSession(&n);
+        const stream_id = try n.requestQuic(sess.id(), .{
+            .subject = "remote.echo",
+            .id = 4,
+            .body = "w",
+        });
+        try std.testing.expect(try n.cancelQuicRequest(sess.id(), stream_id));
+        var events: [4]Event = undefined;
+        const failed = (try pollForQuicRequestFailed(&n, &events)).?;
+        try std.testing.expectEqual(RequestFailure.canceled, failed.failure);
+        try std.testing.expectEqual(@as(message.MessageId, 4), failed.id);
+
+        try std.testing.expect(!(try n.cancelQuicRequest(sess.id(), stream_id)));
+        try n.tick(1_000);
+        try std.testing.expectEqual(
+            @as(?QuicRequestFailedEvent, null),
+            try pollForQuicRequestFailed(&n, &events),
+        );
+    }
+
+    // A dying session classifies every still-pending request as
+    // .peer_closed.
+    {
+        const sess = try outcomeTestSession(&n);
+        _ = try n.requestQuic(sess.id(), .{ .subject = "remote.a", .id = 5, .body = "a" });
+        _ = try n.requestQuic(sess.id(), .{ .subject = "remote.b", .id = 6, .body = "b" });
+        sess.runtime.beginClosing();
+
+        try n.tick(1_000);
+        var events: [4]Event = undefined;
+        const count = try n.poll(&events);
+        var failures: usize = 0;
+        try std.testing.expect(count >= 2);
+        for (events[0..count]) |*event| {
+            defer event.deinit();
+            switch (event.*) {
+                .quic_request_failed => |ev| {
+                    failures += 1;
+                    try std.testing.expectEqual(sess.id(), ev.session_id);
+                    try std.testing.expectEqual(RequestFailure.peer_closed, ev.failure);
+                },
+                .connected => {}, // session-creation event still queued
+                else => return error.UnexpectedEvent,
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), failures);
+        try std.testing.expectEqual(@as(usize, 0), n.quic_pending.items.len);
+    }
+
+    // Raw queueReliable stays untracked: no deadline classification
+    // for plain reliable sends.
+    {
+        const sess = try outcomeTestSession(&n);
+        _ = try sess.queueReliable(.{
+            .subject = "plain.send",
+            .id = 7,
+            .deadline_ms = 10,
+            .body = "untracked",
+        });
+        try n.tick(100_000);
+        var events: [4]Event = undefined;
+        try std.testing.expectEqual(
+            @as(?QuicRequestFailedEvent, null),
+            try pollForQuicRequestFailed(&n, &events),
+        );
+        try std.testing.expectEqual(@as(usize, 0), n.quic_pending.items.len);
+    }
+}
+
 // ---- live-UDP acceptance (skipped when the sandbox denies binds) ------------
 
 test "live UDP: queueReliable round trip needs no explicit accept and deinit with live sessions is clean" {
@@ -3498,19 +3913,18 @@ test "live UDP: answered and unanswered requests on one dial session (phase B mi
     }
     try std.testing.expectEqual(transport.quic.State.ready, client.state());
 
-    const echo_stream = try client.queueReliable(.{
+    const echo_stream = try n.requestQuic(client_session_id, .{
         .subject = "remote.echo",
         .id = 11,
         .deadline_ms = 2_000,
         .body = "payload",
     });
-    const silent_stream = try client.queueReliable(.{
+    const silent_stream = try n.requestQuic(client_session_id, .{
         .subject = "remote.silent",
         .id = 12,
         .deadline_ms = 60,
         .body = "x",
     });
-    _ = silent_stream;
 
     var dispatcher = LivePhaseBDispatcher{ .allocator = allocator };
     var got_reply: ?transport.quic_session_runtime.ReceivedReliable = null;
@@ -3519,7 +3933,9 @@ test "live UDP: answered and unanswered requests on one dial session (phase B mi
         now_us += 1_000;
         try n.tick(now_us);
         _ = try n.runOnce(&dispatcher);
-        got_reply = client.runtime.recvReliable();
+        // Wrapper pop: settles the request the reply completes, so a
+        // later sweep cannot misclassify it.
+        got_reply = client.recvReliable();
     }
     var reply = got_reply orelse return error.ReplyMissing;
     defer reply.deinit();
@@ -3532,7 +3948,7 @@ test "live UDP: answered and unanswered requests on one dial session (phase B mi
     try std.testing.expectEqual(transport.quic.State.ready, client.state());
     try std.testing.expect(liveServerSessionReady(&n, client_session_id));
 
-    const third_stream = try client.queueReliable(.{
+    const third_stream = try n.requestQuic(client_session_id, .{
         .subject = "remote.echo",
         .id = 13,
         .deadline_ms = 2_000,
@@ -3544,7 +3960,7 @@ test "live UDP: answered and unanswered requests on one dial session (phase B mi
         now_us += 1_000;
         try n.tick(now_us);
         _ = try n.runOnce(&dispatcher);
-        if (client.runtime.recvReliable()) |late| {
+        if (client.recvReliable()) |late| {
             if (late.stream_id == third_stream) {
                 third = late;
             } else {
@@ -3556,6 +3972,41 @@ test "live UDP: answered and unanswered requests on one dial session (phase B mi
     var got_third = third orelse return error.ThirdReplyMissing;
     defer got_third.deinit();
     try std.testing.expectEqual(@as(message.MessageId, 13), got_third.message.id);
+    try std.testing.expectEqual(transport.quic.State.ready, client.state());
+
+    // Dial-side outcome classification, live: the silent request —
+    // dispatched by the server, never answered — ends as exactly one
+    // `quic_request_failed{.deadline_exceeded}` keyed by its (session,
+    // stream); the answered and third requests never classify.
+    var silent_failure: ?QuicRequestFailedEvent = null;
+    var stray_failures: usize = 0;
+    step = 0;
+    while (step < 20_000 and silent_failure == null) : (step += 1) {
+        now_us += 1_000;
+        try n.tick(now_us);
+        _ = try n.runOnce(&dispatcher);
+        var events: [4]Event = undefined;
+        const count = try n.poll(&events);
+        for (events[0..count]) |*event| {
+            defer event.deinit();
+            switch (event.*) {
+                .quic_request_failed => |ev| {
+                    if (ev.stream_id == silent_stream) {
+                        silent_failure = ev;
+                    } else {
+                        stray_failures += 1;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    const failed = silent_failure orelse return error.SilentFailureMissing;
+    try std.testing.expectEqual(client_session_id, failed.session_id);
+    try std.testing.expectEqual(@as(message.MessageId, 12), failed.id);
+    try std.testing.expectEqual(RequestFailure.deadline_exceeded, failed.failure);
+    try std.testing.expectEqual(@as(usize, 0), stray_failures);
+    try std.testing.expectEqual(@as(usize, 0), n.quic_pending.items.len);
     try std.testing.expectEqual(transport.quic.State.ready, client.state());
 }
 

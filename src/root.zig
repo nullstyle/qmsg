@@ -83,6 +83,7 @@ pub const InprocPubId = node.InprocPubId;
 pub const QuicRequestEvent = node.QuicRequestEvent;
 pub const QuicReplyEvent = node.QuicReplyEvent;
 pub const QuicDeliveryEvent = node.QuicDeliveryEvent;
+pub const QuicRequestFailedEvent = node.QuicRequestFailedEvent;
 pub const EmbeddedDispatch = transport.quic_embedded.EmbeddedDispatch;
 pub const EmbeddedSeat = transport.quic_embedded.EmbeddedSeat;
 pub const EmbeddedDelivery = transport.quic_embedded.Delivery;

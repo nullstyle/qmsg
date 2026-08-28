@@ -425,6 +425,16 @@ pub const QuicSessionRuntime = struct {
         return self.inbox.items[0].stream_id;
     }
 
+    /// Whether a received-but-unpopped message exists for `stream_id`.
+    /// The node's pending-request sweep uses this to settle a request
+    /// whose reply has already landed, without consuming it.
+    pub fn inboxHasStream(self: *const QuicSessionRuntime, stream_id: u64) bool {
+        for (self.inbox.items) |received| {
+            if (received.stream_id == stream_id) return true;
+        }
+        return false;
+    }
+
     pub fn inboxLen(self: QuicSessionRuntime) usize {
         return self.inbox.items.len;
     }
