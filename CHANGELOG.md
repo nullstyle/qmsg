@@ -5,6 +5,65 @@ All notable changes to qmsg are documented in this file.
 The project is pre-1.0. Any 0.x release may include breaking API
 changes.
 
+## [0.1.6] - 2026-08-28
+
+Dial-side QUIC request outcomes (the Phase B item deferred since the
+embed-seam review), plus the ReleaseSafe resolution the changelog has
+carried as a known issue since 0.1.0.
+
+### Added
+
+- **`Node.requestQuic` / `cancelQuicRequest` / `settleQuicRequest`
+  and the `quic_request_failed` event** — terminal-outcome
+  classification for outbound QUIC requests, the twin of the inproc
+  surface's pending table. A node-owned table keyed
+  `(session_id, stream_id)` — the same key the `quic_reply` event
+  carries — settles first-classification-wins on whichever outcome is
+  observed first: the reply surfacing (settled silently; the session
+  wrapper's `recvReliable` settles on pop, the `quic_reply` drain
+  settles inline, and a reply already sitting in the inbox settles at
+  sweep time), a passed deadline at `tick`
+  (`quic_request_failed{.deadline_exceeded}`), an explicit cancel
+  (`.canceled`, plus a RESET/STOP_SENDING cancel plan on the wire
+  when the node owns the connection), or the session dying
+  (`.peer_closed` for every still-pending request). The contract —
+  including idempotency with a consumer's own pending table, exactly
+  as the mruby-quic review requested ("pending keyed by
+  session+stream, first classification wins") — is recorded in
+  docs/QUIC_REQUEST_OUTCOMES.md, written before the code. Raw
+  `queueReliable` sends stay untracked; send-path errors remain
+  synchronous through `classifyRequestError`.
+- `QuicSessionRuntime.recvReliable` on the node-level session wrapper
+  (the inner runtime's pop, plus pending settlement), and
+  `QuicSessionRuntime.inboxHasStream` on the transport runtime for
+  the sweep's reply-already-landed check.
+
+### Fixed
+
+- **ReleaseSafe no longer fails to link** — the `___ubsan_handle_*`
+  undefined-symbol failure (known issue since 0.1.0, tracked as
+  upstream boringssl-zig/quic-zig) is resolved through the current
+  pins: qmsg's own full suite passes 329/329 at `--release=safe`,
+  and the consumer dependency-instantiation check (qmsg as a path
+  dependency with `.{ .target, .optimize }` forwarded) builds and
+  runs green in safe mode. The 0.1.1 note stands as history; this
+  entry supersedes it.
+
+### Testing
+
+- Hermetic outcome suite: deadline classifies once and never
+  re-classifies; a reply already in the inbox settles silently and
+  beats a passed deadline; wrapper pops settle; cancel classifies
+  `.canceled` exactly once (second cancel is a no-op); a dying
+  session classifies every pending request `.peer_closed`; raw
+  `queueReliable` sends never classify.
+- Live-UDP acceptance (phase-B mirror upgraded): the silent request
+  ends as exactly one `quic_request_failed{.deadline_exceeded}`
+  keyed to its (session, stream) while the answered requests never
+  classify and the connection stays ready.
+- Full suite 329 tests (246 root + 83 transport) in debug AND
+  `--release=safe`; all nine examples run (localhost live).
+
 ## [0.1.5] - 2026-08-28
 
 Fixes for three consumer-reported defects in the v0.1.4 embed seam
