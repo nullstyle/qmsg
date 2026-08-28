@@ -5,6 +5,26 @@ All notable changes to qmsg are documented in this file.
 The project is pre-1.0. Any 0.x release may include breaking API
 changes.
 
+## [0.1.1] - 2026-08-27
+
+The dependency-build fix: qmsg could not be instantiated as a
+dependency. Consumers that forward `optimize` into
+`b.dependency("qmsg", …)` (the normal shape) made qmsg's own
+`b.dependency("quic"/"paseto", …)` calls fail with
+`invalid option: optimize` before any module was even requested —
+dependency builds on this toolchain reject an `optimize` option for
+these packages. qmsg now forwards only `.target` to its dependencies;
+consumers forward `.optimize` to qmsg and it stops there. Verified by
+building a scratch consumer that instantiates qmsg as a path
+dependency with `.{ .target, .optimize }` forwarded (debug mode, full
+transitive graph). No source-level API changes.
+
+Known issue (pre-existing at 0.1.0, upstream of qmsg): ReleaseSafe
+links that actually pull boringssl's C objects in fail with
+undefined `___ubsan_handle_*` symbols on this toolchain. Debug-mode
+dependency builds are unaffected. This needs a boringssl-zig/quic-zig
+-side resolution; not caused or changed by this release.
+
 ## [0.1.0] - 2026-08-27
 
 The first pinnable release, cut for the mruby-quic actor-messaging

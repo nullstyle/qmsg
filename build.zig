@@ -4,14 +4,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // .optimize is deliberately NOT forwarded: dependency builds on
+    // this toolchain reject an `optimize` option (quic-zig's build
+    // errors with `invalid option: optimize` before any module is
+    // requested), which made qmsg itself unbuildable as a dependency
+    // of a consumer that forwards optimize here. Consumers forward
+    // .optimize to qmsg; qmsg forwards only .target onward.
     const paseto_dep = b.dependency("paseto", .{
         .target = target,
-        .optimize = optimize,
     });
     const paseto_mod = paseto_dep.module("paseto");
     const quic_dep = b.dependency("quic", .{
         .target = target,
-        .optimize = optimize,
     });
     const quic_mod = quic_dep.module("quic");
 
