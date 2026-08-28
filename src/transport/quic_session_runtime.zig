@@ -63,6 +63,11 @@ pub const ReceivedReliable = struct {
 pub const QuicSessionRuntime = struct {
     allocator: std.mem.Allocator,
     session: quic.QuicSession,
+    /// True when this session's inbound messages are consumed
+    /// through the owner's `poll` events (the embedded pull model)
+    /// instead of `runOnce` dispatch. Set by the attach dispatch
+    /// that created the session on a foreign embedder's connection.
+    event_delivery: bool = false,
     stream_ids: quic_streams.StreamIdAllocator,
     control_sender: ?quic_streams.ControlStreamSender = null,
     control_flush_sender: ?quic_control.FlushSender = null,

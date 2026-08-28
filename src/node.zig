@@ -112,6 +112,48 @@ pub const DeliveryEvent = struct {
     }
 };
 
+/// An inbound request on an attached embedded QUIC session. `msg`
+/// is owned by the event: `msg.id` is the reply correlation id,
+/// `msg.deadline_ms` the request deadline. Reply through
+/// `Node.replyQuic` while the event is alive, then `deinit`.
+pub const QuicRequestEvent = struct {
+    session_id: QuicSessionId,
+    stream_id: u64,
+    msg: message.Message,
+
+    pub fn deinit(self: *QuicRequestEvent) void {
+        self.msg.deinit();
+        self.* = undefined;
+    }
+};
+
+/// A reply completing one of the node's outbound QUIC requests
+/// (sent with `queueReliable` on the session). `stream_id` is the
+/// request's own stream — the (session, stream) pair the caller's
+/// pending table is keyed on. Peer error replies carry `flags.err`
+/// and the `qmsg-error-code` / `qmsg-error-message` headers.
+pub const QuicReplyEvent = struct {
+    session_id: QuicSessionId,
+    stream_id: u64,
+    msg: message.Message,
+
+    pub fn deinit(self: *QuicReplyEvent) void {
+        self.msg.deinit();
+        self.* = undefined;
+    }
+};
+
+/// One DATAGRAM delivery on an attached embedded QUIC session.
+pub const QuicDeliveryEvent = struct {
+    session_id: QuicSessionId,
+    msg: message.Message,
+
+    pub fn deinit(self: *QuicDeliveryEvent) void {
+        self.msg.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const Event = union(enum) {
     connected: session.SessionId,
     closed: session.SessionId,
@@ -120,6 +162,9 @@ pub const Event = union(enum) {
     reply: ReplyEvent,
     request_failed: RequestFailedEvent,
     delivery: DeliveryEvent,
+    quic_request: QuicRequestEvent,
+    quic_reply: QuicReplyEvent,
+    quic_delivery: QuicDeliveryEvent,
 
     /// Releases memory the event owns. Every event pulled out of
     /// `Node.poll` must be deinited by the embedder after handling.
@@ -128,6 +173,9 @@ pub const Event = union(enum) {
             .request => |*ev| ev.deinit(),
             .reply => |*ev| ev.deinit(),
             .delivery => |*ev| ev.deinit(),
+            .quic_request => |*ev| ev.deinit(),
+            .quic_reply => |*ev| ev.deinit(),
+            .quic_delivery => |*ev| ev.deinit(),
             .connected, .closed, .message_dropped, .request_failed => {},
         }
     }
@@ -1020,6 +1068,105 @@ pub const Node = struct {
         }
     }
 
+    /// Drains attached embedded QUIC sessions into the event queue
+    /// (the pull model): inbound requests on peer-initiated streams,
+    /// replies on the session's own request streams, and datagram
+    /// deliveries. The transport pumping that FILLS these inboxes is
+    /// the embedder's loop (its Driver hooks and `serviceSeat`
+    /// calls); this only drains what has arrived.
+    fn pumpEmbeddedQuic(self: *Node) !void {
+        for (self.quic_sessions.items) |runtime| {
+            if (!runtime.runtime.event_delivery) continue;
+
+            while (runtime.runtime.peekReliableStreamId()) |stream_id| {
+                const is_request = transport.quic_session_runtime.isPeerBidiStreamId(
+                    runtime.runtime.session.role,
+                    stream_id,
+                );
+                var received = runtime.runtime.recvReliable() orelse break;
+                const incoming = received.takeMessage();
+                if (is_request) {
+                    try self.emit(.{ .quic_request = .{
+                        .session_id = runtime.id(),
+                        .stream_id = stream_id,
+                        .msg = incoming,
+                    } });
+                } else {
+                    try self.emit(.{ .quic_reply = .{
+                        .session_id = runtime.id(),
+                        .stream_id = stream_id,
+                        .msg = incoming,
+                    } });
+                }
+            }
+
+            while (runtime.recvDatagram()) |received_datagram| {
+                var received = received_datagram;
+                const incoming = received.takeMessage();
+                try self.emit(.{ .quic_delivery = .{
+                    .session_id = runtime.id(),
+                    .msg = incoming,
+                } });
+            }
+        }
+    }
+
+    /// Replies to a request surfaced as a `quic_request` event, while
+    /// the event is alive. The reply rides the request's own stream;
+    /// its subject echoes the request subject when left empty, and
+    /// the request's deadline travels back on the reply.
+    pub fn replyQuic(
+        self: *Node,
+        request: *const QuicRequestEvent,
+        outgoing: message.OutgoingMessage,
+    ) !void {
+        const runtime = self.quicSession(request.session_id) orelse return error.EndpointNotFound;
+
+        var effective = outgoing;
+        if (effective.subject.len == 0) effective.subject = request.msg.subject;
+        if (effective.id == 0) effective.id = request.msg.id;
+        if (effective.deadline_ms == null) effective.deadline_ms = request.msg.deadline_ms;
+
+        try runtime.replyReliableOnStream(request.stream_id, effective);
+        self.counters.sent += 1;
+    }
+
+    /// Replies with an error message instead of a payload; the
+    /// requester's `quic_reply` event carries `flags.err` plus the
+    /// `qmsg-error-code` / `qmsg-error-message` headers.
+    pub fn replyErrorQuic(
+        self: *Node,
+        request: *const QuicRequestEvent,
+        app_error: socket.ErrorReply,
+    ) !void {
+        const runtime = self.quicSession(request.session_id) orelse return error.EndpointNotFound;
+
+        const headers = [_]message.Header{
+            .{ .name = socket.ErrorReply.code_header, .value = app_error.code },
+            .{ .name = socket.ErrorReply.message_header, .value = app_error.message },
+        };
+        var effective_subject = app_error.subject;
+        if (effective_subject.len == 0) effective_subject = request.msg.subject;
+
+        try runtime.replyReliableOnStream(request.stream_id, .{
+            .subject = effective_subject,
+            .id = request.msg.id,
+            .flags = .{ .err = true, .final = true },
+            .deadline_ms = request.msg.deadline_ms,
+            .headers = &headers,
+            .body = app_error.message,
+        });
+        self.counters.sent += 1;
+    }
+
+    /// Publishes one unreliable message on an attached embedded QUIC
+    /// session (a DATAGRAM; the session must have datagrams enabled).
+    pub fn publishQuic(self: *Node, session_id: QuicSessionId, outgoing: message.OutgoingMessage) !void {
+        const runtime = self.quicSession(session_id) orelse return error.EndpointNotFound;
+        try runtime.queueDatagram(outgoing);
+        self.counters.sent += 1;
+    }
+
     /// Correlates one popped reply against the pending table. Late
     /// replies (request already canceled or expired) are dropped,
     /// counted, and surfaced as `message_dropped`.
@@ -1074,6 +1221,11 @@ pub const Node = struct {
         }
 
         for (self.quic_sessions.items) |runtime| {
+            // Embedded attach sessions are pull-consumed: their
+            // inbound messages surface through `poll` events, never
+            // through a dispatcher.
+            if (runtime.runtime.event_delivery) continue;
+
             const attachment = self.quicSocketAttachment(runtime.id());
             const can_dispatch_reliable = comptime dispatcherHas(@TypeOf(dispatcher), "dispatchQuicReliable");
             if (attachment == null and !can_dispatch_reliable) continue;
@@ -1130,6 +1282,8 @@ pub const Node = struct {
         }
 
         for (self.quic_sessions.items) |runtime| {
+            if (runtime.runtime.event_delivery) continue;
+
             const attachment = self.quicSocketAttachment(runtime.id());
             const can_dispatch_datagram = comptime dispatcherHas(@TypeOf(dispatcher), "dispatchQuicDatagram");
             if (attachment == null and !can_dispatch_datagram) continue;
@@ -1180,6 +1334,7 @@ pub const Node = struct {
     /// against a fresh clock.
     pub fn poll(self: *Node, out: []Event) !usize {
         try self.pumpInproc();
+        try self.pumpEmbeddedQuic();
 
         const count = @min(out.len, self.events.items.len);
         for (out[0..count], 0..) |*slot, index| {
@@ -1442,7 +1597,7 @@ pub const Node = struct {
 
 fn eventCarriesMessage(event: Event) bool {
     return switch (event) {
-        .request, .reply, .delivery => true,
+        .request, .reply, .delivery, .quic_request, .quic_reply, .quic_delivery => true,
         .connected, .closed, .message_dropped, .request_failed => false,
     };
 }
@@ -2538,6 +2693,298 @@ test "Node runOnce leaves replies on own request streams undispatched" {
     defer request.deinit();
     try std.testing.expectEqual(@as(u64, 1), request.stream_id);
     try std.testing.expectEqualStrings("time.now", request.message.subject);
+}
+
+// ---- inbound embed seam (foreign-driver attach, hermetic) --------------------
+
+const quic_zig = @import("quic");
+
+/// A stand-in for mruby-quic's embedder: it owns the listener, the
+/// Driver, and the loop; qmsg only rides the connections it routes
+/// in by ALPN. Per-connection state is one embedded seat.
+const ForeignEmbedder = struct {
+    allocator: std.mem.Allocator,
+    node: *Node,
+    dispatch: transport.quic_embedded.EmbeddedDispatch(Node),
+    driver: D,
+
+    pub const D = quic_zig.app.Driver(@This());
+
+    /// Per-connection state, exactly as a real embedder keeps it: the
+    /// qmsg seat rides alongside the embedder's own connection state.
+    pub const ConnState = struct {
+        qmsg: ?transport.quic_embedded.EmbeddedDispatch(Node).Seat = null,
+    };
+
+    pub const StreamState = struct {};
+
+    fn create(
+        allocator: std.mem.Allocator,
+        node: *Node,
+        transport_options: transport.quic.QuicOptions,
+    ) !*ForeignEmbedder {
+        const self = try allocator.create(ForeignEmbedder);
+        errdefer allocator.destroy(self);
+
+        self.* = .{
+            .allocator = allocator,
+            .node = node,
+            .dispatch = transport.quic_embedded.EmbeddedDispatch(Node).init(
+                allocator,
+                node,
+                transport_options,
+                .events,
+            ),
+            .driver = undefined,
+        };
+        self.driver = try D.init(.{
+            .allocator = allocator,
+            .app = self,
+            .hooks = .{
+                .on_handshake = onHandshake,
+                .on_stream_open = onStreamOpen,
+                .on_stream_data = onStreamData,
+                .on_stream_end = onStreamEnd,
+                .on_datagram = onDatagram,
+                .on_disconnect = onDisconnect,
+            },
+            .max_tracked_streams = transport.quic_embedded.driverSizing(transport_options).max_tracked_streams,
+            .datagram_buf_bytes = transport.quic_embedded.driverSizing(transport_options).datagram_buf_bytes,
+        });
+        return self;
+    }
+
+    fn destroy(self: *ForeignEmbedder) void {
+        self.driver.deinit();
+        self.allocator.destroy(self);
+    }
+
+    fn onHandshake(app: *@This(), s: *D.Session) anyerror!void {
+        if (!transport.quic_embedded.isQmsgAlpn(s.conn)) return;
+        if (s.app.qmsg != null) return;
+        var seat = transport.quic_embedded.EmbeddedDispatch(Node).Seat.init(app.allocator);
+        try app.dispatch.onHandshake(&seat, s.conn);
+        s.app.qmsg = seat;
+    }
+
+    fn onStreamOpen(app: *@This(), s: *D.Session, e: *D.StreamEntry, bidi: bool) anyerror!void {
+        if (s.app.qmsg == null) return;
+        try app.dispatch.onStreamOpen(&s.app.qmsg.?, e.id, bidi);
+    }
+
+    fn onStreamData(app: *@This(), s: *D.Session, e: *D.StreamEntry, chunk: []const u8) anyerror!void {
+        if (s.app.qmsg == null) return;
+        try app.dispatch.onStreamData(&s.app.qmsg.?, s.conn, e.id, chunk);
+    }
+
+    fn onStreamEnd(app: *@This(), s: *D.Session, e: *D.StreamEntry, end: quic_zig.app.StreamEnd) anyerror!void {
+        if (s.app.qmsg == null) return;
+        try app.dispatch.onStreamEnd(&s.app.qmsg.?, s.conn, e.id, end);
+    }
+
+    fn onDatagram(app: *@This(), s: *D.Session, datagram: D.Datagram) anyerror!void {
+        if (s.app.qmsg == null) return;
+        try app.dispatch.onDatagram(&s.app.qmsg.?, datagram.bytes, datagram.arrived_in_early_data);
+    }
+
+    fn onDisconnect(app: *@This(), s: *D.Session) void {
+        if (s.app.qmsg == null) return;
+        app.dispatch.onDisconnect(&s.app.qmsg.?);
+        s.app.qmsg = null;
+    }
+};
+
+const EmbedTestPeers = struct {
+    listener: transport.quic_runtime.ListenerRuntime,
+    embedder: *ForeignEmbedder,
+    client: transport.quic_runtime.ClientRuntime,
+    rx: [8192]u8 = undefined,
+    now_us: u64 = 1_000,
+
+    fn drive(self: *EmbedTestPeers) !void {
+        const from: transport.quic_runtime.Address = .{ .ipv4 = .{
+            .addr = .{ 0x7f, 0, 0, 1 },
+            .port = 40_000,
+        } };
+        while (try self.client.drainOutbound(&self.rx, self.now_us)) |out| {
+            _ = try self.listener.feedInbound(.{
+                .bytes = self.rx[0..out.len],
+                .from = from,
+            }, self.now_us);
+        }
+        try self.embedder.driver.service(&self.listener.server);
+        for (self.listener.server.iterator()) |slot| {
+            const ds = self.embedder.driver.sessionOn(slot) orelse continue;
+            if (ds.app.qmsg == null) continue;
+            try self.embedder.dispatch.serviceSeat(&ds.app.qmsg.?, slot.conn);
+        }
+        while (try self.listener.drainOutbound(&self.rx, self.now_us)) |out| {
+            try self.client.feedInbound(.{ .bytes = self.rx[0..out.len] }, self.now_us);
+        }
+        try self.listener.tick(self.now_us);
+        try self.client.tick(self.now_us);
+        self.now_us += 1_000;
+    }
+};
+
+test "foreign embedder drives qmsg sessions through its own Driver end to end" {
+    const allocator = std.testing.allocator;
+    const control = @import("control.zig");
+
+    const server_opts: transport.quic.QuicOptions = .{
+        .peer_id = "embed-server",
+        .role_flags = control.RoleFlags.server,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+        .datagram_enabled = true,
+    };
+    const client_opts: transport.quic.QuicOptions = .{
+        .peer_id = "embed-client",
+        .role_flags = control.RoleFlags.client,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+        .datagram_enabled = true,
+    };
+
+    var node = try Node.init(allocator, .{});
+    defer node.deinit();
+
+    var p: EmbedTestPeers = undefined;
+    p.now_us = 1_000;
+    p.listener = try transport.quic_runtime.ListenerRuntime.init(allocator, "127.0.0.1:4433", .{
+        .tls_cert_pem = dispatch_test_cert_pem,
+        .tls_key_pem = dispatch_test_key_pem,
+        .transport = server_opts,
+    });
+    // Defer order (LIFO): listener FIRST (its Server.deinit fires the
+    // will-close hook, whose on_disconnect destroys the embedded
+    // session through the owner while the node is still alive), then
+    // the embedder's driver, then the client — the teardown
+    // ride-along under test.
+    p.embedder = try ForeignEmbedder.create(allocator, &node, server_opts);
+    defer p.embedder.destroy();
+    p.embedder.driver.attach(&p.listener.server);
+    defer p.listener.deinit();
+    p.client = try transport.quic_runtime.ClientRuntime.init(allocator, "127.0.0.1:4433", .{
+        .server_name = "localhost",
+        .insecure_skip_verify = true, // self-signed test fixture
+        .transport = client_opts,
+    });
+    defer p.client.deinit();
+
+    const client_sess = try node.openQuicSession(.{
+        .role = .client,
+        .transport = client_opts,
+    });
+
+    // Handshake + HELLO exchange: the server side is driven entirely
+    // by the embedder's Driver hooks.
+    var step: u32 = 0;
+    while (step < 4_000) : (step += 1) {
+        try p.drive();
+        if (p.client.connection().handshakeDone() and
+            p.listener.connectionCount() > 0 and
+            p.listener.connection(0).?.handshakeDone()) break;
+    }
+    client_sess.transport_ready = true;
+    try client_sess.runtime.onQuicReady();
+
+    var embedded_sess: ?*QuicSessionRuntime = null;
+    step = 0;
+    while (step < 4_000) : (step += 1) {
+        _ = try client_sess.runtime.pumpConnection(p.client.connection());
+        try p.drive();
+        if (embedded_sess == null) {
+            for (node.quic_sessions.items) |candidate| {
+                if (candidate != client_sess) embedded_sess = candidate;
+            }
+        }
+        const embedded_ready = if (embedded_sess) |sess| sess.state() == .ready else false;
+        if (client_sess.state() == .ready and embedded_ready) break;
+    }
+    try std.testing.expectEqual(transport.quic.State.ready, client_sess.state());
+    const srv_sess = embedded_sess orelse return error.ServerSessionMissing;
+    try std.testing.expectEqual(transport.quic.State.ready, srv_sess.state());
+    try std.testing.expect(srv_sess.runtime.event_delivery);
+
+    // Request: client -> embedded server through the foreign driver.
+    const stream_id = try client_sess.queueReliable(.{
+        .subject = "user.get",
+        .id = 4242,
+        .deadline_ms = 1_000,
+        .body = "ada",
+    });
+    var got_request = false;
+    step = 0;
+    while (step < 4_000 and !got_request) : (step += 1) {
+        _ = try client_sess.runtime.pumpConnection(p.client.connection());
+        try p.drive();
+        var events: [4]Event = undefined;
+        const count = try node.poll(&events);
+        for (events[0..count]) |*event| {
+            defer event.deinit();
+            switch (event.*) {
+                .quic_request => |*ev| {
+                    try std.testing.expectEqual(srv_sess.id(), ev.session_id);
+                    try std.testing.expectEqual(stream_id, ev.stream_id);
+                    try std.testing.expectEqual(@as(message.MessageId, 4242), ev.msg.id);
+                    try std.testing.expectEqualStrings("user.get", ev.msg.subject);
+                    try std.testing.expectEqualStrings("ada", ev.msg.body);
+                    try node.replyQuic(ev, .{ .subject = "", .body = "Ada Lovelace" });
+                    got_request = true;
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(got_request);
+
+    // Reply: embedded server -> client on the request's own stream
+    // (the receiver queueReliable armed).
+    var reply: ?transport.quic_session_runtime.ReceivedReliable = null;
+    step = 0;
+    while (step < 4_000 and reply == null) : (step += 1) {
+        try p.drive();
+        _ = try client_sess.runtime.pumpConnection(p.client.connection());
+        reply = client_sess.runtime.recvReliable();
+    }
+    var got_reply = reply orelse return error.ReplyMissing;
+    defer got_reply.deinit();
+    try std.testing.expectEqual(stream_id, got_reply.stream_id);
+    try std.testing.expectEqual(@as(message.MessageId, 4242), got_reply.message.id);
+    try std.testing.expectEqualStrings("Ada Lovelace", got_reply.message.body);
+
+    // Datagram delivery: client publishes, the embedded session's
+    // poll events surface it as quic_delivery.
+    _ = try transport.quic_datagram.send(
+        p.client.connection(),
+        allocator,
+        .{ .subject = "presence.ada", .flags = .{ .unreliable = true }, .body = "online" },
+        .{ .fallback = .datagram_only },
+    );
+    var got_delivery = false;
+    step = 0;
+    while (step < 4_000 and !got_delivery) : (step += 1) {
+        try p.drive();
+        var events: [4]Event = undefined;
+        const count = try node.poll(&events);
+        for (events[0..count]) |*event| {
+            defer event.deinit();
+            switch (event.*) {
+                .quic_delivery => |*ev| {
+                    try std.testing.expectEqual(srv_sess.id(), ev.session_id);
+                    try std.testing.expectEqualStrings("presence.ada", ev.msg.subject);
+                    try std.testing.expectEqualStrings("online", ev.msg.body);
+                    got_delivery = true;
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(got_delivery);
+
+    // The session's lifecycle rides the embedder's will-close path:
+    // fall off the end with the connection live; the defers tear the
+    // listener down first (hook -> onDisconnect -> session destroyed
+    // exactly once), then the driver, then the node's leftovers.
 }
 
 // ---- live-UDP acceptance (skipped when the sandbox denies binds) ------------

@@ -41,7 +41,12 @@ tranches are building around:
   failures (`RequestFailure`), pub/sub deliveries with the matched
   filter, drop accounting, and plain `Stats` counters. See
   [docs/EMBEDDING.md](docs/EMBEDDING.md) and
-  [examples/embedded_inproc_node.zig](examples/embedded_inproc_node.zig).
+  [examples/embedded_inproc_node.zig](examples/embedded_inproc_node.zig);
+- inbound QUIC attach for foreign embedders (`EmbeddedDispatch`):
+  qmsg sessions ride connections on the embedder's own listener and
+  `quic.app.Driver`, routed by ALPN, with inbound requests/replies/
+  deliveries flowing through the same `poll` events and replies via
+  `replyQuic`.
 
 The inproc socket examples build and run against the current public API. The
 App facade can now serve inproc REP routes through `runOnce`, and can prepare
@@ -198,8 +203,11 @@ classification, ownership — is
 [examples/embedded_inproc_node.zig](examples/embedded_inproc_node.zig)
 is the executable form of it (run it with
 `zig build examples && ./zig-out/bin/embedded-inproc-node` — deterministic,
-virtual clock, no sockets). Inbound QUIC attach for embedders is a
-designed, reviewable seam: [docs/QUIC_EMBED_SEAM.md](docs/QUIC_EMBED_SEAM.md).
+virtual clock, no sockets). Inbound QUIC attach — qmsg sessions riding
+a foreign embedder's listener and `quic.app.Driver`, routed by ALPN,
+consumed through the same poll events — is built:
+[docs/QUIC_EMBED_SEAM.md](docs/QUIC_EMBED_SEAM.md) and
+[examples/embedded_quic_attach.zig](examples/embedded_quic_attach.zig).
 
 ## Embeddable QUIC Hooks
 

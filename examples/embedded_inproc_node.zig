@@ -188,7 +188,7 @@ fn handleEvent(
         .message_dropped => |ev| {
             std.debug.print("message dropped: {d} bytes\n", .{ev.bytes});
         },
-        .connected, .closed => {},
+        .quic_request, .quic_reply, .quic_delivery, .connected, .closed => {},
     }
     _ = asked_id;
 }

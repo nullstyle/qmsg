@@ -1,10 +1,25 @@
-# QUIC inbound embed seam (Phase C design)
+# QUIC inbound embed seam (Phase C)
 
-**Status: design only — not built.** This is the seam for qmsg
-sessions riding connections on a FOREIGN embedder's QUIC listener
-(mruby-quic phase C): the embedder owns the listener, the UDP
-socket, and the `quic.app.Driver`; qmsg owns session state and the
-qmsg protocol. mruby-quic reviews this before it is built.
+**Status: BUILT as of v0.1.4** — `transport.quic_embedded.EmbeddedDispatch`,
+with [examples/embedded_quic_attach.zig](../examples/embedded_quic_attach.zig)
+as the executable contract and a hermetic foreign-driver end-to-end
+test (request event → `replyQuic` → reply received; datagram
+delivery event; will-close teardown ride-along). The design below is
+the record of what was built and why; the consumer (mruby-quic)
+reviewed and approved it with these decisions:
+
+- **Q1 — shared listener + ALPN routing** (confirmed): the embedder
+  routes by negotiated ALPN (`isQmsgAlpn`); qmsg connections
+  delegate wholly to the dispatch, everything else is the embedder's.
+- **Q2 — PULL model** (emphatic): embedded sessions are
+  `event_delivery` — inbound messages surface through `Node.poll`
+  events (`quic_request`, `quic_reply`, `quic_delivery`), the same
+  registry as the inproc embedded surface; `runOnce` never touches
+  them. Replies correlate by (session, stream).
+- **Q3 — AuthConfig once at init**: credentials ride the transport
+  options' `auth_config` into `EmbeddedDispatch.init` and verify once
+  at HELLO acceptance.
+- **Q4 — drop-and-count confirmed** for undecodable datagrams.
 
 Companion reading: [EMBEDDING.md](EMBEDDING.md) (the inproc
 embedder contract this extends), `src/transport/quic_app_server.zig`
@@ -33,7 +48,7 @@ The hard constraint comes from quic-zig: a `Server` has exactly ONE
 connection-will-close hook (`setConnectionWillCloseHook`), and the
 Driver is the thing that registers `D.willCloseHook` there. Two
 independent Drivers over one Server would double-consume stream data
-and fight over the single teardown slot. Therefore:
+and fight over the single teardown slot. Therefore (as built):
 
 > **There is one `quic.app.Driver` per Server — the embedder's. qmsg
 > never instantiates a Driver on the inbound seam. The embedder's App
@@ -65,14 +80,18 @@ const App = struct {
 };
 ```
 
-`EmbeddedDispatch` owns per-connection stream buffering exactly as
-`ServerDispatch.App.StreamState` does today (the pull-based qmsg
-receivers read through the same `Adapter` shape:
-`streamRead`/`streamReceiveStatus` over Driver-owned buffers). The
-embedder calls one pass hook per listener tick, before its
-`Server.tick` (the same service-before-tick ordering
-`ServerDispatch.service` documents — the stream GC must never reap a
-stream whose arrived bytes qmsg has not read).
+As built, `EmbeddedDispatch(Owner)` is the hook-body library and
+`EmbeddedSeat(Owner)` is the per-connection state (session handle,
+pre-HELLO stream accepts, per-stream inbound buffers). The dispatch
+is stateless — all state lives in seats and the owner — so the
+qmsg-owned listener's `ServerDispatch` delegates to the same bodies
+and there is exactly one copy of the teardown mechanics. The embedder
+calls `serviceSeat` once per connection per tick, after its
+`driver.service` and before its `Server.tick` (the stream GC must
+never reap a stream whose arrived bytes qmsg has not read).
+`driverSizing` derives the Driver's `max_tracked_streams` and
+`datagram_buf_bytes` from the transport options so embedders do not
+re-derive them.
 
 **Ownership statements:**
 - qmsg owns: session runtimes, control/reliable/datagram codecs,
@@ -186,24 +205,10 @@ machine (pending table + `request_failed` events over QUIC) is the
 first Phase B work item after this sprint, and it reuses the
 embedded event vocabulary unchanged.
 
-## Open questions for mruby-quic review
+## Deferred (recorded, not built)
 
-- **Q1 — listener shape:** shared listener with ALPN routing, or a
-  dedicated qmsg listener owned by the embedder? Affects hook
-  branching and TLS cert sharing; ALPN routing is the current
-  recommendation.
-- **Q2 — dispatch consumption:** does the bridge consume inbound
-  QUIC messages through `App` handlers (`dispatchQuic`, push model)
-  or should the QUIC path also feed `poll` events like the inproc
-  embedded surface (pull model)? The latter unifies the bridge's
-  event loop across phases A–C and is the leaning, but it means the
-  event queue becomes the single consumption path for QUIC sessions
-  too.
-- **Q3 — HELLO auth config surface:** who constructs the
-  `AuthConfig`/key registry for embedded qmsg sessions — the
-  embedder at `EmbeddedDispatch.init`, or per-listener? Inproc has
-  no HELLO, so this is the first place it binds.
-- **Q4 — datagram fallback policy:** on the qmsg-owned listener,
-  datagrams that cannot decode are dropped and counted; confirm the
-  embedded seam should keep drop-and-count (no reliable fallback for
-  unreliable sends).
+- QUIC dial-side request deadline/cancellation outcomes (Phase B):
+  no timeout fires on `Node.tick` for outbound QUIC requests yet.
+  The consumer's pending table (keyed by session+stream, first
+  classification wins) and qmsg's planned classification are
+  idempotent together by construction.

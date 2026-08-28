@@ -10,6 +10,7 @@ pub const quic_cancel = @import("quic_cancel.zig");
 pub const quic_datagram = @import("quic_datagram.zig");
 pub const quic_control = @import("quic_control.zig");
 pub const quic_app_server = @import("quic_app_server.zig");
+pub const quic_embedded = @import("quic_embedded.zig");
 
 pub const Kind = enum {
     inproc,

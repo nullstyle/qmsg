@@ -157,6 +157,46 @@ perspective; the only re-entry is through the explicit calls above
 rather than unwinding through callbacks. qmsg calls no embedder code
 from `tick` or `poll`.
 
+## Inbound QUIC attach (embedder-owned listener)
+
+A `Node` can also serve qmsg sessions over connections on a FOREIGN
+embedder's QUIC listener — the embedder owns the listener, the UDP
+socket, and the single `quic.app.Driver`; qmsg rides the connections
+the embedder routes to it by negotiated ALPN (`qmsg/1`). The embedder
+keeps one `EmbeddedDispatch(Node).Seat` per connection in its own
+connection state and delegates its Driver hooks:
+
+```zig
+fn onHandshake(app: *App, s: *Driver(App).Session) anyerror!void {
+    if (qmsg.isQmsgAlpn(s.conn)) {
+        var seat = qmsg.EmbeddedDispatch(Node).Seat.init(app.allocator);
+        try app.qmsg_dispatch.onHandshake(&seat, s.conn);
+        s.app.qmsg_seat = seat;
+    }
+}
+// likewise on_stream_open/data/end + on_datagram (+ the seat check),
+// on_disconnect frees the seat through the dispatch, and once per
+// tick per connection: try app.qmsg_dispatch.serviceSeat(&seat, conn);
+```
+
+Embedded sessions are pull-consumed like everything else: inbound
+requests arrive as `quic_request` events (correlation id + the
+request's stream), replies to the node's own outbound requests as
+`quic_reply` events keyed by (session, stream), and datagrams as
+`quic_delivery` events. Answer with `Node.replyQuic` (or
+`replyErrorQuic`) while the request event is alive; publish with
+`Node.publishQuic`. Credentials verify once at HELLO from the
+`auth_config` carried on the transport options passed to
+`EmbeddedDispatch.init`. Sizing for the embedder's Driver comes from
+`qmsg.embeddedDriverSizing`.
+
+The full contract — including the one-Driver constraint that forces
+this shape, and the teardown ride-along through the embedder's
+will-close path — is
+[QUIC_EMBED_SEAM.md](QUIC_EMBED_SEAM.md), and
+[examples/embedded_quic_attach.zig](../examples/embedded_quic_attach.zig)
+is the executable form.
+
 ## Relation to the App facade
 
 `App` (the handler-registration facade over the same Node) consumes

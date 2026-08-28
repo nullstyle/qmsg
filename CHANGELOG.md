@@ -5,6 +5,74 @@ All notable changes to qmsg are documented in this file.
 The project is pre-1.0. Any 0.x release may include breaking API
 changes.
 
+## [0.1.4] - 2026-08-28
+
+The inbound QUIC embed seam, built per the consumer-reviewed design
+(docs/QUIC_EMBED_SEAM.md, approved with decisions: shared listener +
+ALPN routing; pull-model events; AuthConfig once at init;
+drop-and-count datagrams).
+
+### Added
+
+- **`EmbeddedDispatch(Owner)` + `EmbeddedSeat(Owner)`** — inbound
+  qmsg attach on a FOREIGN embedder's listener: the embedder owns
+  the listener, UDP, and the one `quic.app.Driver` (quic-zig allows
+  a single will-close hook per Server); qmsg owns only the sessions
+  riding ALPN-`qmsg/1` connections. The embedder keeps one seat per
+  connection in its own connection state, delegates its Driver hooks
+  (`onHandshake`/`onStreamOpen`/`onStreamData`/`onStreamEnd`/
+  `onDatagram`/`onDisconnect`), and calls `serviceSeat` once per
+  connection per tick. `isQmsgAlpn` routes; `driverSizing` derives
+  the Driver's table/buffer sizing from transport options. The
+  dispatch is stateless (state lives in seats and the owner), so the
+  qmsg-owned listener's `ServerDispatch` now delegates to the same
+  bodies — one copy of the teardown mechanics, not two.
+- **Pull-model QUIC events** — embedded sessions are
+  `event_delivery`: inbound requests arrive as `quic_request` poll
+  events (correlation id + the request's stream + deadline), replies
+  to the node's own outbound QUIC requests as `quic_reply` events
+  keyed by (session, stream), and datagrams as `quic_delivery`
+  events — the same registry as the inproc embedded surface.
+  `Node.replyQuic`/`replyErrorQuic` answer request events (subject
+  echo and deadline carry-back mirror the inproc rules);
+  `Node.publishQuic` sends datagrams on an embedded session.
+  `runOnce` never touches event-delivery sessions.
+- **Credentials verify once at HELLO** on the embedded path via the
+  transport options' `auth_config` handed to `EmbeddedDispatch.init`
+  (Q3: once at init; there is no per-message credential check).
+- **examples/embedded_quic_attach.zig** — the executable contract:
+  a hermetic foreign-embedder loop (embedder-owned Driver, seat in
+  its own ConnState, ALPN routing) completing request/reply plus
+  datagram delivery through poll events, then teardown with the
+  connection live.
+- `QuicSessionRuntime.peekReliableStreamId` consumers get
+  `isPeerBidiStreamId`-based request/reply classification in
+  `Node.poll`; `quic_datagram.codecFromTransport` is the shared
+  datagram codec derivation.
+
+### Fixed
+
+- examples/quic_node_localhost.zig carried a truncated inline test
+  certificate (its live-UDP mode is env-gated, so nothing failed
+  loudly); both examples now inline the known-good testdata certs.
+
+### Testing
+
+- Hermetic foreign-driver end-to-end test: embedder-owned Driver
+  drives handshake → HELLO → embedded session; client request →
+  `quic_request` event → `replyQuic` → reply received on the
+  requester's own stream; client datagram → `quic_delivery` event;
+  teardown ride-along (listener will-close → onDisconnect → session
+  destroyed exactly once) with the connection live. 324/324 tests,
+  27/27 example steps, and a consumer-side dependency instantiation
+  check with `.{ .target, .optimize }` forwarded all green.
+
+### Known gaps (unchanged, documented)
+
+- QUIC dial-side request deadline/cancellation outcomes (Phase B);
+  the consumer's pending table and qmsg's planned classification
+  are idempotent together by construction.
+
 ## [0.1.3] - 2026-08-27
 
 `Node.runOnce` no longer dispatches replies as requests. A reliable

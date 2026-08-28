@@ -11,6 +11,23 @@ pub const CodecOptions = struct {
     max_header_bytes: usize = 16 * 1024,
 };
 
+/// The datagram codec a session negotiates from its transport
+/// options: payload cap is the min of the message cap and the
+/// negotiated (or default) DATAGRAM frame limit.
+pub fn codecFromTransport(options: @import("quic.zig").QuicOptions) CodecOptions {
+    const default_codec = CodecOptions{};
+    const negotiated_max = if (options.max_datagram_frame_size == 0)
+        default_codec.max_payload_size
+    else
+        std.math.cast(usize, options.max_datagram_frame_size) orelse std.math.maxInt(usize);
+
+    return .{
+        .max_payload_size = @min(options.max_message_size, negotiated_max),
+        .max_headers = options.max_header_count,
+        .max_header_bytes = options.max_header_bytes,
+    };
+}
+
 pub const QueueFullMapping = enum {
     queue_full,
     flow_controlled,

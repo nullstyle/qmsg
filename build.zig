@@ -49,14 +49,15 @@ pub fn build(b: *std.Build) void {
     quic_test_step.dependOn(&run_quic_tests.step);
 
     const examples_step = b.step("examples", "Build qmsg examples");
-    addExample(b, examples_step, qmsg_mod, paseto_mod, target, optimize, "inproc-reqrep", "examples/inproc_reqrep.zig");
-    addExample(b, examples_step, qmsg_mod, paseto_mod, target, optimize, "embedded-inproc-node", "examples/embedded_inproc_node.zig");
-    addExample(b, examples_step, qmsg_mod, paseto_mod, target, optimize, "app-ergonomics", "examples/app_ergonomics.zig");
-    addExample(b, examples_step, qmsg_mod, paseto_mod, target, optimize, "auth-paseto", "examples/auth_paseto.zig");
-    addExample(b, examples_step, qmsg_mod, paseto_mod, target, optimize, "quic-runtime-reqrep", "examples/quic_runtime_reqrep.zig");
-    addExample(b, examples_step, qmsg_mod, paseto_mod, target, optimize, "quic-socket-hooks", "examples/quic_socket_hooks.zig");
-    addExample(b, examples_step, qmsg_mod, paseto_mod, target, optimize, "quic-app-dispatch", "examples/quic_app_dispatch.zig");
-    addExample(b, examples_step, qmsg_mod, paseto_mod, target, optimize, "quic-node-localhost", "examples/quic_node_localhost.zig");
+    addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "inproc-reqrep", "examples/inproc_reqrep.zig");
+    addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "embedded-inproc-node", "examples/embedded_inproc_node.zig");
+    addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "embedded-quic-attach", "examples/embedded_quic_attach.zig");
+    addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "app-ergonomics", "examples/app_ergonomics.zig");
+    addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "auth-paseto", "examples/auth_paseto.zig");
+    addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "quic-runtime-reqrep", "examples/quic_runtime_reqrep.zig");
+    addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "quic-socket-hooks", "examples/quic_socket_hooks.zig");
+    addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "quic-app-dispatch", "examples/quic_app_dispatch.zig");
+    addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "quic-node-localhost", "examples/quic_node_localhost.zig");
 
     const test_step = b.step("test", "Run qmsg unit tests");
     test_step.dependOn(&run_unit_tests.step);
@@ -68,6 +69,7 @@ fn addExample(
     step: *std.Build.Step,
     qmsg_mod: *std.Build.Module,
     paseto_mod: *std.Build.Module,
+    quic_mod: *std.Build.Module,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     comptime name: []const u8,
@@ -80,6 +82,7 @@ fn addExample(
     });
     mod.addImport("qmsg", qmsg_mod);
     mod.addImport("paseto", paseto_mod);
+    mod.addImport("quic", quic_mod);
 
     const exe = b.addExecutable(.{
         .name = name,
