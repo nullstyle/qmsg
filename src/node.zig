@@ -4,6 +4,7 @@ const queue = @import("queue.zig");
 const socket = @import("socket.zig");
 const session = @import("session.zig");
 const transport = @import("transport/root.zig");
+const protocol = @import("protocol/root.zig");
 
 pub const NodeOptions = struct {
     max_sessions: usize = 1024,
@@ -17,6 +18,16 @@ pub const NodeOptions = struct {
     /// first `dialInprocSub`/`subscribeInproc` call. Its receive-queue
     /// policy is the slow-consumer policy for embedded deliveries.
     inproc_sub: socket.SocketOptions(.sub) = .{},
+    /// Bound on node-level QUIC subscriptions (`subscribeQuic`).
+    /// Further subscribes fail with `error.QueueFull` instead of
+    /// growing without limit.
+    max_quic_subscriptions: usize = 64,
+    /// Per-session bound on datagram publications queued for the
+    /// wire. At the bound, a subscriber's `on_full` queue policy
+    /// decides drop-newest vs drop-oldest; drops surface as
+    /// `message_dropped` and count in `Stats.dropped`. Slow
+    /// consumers shed; fan-out never blocks.
+    quic_datagram_outbox_max: usize = 64,
     io: std.Io = std.Io.Threaded.global_single_threaded.io(),
 };
 
@@ -446,6 +457,15 @@ pub const QuicSessionRuntime = struct {
     driver_owned: bool = false,
     datagram_inbox: std.ArrayList(transport.quic_datagram.ReceivedDatagram) = .empty,
     datagram_outbox: std.ArrayList(message.Message) = .empty,
+    /// Per-session control-frame state: the queue this session's
+    /// SUBSCRIBE/UNSUBSCRIBE emission flushes onto a follow-up uni
+    /// control stream, and the apply path for inbound frames (into
+    /// the node's registry). Null only before createQuicSession
+    /// finishes.
+    control_state: ?transport.quic_control.State = null,
+    /// True once the node's full subscription set has been queued
+    /// for this session (per redial-generation session).
+    subscriptions_synced: bool = false,
 
     pub fn id(self: QuicSessionRuntime) QuicSessionId {
         return self.runtime.id();
@@ -546,6 +566,9 @@ pub const QuicSessionRuntime = struct {
         }
         self.datagram_inbox.deinit(self.runtime.allocator);
         self.runtime.deinit();
+        // After the runtime: a pending flush sender references the
+        // control state's queued frames until it completes.
+        if (self.control_state) |*ctrl| ctrl.deinit();
         self.* = undefined;
     }
 };
@@ -565,6 +588,13 @@ pub const Node = struct {
     inproc_sub: ?*InprocSubEndpoint = null,
     inproc_pending: std.ArrayList(PendingInprocRequest) = .empty,
     quic_pending: std.ArrayList(PendingQuicRequest) = .empty,
+    /// QUIC pub/sub state (docs/QUIC_PUBSUB.md): the registry of
+    /// what PEERS want from us (peer id = session id), the node's
+    /// own outbound subscription set (what WE want from peers), and
+    /// the shared credit ledger the per-session control states use.
+    quic_registry: protocol.pubsub.Registry = undefined,
+    quic_subscriptions: protocol.pubsub.SubscriptionSet = undefined,
+    quic_credit_ledger: protocol.pushpull.CreditLedger = undefined,
     counters: Counters = .{},
     quic_listeners: std.ArrayList(*QuicListenerRuntime) = .empty,
     quic_clients: std.ArrayList(*QuicClientRuntime) = .empty,
@@ -574,10 +604,17 @@ pub const Node = struct {
     next_session_id: session.SessionId = 1,
 
     pub fn init(allocator: std.mem.Allocator, options: NodeOptions) !Node {
-        return .{
+        var self = Node{
             .allocator = allocator,
             .options = options,
         };
+        self.quic_registry = protocol.pubsub.Registry.init(allocator);
+        self.quic_subscriptions = protocol.pubsub.SubscriptionSet.init(
+            allocator,
+            options.max_quic_subscriptions,
+        );
+        self.quic_credit_ledger = protocol.pushpull.CreditLedger.init(allocator);
+        return self;
     }
 
     pub fn deinit(self: *Node) void {
@@ -605,6 +642,9 @@ pub const Node = struct {
         self.quic_socket_attachments.deinit(self.allocator);
         self.inproc_pending.deinit(self.allocator);
         self.quic_pending.deinit(self.allocator);
+        self.quic_registry.deinit();
+        self.quic_subscriptions.deinit();
+        self.quic_credit_ledger.deinit();
         if (self.inproc_sub) |sub| {
             sub.deinit();
             self.allocator.destroy(sub);
@@ -656,6 +696,7 @@ pub const Node = struct {
         try self.tickQuicListeners(now_us);
         try self.tickQuicClients(now_us);
         try self.sweepQuicPending(self.nowMs());
+        self.syncQuicControl();
     }
 
     pub fn listenQuic(self: *Node, endpoint: []const u8, options: QuicListenOptions) !QuicListenerId {
@@ -1248,6 +1289,145 @@ pub const Node = struct {
         self.counters.sent += 1;
     }
 
+    // ---- QUIC pub/sub across the process wall (docs/QUIC_PUBSUB.md) ----
+
+    /// Subscribes the NODE to `filter` on every QUIC session, current
+    /// and future: SUBSCRIBE frames are queued for every ready
+    /// session and re-emitted (the full set) on each NEW session that
+    /// reaches ready — a redial's replacement session inherits the
+    /// mesh's subscriptions without any re-subscribe call. State
+    /// outlives sessions by construction. Unsubscribe with
+    /// `unsubscribeQuic`. Emission rides follow-up uni control
+    /// streams through the existing queue/flush machinery; a session
+    /// that is closing or whose flush sender is busy keeps its frames
+    /// queued for a later tick, and one session's failure never
+    /// unwinds the set.
+    pub fn subscribeQuic(
+        self: *Node,
+        filter: []const u8,
+        options: queue.QueueOptions,
+    ) !void {
+        if (!try self.quic_subscriptions.add(filter)) return; // duplicate
+
+        for (self.quic_sessions.items) |runtime| {
+            if (!runtime.subscriptions_synced) continue; // full set comes at sync
+            const state = &(runtime.control_state orelse continue);
+            state.queueSubscribe(filter, options) catch continue;
+        }
+    }
+
+    /// Removes a `subscribeQuic` subscription: the filter leaves the
+    /// node set and UNSUBSCRIBE is queued for every synced session.
+    pub fn unsubscribeQuic(self: *Node, filter: []const u8) void {
+        if (!self.quic_subscriptions.remove(filter)) return;
+
+        for (self.quic_sessions.items) |runtime| {
+            if (!runtime.subscriptions_synced) continue;
+            const state = &(runtime.control_state orelse continue);
+            state.queueUnsubscribe(filter) catch continue;
+        }
+    }
+
+    /// Publishes one datagram to every QUIC session whose registry
+    /// entry matches `subject` — dial peers and embedded qmsg/1
+    /// clients alike, one registry. Returns the number of sessions
+    /// the publication was queued for. Sessions without datagram
+    /// support and over-budget outboxes are skipped and counted
+    /// (`message_dropped`, `Stats.dropped`); a subscriber's `on_full`
+    /// policy decides drop-newest vs drop-oldest at its bound. Slow
+    /// consumers shed; the loop never blocks. Publications are
+    /// lossy-tolerant by design (datagram-first; reliable-stream
+    /// publication is future work).
+    pub fn publishQuicSubscribed(self: *Node, outgoing: message.OutgoingMessage) !usize {
+        var matches: std.ArrayList(protocol.pubsub.Match) = .empty;
+        defer matches.deinit(self.allocator);
+        try self.quic_registry.collectMatches(outgoing.subject, &matches);
+
+        var delivered: usize = 0;
+        for (matches.items) |match| {
+            const runtime = self.quicSession(@intCast(match.peer_id)) orelse continue;
+            if (runtime.runtime.state() != .ready) continue;
+
+            if (!runtime.runtime.appSession().datagram_enabled) {
+                self.counters.dropped += 1;
+                self.emit(.{ .message_dropped = .{
+                    .session_id = runtime.id(),
+                    .bytes = outgoing.body.len,
+                } }) catch {};
+                continue;
+            }
+
+            if (!self.roomForQuicDatagram(runtime)) {
+                self.counters.dropped += 1;
+                self.emit(.{ .message_dropped = .{
+                    .session_id = runtime.id(),
+                    .bytes = outgoing.body.len,
+                } }) catch {};
+                continue;
+            }
+
+            runtime.queueDatagram(outgoing) catch |err| switch (err) {
+                error.MessageTooLarge => {
+                    self.counters.dropped += 1;
+                    self.emit(.{ .message_dropped = .{
+                        .session_id = runtime.id(),
+                        .bytes = outgoing.body.len,
+                    } }) catch {};
+                },
+                else => return err,
+            };
+            delivered += 1;
+        }
+        self.counters.sent += 1;
+        return delivered;
+    }
+
+    /// Makes room per the subscriber's queue policy at the outbox
+    /// bound: drop-newest reports no room (the publication sheds),
+    /// drop-oldest sheds the oldest queued datagram to make it.
+    fn roomForQuicDatagram(self: *Node, runtime: *QuicSessionRuntime) bool {
+        if (runtime.datagram_outbox.items.len < self.options.quic_datagram_outbox_max) {
+            return true;
+        }
+
+        const options = self.quic_registry.peerQueueOptions(
+            quicRegistryPeer(runtime.id()),
+        ) orelse return false;
+        switch (options.on_full) {
+            .drop_newest => return false,
+            else => {
+                var shed = runtime.datagram_outbox.orderedRemove(0);
+                shed.deinit();
+                return true;
+            },
+        }
+    }
+
+    /// Tick-driven control sync (docs/QUIC_PUBSUB.md): every ready
+    /// session not yet synced gets the FULL node subscription set
+    /// queued (redial replacements inherit the mesh), then any
+    /// session with queued frames and an idle flush sender flushes
+    /// them onto a follow-up uni control stream. Per-session
+    /// failures are contained; nothing here unwinds `tick`.
+    fn syncQuicControl(self: *Node) void {
+        for (self.quic_sessions.items) |runtime| {
+            var state = &(runtime.control_state orelse continue);
+            if (runtime.runtime.state() != .ready) continue;
+
+            if (!runtime.subscriptions_synced) {
+                for (self.quic_subscriptions.entries.items) |*entry| {
+                    state.queueSubscribe(entry.filter.text, peerQueueDefaults) catch continue;
+                }
+                runtime.subscriptions_synced = true;
+                state = &(runtime.control_state orelse continue);
+            }
+
+            if (state.queuedFrameCount() == 0) continue;
+            if (runtime.runtime.hasControlFlushSender()) continue;
+            _ = runtime.runtime.flushQueuedControl(state) catch continue;
+        }
+    }
+
     // ---- outbound QUIC request outcomes (docs/QUIC_REQUEST_OUTCOMES.md) ----
 
     /// Sends one request on a QUIC session and records it for
@@ -1679,6 +1859,21 @@ pub const Node = struct {
         } });
     }
 
+    /// Inbound control frames from a session's follow-up uni
+    /// streams (SUBSCRIBE/UNSUBSCRIBE/CREDIT): applied into the
+    /// node's registry through the session's control state. Frames
+    /// are BORROWED — the dispatch's control-read pump owns and
+    /// frees them; the registry/ledger copy what they keep.
+    pub fn driverControlFramesReceived(
+        self: *Node,
+        sess: DriverSession,
+        frames: []@import("control.zig").Frame,
+    ) !void {
+        _ = self;
+        const state = &(sess.control_state orelse return);
+        _ = try state.applyReceivedFrames(quicRegistryPeer(sess.id()), frames);
+    }
+
     fn tickQuicListeners(self: *Node, now_us: u64) !void {
         for (self.quic_listeners.items) |listener| {
             _ = try listener.listener.recvAndFeedOne(now_us);
@@ -1816,6 +2011,12 @@ pub const Node = struct {
                 role,
                 options,
             ),
+            .control_state = transport.quic_control.State.init(
+                self.allocator,
+                &self.quic_registry,
+                &self.quic_credit_ledger,
+                .{},
+            ),
         };
         errdefer if (owns_runtime) runtime.deinit();
         runtime.runtime.appSession().user_data = user_data;
@@ -1828,6 +2029,8 @@ pub const Node = struct {
 
     fn destroyQuicSession(self: *Node, runtime: *QuicSessionRuntime) void {
         self.emit(.{ .closed = runtime.id() }) catch {};
+        // A dying subscriber must not linger in the fan-out set.
+        _ = self.quic_registry.removePeer(quicRegistryPeer(runtime.id()));
         for (self.quic_sessions.items, 0..) |candidate, index| {
             if (candidate != runtime) continue;
             _ = self.quic_sessions.orderedRemove(index);
@@ -1870,6 +2073,12 @@ pub const Node = struct {
         return id;
     }
 };
+
+fn quicRegistryPeer(id: QuicSessionId) protocol.pubsub.PeerId {
+    return @intCast(id);
+}
+
+const peerQueueDefaults: queue.QueueOptions = .{};
 
 fn eventCarriesMessage(event: Event) bool {
     return switch (event) {

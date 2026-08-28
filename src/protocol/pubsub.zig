@@ -248,6 +248,12 @@ pub const Registry = struct {
         };
     }
 
+    /// The peer's queue policy, for fan-out shedding decisions.
+    pub fn peerQueueOptions(self: Registry, peer_id: PeerId) ?queue.QueueOptions {
+        const peer = self.findPeerConst(peer_id) orelse return null;
+        return peer.queue_options;
+    }
+
     pub fn matches(self: Registry, peer_id: PeerId, subject: []const u8) bool {
         const peer = self.findPeerConst(peer_id) orelse return false;
         return peer.subscriptions.matches(subject);

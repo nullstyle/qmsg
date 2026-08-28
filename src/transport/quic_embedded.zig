@@ -55,6 +55,9 @@ const quic_streams = @import("quic_streams.zig");
 
 const SessionRuntime = quic_session_runtime.QuicSessionRuntime;
 
+/// control.zig lives a level up from the transport layer.
+const quic_control_frame = @import("../control.zig").Frame;
+
 /// Whether a connection negotiated qmsg's ALPN — the routing test
 /// the embedder applies before delegating to the dispatch.
 pub fn isQmsgAlpn(conn: *quic_zig.Connection) bool {
@@ -97,10 +100,24 @@ pub fn EmbeddedSeat(comptime Owner: type) type {
         sess: ?Owner.DriverSession = null,
         pending_accepts: std.ArrayListUnmanaged(u64) = .empty,
         streams: std.AutoHashMapUnmanaged(u64, StreamBuffer) = .empty,
+        /// Incremental control-frame readers for the peer's
+        /// FOLLOW-UP uni streams (everything after the HELLO
+        /// stream): SUBSCRIBE/UNSUBSCRIBE/CREDIT ride these. Decoded
+        /// frames go to `Owner.driverControlFramesReceived`.
+        control_reads: std.ArrayListUnmanaged(ControlRead) = .empty,
+        /// Follow-up uni streams that opened before the session
+        /// reached ready (they can ride the same flight as the HELLO
+        /// tail): armed as control reads once the exchange lands.
+        pending_control_reads: std.ArrayListUnmanaged(u64) = .empty,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{ .allocator = allocator };
         }
+
+        pub const ControlRead = struct {
+            stream_id: u64,
+            receiver: quic_streams.ControlStreamReceiver,
+        };
 
         /// Inbound buffering for one stream: prefix `[0..start)` has
         /// been consumed by the adapter and compacted away;
@@ -255,9 +272,30 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
         /// from on_stream_open.
         pub fn onStreamOpen(self: *Self, seat: *Seat, stream_id: u64, bidi: bool) !void {
             _ = self;
-            if (!bidi) return;
             const sess = seat.sess orelse return;
             const rt = Owner.driverSessionRuntime(sess);
+
+            if (!bidi) {
+                // The peer's FIRST uni stream is the HELLO control
+                // stream (pre-armed by id on the runtime); every
+                // later uni stream carries follow-up control frames.
+                const role: quic_streams.Role = switch (rt.session.role) {
+                    .client => .client,
+                    .server => .server,
+                };
+                if (stream_id == quic_streams.peerControlStreamId(role)) return;
+
+                // The stream may open before the session reaches
+                // ready (same flight as the HELLO tail); arm it once
+                // the exchange lands — onStreamOpen fires once.
+                if (rt.state() != .ready) {
+                    try seat.pending_control_reads.append(seat.allocator, stream_id);
+                    return;
+                }
+                armControlRead(seat, rt, stream_id);
+                return;
+            }
+
             if (rt.state() == .ready) {
                 acceptReliable(rt, stream_id);
             } else {
@@ -294,6 +332,8 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
             end: quic_zig.app.StreamEnd,
         ) !void {
             removePendingAccept(seat, stream_id);
+            removePendingControlRead(seat, stream_id);
+            removeControlRead(seat, stream_id);
             const state = seat.streams.getPtr(stream_id) orelse return;
 
             switch (end) {
@@ -369,6 +409,11 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
         pub fn onDisconnect(self: *Self, seat: *Seat) void {
             seat.pending_accepts.deinit(seat.allocator);
             seat.pending_accepts = .empty;
+            for (seat.control_reads.items) |*read| read.receiver.deinit();
+            seat.control_reads.deinit(seat.allocator);
+            seat.control_reads = .empty;
+            seat.pending_control_reads.deinit(seat.allocator);
+            seat.pending_control_reads = .empty;
             var it = seat.streams.valueIterator();
             while (it.next()) |state| {
                 state.buf.deinit(seat.allocator);
@@ -400,7 +445,6 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
         /// Protocol errors close THIS connection instead of
         /// propagating out of the embedder's loop.
         fn pumpSeat(self: *Self, seat: *Seat, conn: *quic_zig.Connection) !void {
-            _ = self;
             const sess = seat.sess orelse return;
             const rt = Owner.driverSessionRuntime(sess);
 
@@ -411,14 +455,74 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
                 seat.pending_accepts.clearRetainingCapacity();
             }
 
+            if (rt.state() == .ready and seat.pending_control_reads.items.len > 0) {
+                for (seat.pending_control_reads.items) |stream_id| {
+                    // The stream may have ended before the session
+                    // reached ready; onStreamEnd already dropped its
+                    // pending entry, and arming a removed buffer would
+                    // decode nothing forever.
+                    if (!seat.streams.contains(stream_id)) continue;
+                    armControlRead(seat, rt, stream_id);
+                }
+                seat.pending_control_reads.clearRetainingCapacity();
+            }
+
             var adapter: Adapter = .{ .conn = conn, .seat = seat };
             _ = rt.pump(&adapter) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => {
                     rt.beginClosing();
                     conn.close(false, quic.protocol_error_code, "qmsg protocol error");
+                    return;
                 },
             };
+
+            // Follow-up control streams: decode complete frames and
+            // hand them to the owner (registry apply is node-level).
+            self.pumpControlReads(seat, &adapter) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    rt.beginClosing();
+                    conn.close(false, quic.protocol_error_code, "qmsg control frame error");
+                },
+            };
+        }
+
+        fn pumpControlReads(self: *Self, seat: *Seat, adapter: *Adapter) !void {
+            var index: usize = 0;
+            var frames: std.ArrayList(quic_control_frame) = .empty;
+            defer {
+                for (frames.items) |*frame| frame.deinit();
+                frames.deinit(seat.allocator);
+            }
+
+            while (index < seat.control_reads.items.len) {
+                const read = &seat.control_reads.items[index];
+                frames.clearRetainingCapacity();
+                const result = read.receiver.pump(adapter, &frames) catch |err| switch (err) {
+                    // The stream may have been reaped before its end
+                    // was observed; the read goes with it.
+                    error.StreamNotFound => {
+                        read.receiver.deinit();
+                        _ = seat.control_reads.orderedRemove(index);
+                        continue;
+                    },
+                    else => return err,
+                };
+
+                if (frames.items.len > 0) {
+                    // Frames are BORROWED by the owner; this defer
+                    // remains their single owner.
+                    try self.owner.driverControlFramesReceived(seat.sess.?, frames.items);
+                }
+
+                if (result.stream_complete) {
+                    read.receiver.deinit();
+                    _ = seat.control_reads.orderedRemove(index);
+                    continue;
+                }
+                index += 1;
+            }
         }
 
         fn acceptReliable(rt: *SessionRuntime, stream_id: u64) void {
@@ -428,6 +532,46 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
                 // reset/teardown paths instead.
                 else => {},
             };
+        }
+
+        fn armControlRead(seat: *Seat, rt: *SessionRuntime, stream_id: u64) void {
+            for (seat.control_reads.items) |*read| {
+                if (read.stream_id == stream_id) return;
+            }
+            seat.control_reads.append(seat.allocator, .{
+                .stream_id = stream_id,
+                .receiver = quic_streams.ControlStreamReceiver.init(
+                    seat.allocator,
+                    stream_id,
+                    .{ .codec = rt.session.options.control_codec },
+                ),
+            }) catch {
+                // Allocation failure: leave the stream unread; the
+                // peer's next flush re-sends the state.
+            };
+        }
+
+        fn removePendingControlRead(seat: *Seat, stream_id: u64) void {
+            var index: usize = 0;
+            while (index < seat.pending_control_reads.items.len) {
+                if (seat.pending_control_reads.items[index] == stream_id) {
+                    _ = seat.pending_control_reads.swapRemove(index);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+
+        fn removeControlRead(seat: *Seat, stream_id: u64) void {
+            var index: usize = 0;
+            while (index < seat.control_reads.items.len) {
+                if (seat.control_reads.items[index].stream_id == stream_id) {
+                    var removed = seat.control_reads.orderedRemove(index);
+                    removed.receiver.deinit();
+                } else {
+                    index += 1;
+                }
+            }
         }
 
         fn removePendingAccept(seat: *Seat, stream_id: u64) void {
