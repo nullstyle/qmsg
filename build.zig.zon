@@ -1,6 +1,6 @@
 .{
     .name = .qmsg,
-    .version = "0.1.4",
+    .version = "0.1.5",
     .fingerprint = 0x650c9e5831497a83,
     .minimum_zig_version = "0.17.0-dev.1786+75044cb04",
     .paths = .{

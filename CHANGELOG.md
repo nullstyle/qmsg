@@ -5,6 +5,66 @@ All notable changes to qmsg are documented in this file.
 The project is pre-1.0. Any 0.x release may include breaking API
 changes.
 
+## [0.1.5] - 2026-08-28
+
+Fixes for three consumer-reported defects in the v0.1.4 embed seam
+(mruby-quic's Phase C integration report). Two of the three share one
+root cause; all three carry regression tests that fail on v0.1.4.
+
+### Fixed
+
+- **Embedded sessions died on streams that were open but had not yet
+  delivered data** — the seam's adapter answered "no such stream"
+  (`StreamNotFound`) for any stream without a seat buffer, but
+  receivers are armed at `onStreamOpen` (and the control receiver at
+  HELLO) while the buffer first exists at `onStreamData`. Any pump in
+  that window — a `serviceSeat` pass, or another stream's data/end
+  hook in the same driver pass — killed the whole session
+  (`pumpSeat`'s protocol-error path: `beginClosing` + connection
+  close). Hermetic packet timing coalesces the flight so qmsg's own
+  tests never opened the window; real UDP timing does. This is the
+  v0.1.2→v0.1.4 reply regression on the qmsg-owned listener (the
+  ServerDispatch rewrite moved reads from the connection's stream
+  table — where an opened-but-dataless stream exists — to the seat
+  map) AND the second-request connection close on the embedded seam.
+  The adapter now reports "open, no bytes observed" (not reset, no
+  final size, nothing read) for unbuffered streams — the answer the
+  connection's own table would have given.
+- **A pump error stranded receivers/senders that completed earlier in
+  the same pass** — the removal loop never ran, so the next pump
+  failed with `InvalidState` from a stale decoded receiver (or re-FINs
+  a finished sender's stream) instead of the real cause. Both pump
+  loops now finish their removal pass before propagating an error.
+- **examples/quic_node_localhost.zig live mode failed at the TLS
+  handshake** (`InvalidState` via `mapSslError`): the dial passed no
+  `ca_pem`, and the dial path has no skip-verify escape hatch — the
+  self-signed fixture now verifies against itself, as the live-UDP
+  acceptance test already did. (The v0.1.4 cert repair was correct;
+  this was the remaining blocker.)
+
+### Testing
+
+- Hermetic foreign-driver e2e: a reply deferred past the poll loop
+  still reaches the requester; two requests on one session — one
+  answered, one deliberately never answered — keep the connection
+  alive (a third request round-trips afterwards). The latter fails on
+  v0.1.4 with `EndpointClosed`.
+- Live-UDP acceptance mirror of the consumer's phase-B shape (qmsg
+  App server on an ephemeral port, answered + never-answered requests
+  on one dial session, `tick; runOnce` driving with errors
+  surfaced — their loop swallows them with `catch {}`, which is how
+  the regression hid): fails on v0.1.4, passes now.
+- Unit: a pump error mid-pass no longer strands completed receivers
+  (the completed one is removed and its message delivered; the next
+  pump reports the real error again).
+- `runOnce`'s QUIC dispatch now tolerates dispatchers whose result
+  carries replies only (no `publications` field) — the shape of the
+  consumer's minimal dispatchers.
+- Full suite 328 tests (245 root + 83 transport); all nine examples
+  run, including the localhost example's live-UDP mode; the consumer
+  dependency-instantiation check (qmsg as a tarball-path dependency
+  with `.target` + `.optimize` forwarded) is green.
+
 ## [0.1.4] - 2026-08-28
 
 The inbound QUIC embed seam, built per the consumer-reviewed design
