@@ -4471,6 +4471,318 @@ test "live UDP: never-landing dial closes when the handshake times out" {
     try std.testing.expectEqual(@as(?*QuicSessionRuntime, null), n.quicSession(client_session_id));
 }
 
+// Hermetic fan-out mechanics (docs/QUIC_PUBSUB.md ask 2): registry
+// matching, the datagram_enabled gate, and the slow-consumer
+// shed-and-count contract at the outbox bound — drop-newest sheds the
+// publication, drop-oldest sheds the oldest queued datagram — with
+// `message_dropped` surfacing every skip.
+test "quic publish fan-out matches registry entries and sheds slow consumers" {
+    const allocator = std.testing.allocator;
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    const fast = try outcomeTestSession(&n);
+    const slow = try outcomeTestSession(&n);
+    const quiet = try outcomeTestSession(&n); // no datagram support
+
+    // fast/slow carry datagram support; quiet opts out. Opposite
+    // slow-consumer policies on the two subscribers.
+    fast.runtime.appSession().datagram_enabled = true;
+    slow.runtime.appSession().datagram_enabled = true;
+    quiet.runtime.appSession().datagram_enabled = false;
+    _ = try n.quic_registry.subscribe(quicRegistryPeer(fast.id()), "swarm.events", .{ .on_full = .drop_newest });
+    _ = try n.quic_registry.subscribe(quicRegistryPeer(slow.id()), "swarm.events", .{ .on_full = .drop_oldest });
+    _ = try n.quic_registry.subscribe(quicRegistryPeer(quiet.id()), "swarm.other", .{});
+
+    // Matching: only the swarm.events subscribers receive it.
+    try std.testing.expectEqual(@as(usize, 2), try n.publishQuicSubscribed(.{
+        .subject = "swarm.events",
+        .flags = .{ .unreliable = true },
+        .body = "one",
+    }));
+    try std.testing.expectEqual(@as(usize, 1), fast.datagram_outbox.items.len);
+    try std.testing.expectEqual(@as(usize, 1), slow.datagram_outbox.items.len);
+    try std.testing.expectEqual(@as(usize, 0), quiet.datagram_outbox.items.len);
+
+    // Fill both outboxes to the bound (default 64), then publish
+    // past it.
+    while (fast.datagram_outbox.items.len < n.options.quic_datagram_outbox_max) {
+        try fast.queueDatagram(.{ .subject = "swarm.events", .flags = .{ .unreliable = true }, .body = "fill" });
+    }
+    while (slow.datagram_outbox.items.len < n.options.quic_datagram_outbox_max) {
+        try slow.queueDatagram(.{ .subject = "swarm.events", .flags = .{ .unreliable = true }, .body = "fill" });
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), try n.publishQuicSubscribed(.{
+        .subject = "swarm.events",
+        .flags = .{ .unreliable = true },
+        .body = "two",
+    }));
+    // drop-newest shed the publication ("two" never queued); the
+    // outbox stays at the bound with "one" still first.
+    try std.testing.expectEqual(n.options.quic_datagram_outbox_max, fast.datagram_outbox.items.len);
+    try std.testing.expectEqualStrings("one", fast.datagram_outbox.items[0].body);
+    // drop-oldest shed "one" to make room for "two".
+    try std.testing.expectEqual(n.options.quic_datagram_outbox_max, slow.datagram_outbox.items.len);
+    try std.testing.expectEqualStrings("fill", slow.datagram_outbox.items[0].body);
+    try std.testing.expectEqualStrings("two", slow.datagram_outbox.items[slow.datagram_outbox.items.len - 1].body);
+
+    // The skip surfaced as message_dropped events, counted in Stats.
+    try std.testing.expect(n.stats().dropped >= 1);
+    var events: [8]Event = undefined;
+    var saw_drop = false;
+    const count = try n.poll(&events);
+    for (events[0..count]) |*event| {
+        defer event.deinit();
+        switch (event.*) {
+            .message_dropped => saw_drop = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_drop);
+
+    // A subscriber without datagram support is skipped-and-counted
+    // even on a matching subject.
+    try std.testing.expectEqual(@as(usize, 0), try n.publishQuicSubscribed(.{
+        .subject = "swarm.other",
+        .flags = .{ .unreliable = true },
+        .body = "quiet-only",
+    }));
+    try std.testing.expectEqual(@as(usize, 0), quiet.datagram_outbox.items.len);
+    quiet.runtime.appSession().datagram_enabled = true;
+    try std.testing.expectEqual(@as(usize, 1), try n.publishQuicSubscribed(.{
+        .subject = "swarm.other",
+        .flags = .{ .unreliable = true },
+        .body = "quiet-only",
+    }));
+    try std.testing.expectEqual(@as(usize, 1), quiet.datagram_outbox.items.len);
+
+    // A dying subscriber leaves the fan-out set whole.
+    quiet.runtime.beginClosing();
+    try n.tick(1_000);
+    try std.testing.expectEqual(@as(usize, 0), try n.publishQuicSubscribed(.{
+        .subject = "swarm.other",
+        .flags = .{ .unreliable = true },
+        .body = "nobody",
+    }));
+}
+
+// Hermetic emission mechanics (ask 1): the node set queues on ready
+// sessions, duplicates no-op, unsubscribe queues the delta, and a
+// session that dies drops its queued frames with the wrapper.
+test "quic node subscription set queues full set and deltas per session" {
+    const allocator = std.testing.allocator;
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    try n.subscribeQuic("swarm.events", .{});
+    try n.subscribeQuic("swarm.events", .{}); // duplicate: no-op
+    try std.testing.expectEqual(@as(usize, 1), n.quic_subscriptions.len());
+
+    const sess = try outcomeTestSession(&n);
+    try n.tick(1_000);
+    // The full set is queued for the session. Hermetically nothing
+    // pumps the session's pending HELLO sender, so the flush (which
+    // requires an idle control sender) waits — on a live session the
+    // HELLO lands first and the subscription flush follows.
+    try std.testing.expect(sess.subscriptions_synced);
+    try std.testing.expect(!sess.runtime.hasControlFlushSender());
+    try std.testing.expectEqual(@as(usize, 1), sess.control_state.?.queuedFrameCount());
+
+    // Delta on a synced session queues an UNSUBSCRIBE.
+    n.unsubscribeQuic("swarm.events");
+    try std.testing.expectEqual(@as(usize, 0), n.quic_subscriptions.len());
+    try std.testing.expectEqual(@as(usize, 2), sess.control_state.?.queuedFrameCount());
+
+    // subscribeQuic before any session exists is not an error; the
+    // set is the source of truth for later sessions.
+    var n2 = try Node.init(allocator, .{});
+    defer n2.deinit();
+    try n2.subscribeQuic("swarm.early", .{});
+    try std.testing.expectEqual(@as(usize, 1), n2.quic_subscriptions.len());
+}
+
+// The consumer's swarm item 2, verbatim contract: subscriptions are
+// NODE state that outlives sessions. A dial-side subscribeQuic lands
+// in the LISTENER's registry (follow-up uni control stream, embedded
+// apply); a registry-aware publish crosses the wall back as a
+// datagram; and after the remote dies silently and is reborn on the
+// same port, the redial's NEW session re-emits the FULL subscription
+// set with no new subscribe call — the mesh either heals here or
+// quietly loses subscriptions.
+test "live UDP: node subscriptions survive kill, reborn, and redial" {
+    const allocator = std.testing.allocator;
+    const control_mod = @import("control.zig");
+
+    var reset_key: [32]u8 = undefined;
+    for (&reset_key, 0..) |*byte, index| byte.* = @intCast(index *% 5 +% 11);
+
+    const listen_opts: transport.quic.QuicOptions = .{
+        .peer_id = "swarm-hub",
+        .role_flags = control_mod.RoleFlags.server,
+        .supported_patterns = control_mod.PatternBits.pub_ | control_mod.PatternBits.sub,
+        .datagram_enabled = true,
+    };
+    const dial_opts: transport.quic.QuicOptions = .{
+        .peer_id = "swarm-member",
+        .role_flags = control_mod.RoleFlags.client,
+        .supported_patterns = control_mod.PatternBits.pub_ | control_mod.PatternBits.sub,
+        .datagram_enabled = true,
+    };
+
+    var hub = try Node.init(allocator, .{});
+    const hub_listener_id = hub.listenQuic("127.0.0.1:0", .{
+        .tls_cert_pem = dispatch_test_cert_pem,
+        .tls_key_pem = dispatch_test_key_pem,
+        .transport = listen_opts,
+        .stateless_reset_key = reset_key,
+    }) catch |err| switch (err) {
+        error.AccessDenied,
+        error.AddressInUse,
+        error.AddressUnavailable,
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => return error.SkipZigTest,
+        else => return err,
+    };
+    const target = try localhostEndpoint(allocator, hub.quic_listeners.items[hub_listener_id].localAddress());
+    defer allocator.free(target);
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    var now_us: u64 = 1_000;
+
+    // Generation 1: dial, subscribe ONCE, and cross the wall.
+    const session_a = try n.dialQuic(target, .{
+        .server_name = "localhost",
+        .ca_pem = dispatch_test_cert_pem,
+        .transport = dial_opts,
+    });
+    var step: u32 = 0;
+    while (step < 20_000) : (step += 1) {
+        now_us += 1_000;
+        try hub.tick(now_us);
+        try n.tick(now_us);
+        if (n.quicSession(session_a).?.state() == .ready) break;
+    }
+    try std.testing.expectEqual(
+        transport.quic.State.ready,
+        n.quicSession(session_a).?.state(),
+    );
+
+    try n.subscribeQuic("swarm.events", .{});
+
+    step = 0;
+    while (step < 20_000 and hub.quic_registry.peerCount() == 0) : (step += 1) {
+        now_us += 1_000;
+        try hub.tick(now_us);
+        try n.tick(now_us);
+    }
+    try std.testing.expectEqual(@as(usize, 1), hub.quic_registry.peerCount());
+    // Registry peers key by the HUB's own session id (each node keys
+    // its registry by the sessions IT owns).
+    try std.testing.expectEqual(@as(usize, 1), hub.quic_registry.subscriptionCount(
+        @intCast(soleQuicSessionId(&hub).?),
+    ));
+
+    const delivered = try hub.publishQuicSubscribed(.{
+        .subject = "swarm.events",
+        .flags = .{ .unreliable = true },
+        .body = "hello-wall",
+    });
+    try std.testing.expectEqual(@as(usize, 1), delivered);
+
+    var got: ?transport.quic_datagram.ReceivedDatagram = null;
+    step = 0;
+    while (step < 20_000 and got == null) : (step += 1) {
+        now_us += 1_000;
+        try hub.tick(now_us);
+        try n.tick(now_us);
+        got = n.quicSession(session_a).?.recvDatagram();
+    }
+    var received = got orelse return error.WallCrossingMissing;
+    defer received.deinit();
+    try std.testing.expectEqualStrings("swarm.events", received.message.subject);
+    try std.testing.expectEqualStrings("hello-wall", received.message.body);
+
+    // Silent death (plain deinit ships nothing) + same-key reborn.
+    hub.deinit();
+    var reborn = try Node.init(allocator, .{});
+    defer reborn.deinit();
+    _ = reborn.listenQuic(target, .{
+        .tls_cert_pem = dispatch_test_cert_pem,
+        .tls_key_pem = dispatch_test_key_pem,
+        .transport = listen_opts,
+        .stateless_reset_key = reset_key,
+    }) catch |err| switch (err) {
+        error.AddressInUse, error.AddressUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+
+    // The old session observes death at the idle window (its
+    // subscription is long acked; nothing probes), the consumer's
+    // redial loop replaces it, and the replacement gets the FULL
+    // subscription set on its first ready tick — no new subscribe
+    // call anywhere below.
+    var saw_closed = false;
+    step = 0;
+    while (step < 60_000 and !saw_closed) : (step += 1) {
+        now_us += 1_000;
+        reborn.tick(now_us) catch {};
+        try n.tick(now_us);
+        var events: [4]Event = undefined;
+        const count = try n.poll(&events);
+        for (events[0..count]) |*event| {
+            defer event.deinit();
+            switch (event.*) {
+                .closed => saw_closed = true,
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(saw_closed);
+
+    const session_b = try n.dialQuic(target, .{
+        .server_name = "localhost",
+        .ca_pem = dispatch_test_cert_pem,
+        .transport = dial_opts,
+    });
+    try std.testing.expect(session_b != session_a);
+
+    step = 0;
+    while (step < 20_000 and reborn.quic_registry.peerCount() == 0) : (step += 1) {
+        now_us += 1_000;
+        try reborn.tick(now_us);
+        try n.tick(now_us);
+    }
+    // The re-emission contract: the reborn hub knows the NEW
+    // session's subscription with no subscribe call from the test.
+    try std.testing.expectEqual(@as(usize, 1), reborn.quic_registry.peerCount());
+    try std.testing.expectEqual(@as(usize, 1), reborn.quic_registry.subscriptionCount(
+        @intCast(soleQuicSessionId(&reborn).?),
+    ));
+
+    try std.testing.expectEqual(@as(usize, 1), try reborn.publishQuicSubscribed(.{
+        .subject = "swarm.events",
+        .flags = .{ .unreliable = true },
+        .body = "hello-again",
+    }));
+
+    var got2: ?transport.quic_datagram.ReceivedDatagram = null;
+    step = 0;
+    while (step < 20_000 and got2 == null) : (step += 1) {
+        now_us += 1_000;
+        try reborn.tick(now_us);
+        try n.tick(now_us);
+        got2 = n.quicSession(session_b).?.recvDatagram();
+    }
+    var received2 = got2 orelse return error.RebornDeliveryMissing;
+    defer received2.deinit();
+    try std.testing.expectEqualStrings("hello-again", received2.message.body);
+}
+
 // The under-load starvation the consumer hit: a connection with
 // unacked data in flight never idles (quic-zig bumps the activity
 // clock on SEND, so every PTO probe resets the idle timer), so a
@@ -4608,6 +4920,11 @@ test "live UDP: keyed reborn listener resets an orphan under load, fast" {
     // full quiet window. 10s of virtual time is generous for one and
     // impossible for the other.
     try std.testing.expect(now_us - death_us < 10_000_000);
+}
+
+fn soleQuicSessionId(n: *const Node) ?QuicSessionId {
+    if (n.quic_sessions.items.len != 1) return null;
+    return n.quic_sessions.items[0].id();
 }
 
 fn localhostEndpoint(allocator: std.mem.Allocator, address: std.Io.net.IpAddress) ![]u8 {

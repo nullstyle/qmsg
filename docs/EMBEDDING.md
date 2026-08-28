@@ -221,6 +221,24 @@ ignores — see
 a request); send-path errors from `requestQuic` stay synchronous and
 map through `classifyRequestError` like the inproc ones.
 
+**QUIC pub/sub crosses the process wall.** `Node.subscribeQuic(filter,
+options)` subscribes the NODE on every QUIC session, current and
+future: the full set re-emits on each new session's first ready
+tick, so a redial's replacement inherits the mesh's subscriptions
+with no re-subscribe call — state outlives sessions by construction.
+`Node.publishQuicSubscribed(outgoing)` fans a datagram out to every
+session whose registry entry matches (dial peers and embedded qmsg/1
+clients, one registry): sessions without datagram support and
+over-budget outboxes are skipped-and-counted (`message_dropped`), a
+subscriber's `on_full` policy sheds drop-newest or drop-oldest at
+its `NodeOptions.quic_datagram_outbox_max` bound, and slow consumers
+never block the loop. Inbound SUBSCRIBE/UNSUBSCRIBE from peers apply
+into the same registry on the listener/embedded seam (control frames
+beyond HELLO ride follow-up uni streams), and a dying session leaves
+the fan-out set whole on every death path. Full contract in
+[QUIC_PUBSUB.md](QUIC_PUBSUB.md); replay and reliable-stream
+publication are future work.
+
 **Dial sessions observe connection death.** A node-owned dial whose
 connection reaches QUIC's terminal closed state — a peer
 CONNECTION_CLOSE observed through the draining deadline, a stateless
