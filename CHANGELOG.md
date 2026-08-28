@@ -5,6 +5,55 @@ All notable changes to qmsg are documented in this file.
 The project is pre-1.0. Any 0.x release may include breaking API
 changes.
 
+## [0.1.8] - 2026-08-28
+
+qmsg listeners answer stateless resets (the under-load death-detection
+hole, per the mruby-quic adoption follow-up).
+
+### Added
+
+- **`QuicListenOptions.stateless_reset_key`** — RFC 9000 §10.3
+  stateless-reset HMAC key, threaded through the listener runtime to
+  quic-zig's `Server.Config`. Null (the default) generates a fresh
+  random key per listener, so every qmsg listener answers unroutable
+  orphan probes with a Stateless Reset instead of silently dropping
+  them — quic-zig's documented production posture, which qmsg's
+  `listenQuic` wiring had simply never turned on.
+
+### Fixed
+
+- **Silent death under load had no detection path.** quic-zig bumps
+  the connection's activity clock on SEND, so a connection with
+  unacked data in flight PTO-probes forever and never idles — with a
+  deadline-less request pending, a silently-dead remote left the
+  session visibly `.ready` indefinitely (the consumer reproduced
+  this: 45s of virtual time, no transition). With a keyed listener
+  on the peer's port, the orphan's first probe after the remote dies
+  earns a Stateless Reset; the client verifies it through the
+  per-CID token it was advertised at handshake (no shared secret on
+  the peer side), the connection reaches terminal closed, and the
+  v0.1.7 death observation closes the session — `.closed` plus
+  `.peer_closed` for the pending, at PTO latency rather than the
+  idle window. Pin one key across instances/restarts so a replacement
+  listener's resets verify against tokens minted by the dead
+  instance; documented in EMBEDDING.md, including the fundamental
+  residual: a port where nothing listens is still silent, and the
+  consumer-side answer there is request deadlines.
+
+### Testing
+
+- Live starvation mirror (the consumer's shape, red on keyless
+  wiring — verified by neutering the key pass-through, 331/332): a
+  deadline-less `requestQuic` in flight when the remote dies
+  SILENTLY (plain deinit — quic-zig's `Server.deinit` is local
+  teardown, nothing ships), a reborn keyed listener takes the same
+  port, and the orphan receives the reset: one `.closed`, the
+  pending classified `.peer_closed`, in under 10s of virtual time
+  where idle death needs the full quiet window and a deadline-less
+  pending would never classify at all.
+- Full suite 332 tests (249 root + 83 transport), green in debug;
+  examples run (localhost live).
+
 ## [0.1.7] - 2026-08-28
 
 Dial sessions now observe connection death (the swarm peer-visibility
