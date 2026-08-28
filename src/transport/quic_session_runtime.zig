@@ -502,17 +502,19 @@ pub const QuicSessionRuntime = struct {
 
         var senders = self.reliable_senders.iterator();
         while (senders.next()) |entry| {
-            if (try entry.value_ptr.pump(transport) == .complete) {
+            const progress = entry.value_ptr.pump(transport) catch |err| {
+                // Same discipline as the receivers: a finished sender
+                // left stranded by an error would re-FIN its (possibly
+                // reaped) stream on the next pump.
+                dropCompleted(&self.reliable_senders, complete_ids.items);
+                return err;
+            };
+            if (progress == .complete) {
                 try complete_ids.append(self.allocator, entry.key_ptr.*);
             }
         }
 
-        for (complete_ids.items) |stream_id| {
-            if (self.reliable_senders.fetchRemove(stream_id)) |entry| {
-                var sender = entry.value;
-                sender.deinit();
-            }
-        }
+        dropCompleted(&self.reliable_senders, complete_ids.items);
         return complete_ids.items.len;
     }
 
@@ -523,29 +525,44 @@ pub const QuicSessionRuntime = struct {
         var received_count: usize = 0;
         var receivers = self.reliable_receivers.iterator();
         while (receivers.next()) |entry| {
-            if (try entry.value_ptr.pump(transport)) |received| {
-                errdefer {
-                    var cleanup = received;
-                    cleanup.deinit();
-                }
-                try self.inbox.append(self.allocator, .{
-                    .stream_id = entry.key_ptr.*,
-                    .message = received,
-                });
-                try complete_ids.append(self.allocator, entry.key_ptr.*);
-                received_count += 1;
+            const received_opt = entry.value_ptr.pump(transport) catch |err| {
+                // Finish the removal pass for receivers that already
+                // completed earlier in this iteration: an error must
+                // not strand a decoded receiver (its message is in the
+                // inbox; the next pump would fail on the stale
+                // `decoded` flag instead of the real cause).
+                dropCompleted(&self.reliable_receivers, complete_ids.items);
+                return err;
+            };
+            const received = received_opt orelse continue;
+            errdefer {
+                var cleanup = received;
+                cleanup.deinit();
             }
+            try self.inbox.append(self.allocator, .{
+                .stream_id = entry.key_ptr.*,
+                .message = received,
+            });
+            try complete_ids.append(self.allocator, entry.key_ptr.*);
+            received_count += 1;
         }
 
-        for (complete_ids.items) |stream_id| {
-            if (self.reliable_receivers.fetchRemove(stream_id)) |entry| {
-                var receiver = entry.value;
-                receiver.deinit();
-            }
-        }
+        dropCompleted(&self.reliable_receivers, complete_ids.items);
         return received_count;
     }
 };
+
+/// Removes finished entries so a value that completed its work is
+/// never pumped again (a decoded receiver is an InvalidState; a
+/// finished sender would re-FIN its stream).
+fn dropCompleted(map: anytype, ids: []const u64) void {
+    for (ids) |stream_id| {
+        if (map.fetchRemove(stream_id)) |entry| {
+            var value = entry.value;
+            value.deinit();
+        }
+    }
+}
 
 pub fn mapStreamError(err: anyerror) Error {
     return switch (err) {
@@ -634,6 +651,7 @@ const FakeStream = struct {
     incoming: std.ArrayList(u8) = .empty,
     read_offset: usize = 0,
     final_size: ?u64 = null,
+    reset: bool = false,
     writes: std.ArrayList(u8) = .empty,
     write_limit: usize = std.math.maxInt(usize),
     opened_bidi: bool = false,
@@ -701,6 +719,7 @@ const FakeTransport = struct {
     pub fn streamReceiveStatus(self: *FakeTransport, stream_id: u64) ?quic_streams.ReceiveStatus {
         const stream = self.streams.getPtr(stream_id) orelse return null;
         return .{
+            .reset = stream.reset,
             .final_size = stream.final_size,
             .read_offset = @intCast(stream.read_offset),
         };
@@ -1253,6 +1272,56 @@ test "session runtime gates reliable streams until ready" {
         .body = "ping",
     }));
     try std.testing.expectError(error.InvalidState, runtime.acceptReliableStream(0));
+}
+
+test "pump error does not strand receivers that completed earlier in the pass" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .server, .{ .peer_id = "server-a" });
+    defer runtime.deinit();
+    var peer = try QuicSessionRuntime.init(allocator, 2, .client, .{ .peer_id = "client-a" });
+    defer peer.deinit();
+    var io = FakeTransport.init(allocator);
+    defer io.deinit();
+    var peer_io = FakeTransport.init(allocator);
+    defer peer_io.deinit();
+    try runtime.onQuicReady();
+    try peer.onQuicReady();
+    try pumpBoth(&peer, &peer_io, &runtime, &io);
+
+    // Stream 0 carries a complete message; stream 4 is reset. The
+    // reset surfaces as the pass's error AFTER stream 0's receiver
+    // completed and delivered to the inbox.
+    const encoded = try quic_streams.encodeReliableMessage(allocator, .{
+        .subject = "jobs.run",
+        .id = 7,
+        .body = "now",
+    }, .{});
+    defer allocator.free(encoded);
+
+    const ok_entry = try io.getOrPutStream(0);
+    try ok_entry.value_ptr.incoming.appendSlice(allocator, encoded);
+    ok_entry.value_ptr.final_size = encoded.len;
+
+    const reset_entry = try io.getOrPutStream(4);
+    reset_entry.value_ptr.reset = true;
+
+    try runtime.acceptReliableStream(0);
+    try runtime.acceptReliableStream(4);
+
+    try std.testing.expectError(error.StreamReset, runtime.pump(&io));
+
+    // The completed receiver was removed despite the sibling's error
+    // (its message reached the inbox), and the next pump reports the
+    // reset stream again — not InvalidState from a stranded receiver.
+    try std.testing.expectEqual(@as(usize, 1), runtime.inboxLen());
+    try std.testing.expectEqual(@as(usize, 1), runtime.pendingReliableReceivers());
+    try std.testing.expectError(error.StreamReset, runtime.pump(&io));
+
+    var received = runtime.recvReliable().?;
+    defer received.deinit();
+    try std.testing.expectEqual(@as(u64, 0), received.stream_id);
+    try std.testing.expectEqualStrings("now", received.message.body);
 }
 
 test "peer bidi stream id helper follows QUIC low bits" {

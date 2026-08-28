@@ -88,6 +88,11 @@ fn runLocalhost(allocator: std.mem.Allocator) !void {
 
     const client_session_id = try app.node.dialQuic(target, .{
         .server_name = "localhost",
+        // The fixture is a self-signed CA with a localhost SAN, so it
+        // verifies against itself. The dial path has no skip-verify
+        // escape hatch: without a trust anchor the handshake dies with
+        // InvalidState out of mapSslError.
+        .ca_pem = test_cert_pem,
         .transport = .{
             .peer_id = "client",
             .role_flags = control.RoleFlags.client,

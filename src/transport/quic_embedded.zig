@@ -176,7 +176,24 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
                 self: *Adapter,
                 stream_id: u64,
             ) ?quic_streams.ReceiveStatus {
-                const state = self.seat.streams.getPtr(stream_id) orelse return null;
+                // A stream with no seat buffer yet is "open, no bytes
+                // observed": receivers are armed at onStreamOpen (and
+                // the control receiver at HELLO), while the buffer
+                // first exists at onStreamData — so pumps routinely
+                // query streams in that window, including from OTHER
+                // streams' data/end hooks in the same pass. Null here
+                // would surface StreamNotFound from the receiver pump
+                // and take the whole session down; "not reset, no
+                // final size yet, nothing read" is the truthful
+                // answer. Streams that end drop their receivers (and
+                // the control receiver) in onStreamEnd BEFORE the
+                // buffer is removed, so a live receiver never queries
+                // a buffer that is gone because its stream ended.
+                const state = self.seat.streams.getPtr(stream_id) orelse return .{
+                    .reset = false,
+                    .final_size = null,
+                    .read_offset = 0,
+                };
                 return .{
                     .reset = state.reset,
                     .final_size = state.final_size,

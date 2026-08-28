@@ -1267,8 +1267,10 @@ pub const Node = struct {
                     try runtime.replyReliableOnStream(stream_id, reply.outgoing());
                 }
 
-                for (result.publications.items) |publication| {
-                    try runtime.queueDatagram(publication.outgoing());
+                if (comptime @hasField(@TypeOf(result), "publications")) {
+                    for (result.publications.items) |publication| {
+                        try runtime.queueDatagram(publication.outgoing());
+                    }
                 }
 
                 return .{
@@ -2827,56 +2829,40 @@ const EmbedTestPeers = struct {
     }
 };
 
-test "foreign embedder drives qmsg sessions through its own Driver end to end" {
-    const allocator = std.testing.allocator;
-    const control = @import("control.zig");
-
-    const server_opts: transport.quic.QuicOptions = .{
-        .peer_id = "embed-server",
-        .role_flags = control.RoleFlags.server,
-        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
-        .datagram_enabled = true,
-    };
-    const client_opts: transport.quic.QuicOptions = .{
-        .peer_id = "embed-client",
-        .role_flags = control.RoleFlags.client,
-        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
-        .datagram_enabled = true,
-    };
-
-    var node = try Node.init(allocator, .{});
-    defer node.deinit();
-
-    var p: EmbedTestPeers = undefined;
-    p.now_us = 1_000;
+/// Builds the hermetic peers (embedder-owned listener + dial client)
+/// around `node`. The caller owns teardown; LIFO defers must run
+/// `p.listener.deinit()` before `p.embedder.destroy()` (the will-close
+/// ride-along), then `p.client.deinit()`.
+fn embedPeersInit(
+    p: *EmbedTestPeers,
+    allocator: std.mem.Allocator,
+    node: *Node,
+    server_opts: transport.quic.QuicOptions,
+    client_opts: transport.quic.QuicOptions,
+) !void {
+    p.* = .{ .listener = undefined, .embedder = undefined, .client = undefined, .now_us = 1_000 };
     p.listener = try transport.quic_runtime.ListenerRuntime.init(allocator, "127.0.0.1:4433", .{
         .tls_cert_pem = dispatch_test_cert_pem,
         .tls_key_pem = dispatch_test_key_pem,
         .transport = server_opts,
     });
-    // Defer order (LIFO): listener FIRST (its Server.deinit fires the
-    // will-close hook, whose on_disconnect destroys the embedded
-    // session through the owner while the node is still alive), then
-    // the embedder's driver, then the client — the teardown
-    // ride-along under test.
-    p.embedder = try ForeignEmbedder.create(allocator, &node, server_opts);
-    defer p.embedder.destroy();
+    p.embedder = try ForeignEmbedder.create(allocator, node, server_opts);
     p.embedder.driver.attach(&p.listener.server);
-    defer p.listener.deinit();
     p.client = try transport.quic_runtime.ClientRuntime.init(allocator, "127.0.0.1:4433", .{
         .server_name = "localhost",
         .insecure_skip_verify = true, // self-signed test fixture
         .transport = client_opts,
     });
-    defer p.client.deinit();
+}
 
-    const client_sess = try node.openQuicSession(.{
-        .role = .client,
-        .transport = client_opts,
-    });
-
-    // Handshake + HELLO exchange: the server side is driven entirely
-    // by the embedder's Driver hooks.
+/// Drives the peers through the TLS handshake and the qmsg HELLO
+/// exchange until both runtimes are ready; returns the embedded
+/// server-side session.
+fn embedPeersUntilReady(
+    p: *EmbedTestPeers,
+    node: *Node,
+    client_sess: *QuicSessionRuntime,
+) !*QuicSessionRuntime {
     var step: u32 = 0;
     while (step < 4_000) : (step += 1) {
         try p.drive();
@@ -2900,8 +2886,49 @@ test "foreign embedder drives qmsg sessions through its own Driver end to end" {
         const embedded_ready = if (embedded_sess) |sess| sess.state() == .ready else false;
         if (client_sess.state() == .ready and embedded_ready) break;
     }
+    return embedded_sess orelse error.ServerSessionMissing;
+}
+
+test "foreign embedder drives qmsg sessions through its own Driver end to end" {
+    const allocator = std.testing.allocator;
+    const control = @import("control.zig");
+
+    const server_opts: transport.quic.QuicOptions = .{
+        .peer_id = "embed-server",
+        .role_flags = control.RoleFlags.server,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+        .datagram_enabled = true,
+    };
+    const client_opts: transport.quic.QuicOptions = .{
+        .peer_id = "embed-client",
+        .role_flags = control.RoleFlags.client,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+        .datagram_enabled = true,
+    };
+
+    var node = try Node.init(allocator, .{});
+    defer node.deinit();
+
+    var p: EmbedTestPeers = undefined;
+    try embedPeersInit(&p, allocator, &node, server_opts, client_opts);
+    // Defer order (LIFO): listener FIRST (its Server.deinit fires the
+    // will-close hook, whose on_disconnect destroys the embedded
+    // session through the owner while the node is still alive), then
+    // the embedder's driver, then the client — the teardown
+    // ride-along under test.
+    defer p.embedder.destroy();
+    defer p.listener.deinit();
+    defer p.client.deinit();
+
+    const client_sess = try node.openQuicSession(.{
+        .role = .client,
+        .transport = client_opts,
+    });
+
+    // Handshake + HELLO exchange: the server side is driven entirely
+    // by the embedder's Driver hooks.
+    const srv_sess = try embedPeersUntilReady(&p, &node, client_sess);
     try std.testing.expectEqual(transport.quic.State.ready, client_sess.state());
-    const srv_sess = embedded_sess orelse return error.ServerSessionMissing;
     try std.testing.expectEqual(transport.quic.State.ready, srv_sess.state());
     try std.testing.expect(srv_sess.runtime.event_delivery);
 
@@ -2913,7 +2940,7 @@ test "foreign embedder drives qmsg sessions through its own Driver end to end" {
         .body = "ada",
     });
     var got_request = false;
-    step = 0;
+    var step: u32 = 0;
     while (step < 4_000 and !got_request) : (step += 1) {
         _ = try client_sess.runtime.pumpConnection(p.client.connection());
         try p.drive();
@@ -2985,6 +3012,236 @@ test "foreign embedder drives qmsg sessions through its own Driver end to end" {
     // fall off the end with the connection live; the defers tear the
     // listener down first (hook -> onDisconnect -> session destroyed
     // exactly once), then the driver, then the node's leftovers.
+}
+
+test "foreign embedder: reply deferred past the poll loop still reaches the requester" {
+    const allocator = std.testing.allocator;
+    const control = @import("control.zig");
+
+    const server_opts: transport.quic.QuicOptions = .{
+        .peer_id = "embed-server",
+        .role_flags = control.RoleFlags.server,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+    const client_opts: transport.quic.QuicOptions = .{
+        .peer_id = "embed-client",
+        .role_flags = control.RoleFlags.client,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+
+    var node = try Node.init(allocator, .{});
+    defer node.deinit();
+
+    var p: EmbedTestPeers = undefined;
+    try embedPeersInit(&p, allocator, &node, server_opts, client_opts);
+    defer p.embedder.destroy();
+    defer p.listener.deinit();
+    defer p.client.deinit();
+
+    const client_sess = try node.openQuicSession(.{
+        .role = .client,
+        .transport = client_opts,
+    });
+    const srv_sess = try embedPeersUntilReady(&p, &node, client_sess);
+
+    // One request. The embedder's actor does NOT answer inline: the
+    // quic_request event is merely held, and the reply is queued from
+    // a deferred delivery pass several drive iterations later.
+    const req_stream = try client_sess.queueReliable(.{
+        .subject = "user.get",
+        .id = 77,
+        .deadline_ms = 500,
+        .body = "ada",
+    });
+
+    var got_request = false;
+    var subject_buf: [64]u8 = undefined;
+    var subject_len: usize = 0;
+    var req_id: message.MessageId = 0;
+    var req_deadline: ?u64 = null;
+    var step: u32 = 0;
+    while (step < 4_000 and !got_request) : (step += 1) {
+        _ = try client_sess.runtime.pumpConnection(p.client.connection());
+        try p.drive();
+        var events: [4]Event = undefined;
+        const count = try node.poll(&events);
+        for (events[0..count]) |*event| {
+            defer event.deinit();
+            switch (event.*) {
+                .quic_request => |*ev| {
+                    try std.testing.expectEqual(req_stream, ev.stream_id);
+                    subject_len = @min(ev.msg.subject.len, subject_buf.len);
+                    @memcpy(subject_buf[0..subject_len], ev.msg.subject[0..subject_len]);
+                    req_id = ev.msg.id;
+                    req_deadline = ev.msg.deadline_ms;
+                    got_request = true;
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(got_request);
+
+    // The deferred pass: iterations keep flowing while the request is
+    // merely held. Whatever the seat does during this window must not
+    // make the later reply unwritable.
+    var idle: u32 = 0;
+    while (idle < 50) : (idle += 1) {
+        _ = try client_sess.runtime.pumpConnection(p.client.connection());
+        try p.drive();
+    }
+
+    var held: QuicRequestEvent = .{
+        .session_id = srv_sess.id(),
+        .stream_id = req_stream,
+        .msg = .{
+            .allocator = allocator,
+            .subject = subject_buf[0..subject_len],
+            .id = req_id,
+            .deadline_ms = req_deadline,
+        },
+    };
+    try node.replyQuic(&held, .{ .subject = "", .body = "Ada Lovelace (deferred)" });
+
+    var reply: ?transport.quic_session_runtime.ReceivedReliable = null;
+    step = 0;
+    while (step < 4_000 and reply == null) : (step += 1) {
+        try p.drive();
+        _ = try client_sess.runtime.pumpConnection(p.client.connection());
+        reply = client_sess.runtime.recvReliable();
+    }
+    var got_reply = reply orelse return error.ReplyMissing;
+    defer got_reply.deinit();
+    try std.testing.expectEqual(req_stream, got_reply.stream_id);
+    try std.testing.expectEqual(req_id, got_reply.message.id);
+    try std.testing.expectEqualStrings("Ada Lovelace (deferred)", got_reply.message.body);
+    try std.testing.expectEqual(transport.quic.State.ready, srv_sess.state());
+}
+
+test "foreign embedder: two requests on one session, one unanswered, keep the connection" {
+    const allocator = std.testing.allocator;
+    const control = @import("control.zig");
+
+    const server_opts: transport.quic.QuicOptions = .{
+        .peer_id = "embed-server",
+        .role_flags = control.RoleFlags.server,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+    const client_opts: transport.quic.QuicOptions = .{
+        .peer_id = "embed-client",
+        .role_flags = control.RoleFlags.client,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+
+    var node = try Node.init(allocator, .{});
+    defer node.deinit();
+
+    var p: EmbedTestPeers = undefined;
+    try embedPeersInit(&p, allocator, &node, server_opts, client_opts);
+    defer p.embedder.destroy();
+    defer p.listener.deinit();
+    defer p.client.deinit();
+
+    const client_sess = try node.openQuicSession(.{
+        .role = .client,
+        .transport = client_opts,
+    });
+    const srv_sess = try embedPeersUntilReady(&p, &node, client_sess);
+
+    // Two requests in one flight, mirroring the consumer's actor: one
+    // answered, one deliberately never answered (its deadline is the
+    // requester's business, not the server's).
+    const echo_stream = try client_sess.queueReliable(.{
+        .subject = "remote.echo",
+        .id = 1,
+        .deadline_ms = 2_000,
+        .body = "payload",
+    });
+    const silent_stream = try client_sess.queueReliable(.{
+        .subject = "remote.silent",
+        .id = 2,
+        .deadline_ms = 60,
+        .body = "x",
+    });
+    try std.testing.expectEqual(@as(u64, 0), echo_stream);
+    try std.testing.expectEqual(@as(u64, 4), silent_stream);
+
+    var echoed = false;
+    var silent_seen = false;
+    var step: u32 = 0;
+    while (step < 4_000 and (!echoed or !silent_seen)) : (step += 1) {
+        _ = try client_sess.runtime.pumpConnection(p.client.connection());
+        try p.drive();
+        var events: [4]Event = undefined;
+        const count = try node.poll(&events);
+        for (events[0..count]) |*event| {
+            defer event.deinit();
+            switch (event.*) {
+                .quic_request => |*ev| {
+                    if (ev.stream_id == echo_stream) {
+                        try node.replyQuic(ev, .{ .subject = "", .body = "pong" });
+                        echoed = true;
+                    } else if (ev.stream_id == silent_stream) {
+                        silent_seen = true; // held; no reply, ever
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(echoed);
+    try std.testing.expect(silent_seen);
+
+    // The answered request's reply must arrive...
+    var reply: ?transport.quic_session_runtime.ReceivedReliable = null;
+    step = 0;
+    while (step < 4_000 and reply == null) : (step += 1) {
+        try p.drive();
+        _ = try client_sess.runtime.pumpConnection(p.client.connection());
+        reply = client_sess.runtime.recvReliable();
+    }
+    var got_reply = reply orelse return error.ReplyMissing;
+    defer got_reply.deinit();
+    try std.testing.expectEqual(echo_stream, got_reply.stream_id);
+    try std.testing.expectEqual(@as(message.MessageId, 1), got_reply.message.id);
+    try std.testing.expectEqualStrings("pong", got_reply.message.body);
+
+    // ...and the connection must survive both requests plus the never
+    // answered one: a third request still round-trips.
+    try std.testing.expectEqual(transport.quic.State.ready, srv_sess.state());
+    try std.testing.expectEqual(transport.quic.State.ready, client_sess.state());
+    const third_stream = try client_sess.queueReliable(.{
+        .subject = "remote.echo",
+        .id = 3,
+        .deadline_ms = 2_000,
+        .body = "again",
+    });
+    var third_replied = false;
+    step = 0;
+    while (step < 4_000 and !third_replied) : (step += 1) {
+        _ = try client_sess.runtime.pumpConnection(p.client.connection());
+        try p.drive();
+        var events: [4]Event = undefined;
+        const count = try node.poll(&events);
+        for (events[0..count]) |*event| {
+            defer event.deinit();
+            switch (event.*) {
+                .quic_request => |*ev| {
+                    if (ev.stream_id == third_stream) {
+                        try node.replyQuic(ev, .{ .subject = "", .body = "pong-3" });
+                    }
+                },
+                else => {},
+            }
+        }
+        if (client_sess.runtime.recvReliable()) |late| {
+            var owned_late = late;
+            defer owned_late.deinit();
+            if (owned_late.stream_id == third_stream) third_replied = true;
+        }
+    }
+    try std.testing.expect(third_replied);
+    try std.testing.expectEqual(transport.quic.State.ready, srv_sess.state());
 }
 
 // ---- live-UDP acceptance (skipped when the sandbox denies binds) ------------
@@ -3135,6 +3392,171 @@ fn liveServerSessionReady(n: *const Node, exclude: QuicSessionId) bool {
         if (runtime.state() == .ready) return true;
     }
     return false;
+}
+
+const LivePhaseBDispatcher = struct {
+    allocator: std.mem.Allocator,
+
+    const Result = struct {
+        allocator: std.mem.Allocator,
+        replies: std.ArrayList(message.Message) = .empty,
+
+        fn deinit(self: *Result) void {
+            for (self.replies.items) |*msg| msg.deinit();
+            self.replies.deinit(self.allocator);
+        }
+    };
+
+    fn dispatchQuicReliable(
+        self: *@This(),
+        kind: socket.Pattern,
+        incoming: message.Message,
+        sess: *session.Session,
+    ) !Result {
+        _ = kind;
+        _ = sess;
+
+        var owned = incoming;
+        defer owned.deinit();
+
+        var result = Result{ .allocator = self.allocator };
+        // The consumer's phase-B shape: one subject answered, one
+        // deliberately never answered (its deadline is the
+        // requester's business, not this server's).
+        if (std.mem.eql(u8, owned.subject, "remote.silent")) return result;
+
+        const reply = try message.Message.init(self.allocator, .{
+            .subject = owned.subject,
+            .id = owned.id,
+            .flags = .{ .final = true },
+            .deadline_ms = owned.deadline_ms,
+            .body = "pong",
+        });
+        errdefer {
+            var cleanup = reply;
+            cleanup.deinit();
+        }
+        try result.replies.append(self.allocator, reply);
+        return result;
+    }
+};
+
+// The consumer's phase-B regression shape, verbatim structure: a
+// qmsg-owned listener on an ephemeral port, one dial session issuing
+// an answered and a never-answered request in the same flight, driven
+// `tick; runOnce` — with tick errors SURFACED (their loop swallows
+// them with `catch {}`, which is how the v0.1.4 failure hid).
+test "live UDP: answered and unanswered requests on one dial session (phase B mirror)" {
+    const allocator = std.testing.allocator;
+    const control = @import("control.zig");
+
+    const server_opts: transport.quic.QuicOptions = .{
+        .peer_id = "live-server",
+        .role_flags = control.RoleFlags.server,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+    const client_opts: transport.quic.QuicOptions = .{
+        .peer_id = "live-client",
+        .role_flags = control.RoleFlags.client,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    const listener_id = n.listenQuic("127.0.0.1:0", .{
+        .tls_cert_pem = dispatch_test_cert_pem,
+        .tls_key_pem = dispatch_test_key_pem,
+        .transport = server_opts,
+    }) catch |err| switch (err) {
+        error.AccessDenied,
+        error.AddressInUse,
+        error.AddressUnavailable,
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => return error.SkipZigTest,
+        else => return err,
+    };
+    const listener = n.quic_listeners.items[listener_id];
+    const target = try localhostEndpoint(allocator, listener.localAddress());
+    defer allocator.free(target);
+
+    const client_session_id = try n.dialQuic(target, .{
+        .server_name = "localhost",
+        .ca_pem = dispatch_test_cert_pem,
+        .transport = client_opts,
+    });
+    const client = n.quicSession(client_session_id) orelse return error.EndpointNotFound;
+
+    var now_us: u64 = 1_000;
+    var step: u32 = 0;
+    while (step < 20_000) : (step += 1) {
+        now_us += 1_000;
+        try n.tick(now_us);
+        if (client.state() == .ready and liveServerSessionReady(&n, client_session_id)) break;
+    }
+    try std.testing.expectEqual(transport.quic.State.ready, client.state());
+
+    const echo_stream = try client.queueReliable(.{
+        .subject = "remote.echo",
+        .id = 11,
+        .deadline_ms = 2_000,
+        .body = "payload",
+    });
+    const silent_stream = try client.queueReliable(.{
+        .subject = "remote.silent",
+        .id = 12,
+        .deadline_ms = 60,
+        .body = "x",
+    });
+    _ = silent_stream;
+
+    var dispatcher = LivePhaseBDispatcher{ .allocator = allocator };
+    var got_reply: ?transport.quic_session_runtime.ReceivedReliable = null;
+    step = 0;
+    while (step < 20_000 and got_reply == null) : (step += 1) {
+        now_us += 1_000;
+        try n.tick(now_us);
+        _ = try n.runOnce(&dispatcher);
+        got_reply = client.runtime.recvReliable();
+    }
+    var reply = got_reply orelse return error.ReplyMissing;
+    defer reply.deinit();
+    try std.testing.expectEqual(echo_stream, reply.stream_id);
+    try std.testing.expectEqual(@as(message.MessageId, 11), reply.message.id);
+    try std.testing.expectEqualStrings("pong", reply.message.body);
+
+    // The never-answered sibling must not take the connection down:
+    // both sessions stay ready and a third request round-trips.
+    try std.testing.expectEqual(transport.quic.State.ready, client.state());
+    try std.testing.expect(liveServerSessionReady(&n, client_session_id));
+
+    const third_stream = try client.queueReliable(.{
+        .subject = "remote.echo",
+        .id = 13,
+        .deadline_ms = 2_000,
+        .body = "again",
+    });
+    var third: ?transport.quic_session_runtime.ReceivedReliable = null;
+    step = 0;
+    while (step < 20_000 and third == null) : (step += 1) {
+        now_us += 1_000;
+        try n.tick(now_us);
+        _ = try n.runOnce(&dispatcher);
+        if (client.runtime.recvReliable()) |late| {
+            if (late.stream_id == third_stream) {
+                third = late;
+            } else {
+                var stray = late;
+                stray.deinit();
+            }
+        }
+    }
+    var got_third = third orelse return error.ThirdReplyMissing;
+    defer got_third.deinit();
+    try std.testing.expectEqual(@as(message.MessageId, 13), got_third.message.id);
+    try std.testing.expectEqual(transport.quic.State.ready, client.state());
 }
 
 fn localhostEndpoint(allocator: std.mem.Allocator, address: std.Io.net.IpAddress) ![]u8 {
