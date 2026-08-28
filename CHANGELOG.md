@@ -5,6 +5,32 @@ All notable changes to qmsg are documented in this file.
 The project is pre-1.0. Any 0.x release may include breaking API
 changes.
 
+## [0.1.9] - 2026-08-28
+
+Dependency integration: `paseto-zig` 0.2.0 → 0.3.0.
+
+### Changed
+
+- **Pinned `paseto-zig` `0.3.0`** (tag tarball,
+  `paseto-0.3.0-EBI95S2uBwBha2qo-qgtyvS3BJVrGAf7HDhlrsCmCrQL`). The
+  0.3.0 release is audit-hardened on the untrusted-input path qmsg
+  feeds it (token parse, PASERK id/PEM validation), adds
+  cross-implementation interop fixtures, and verifies both the
+  stable and dev Zig toolchains in CI. qmsg's consumption surface
+  (`PaserkId`, `v4.Public`/`v4.Local`, `paserk.id` parse,
+  `token.parse`/`serialize`, `Validator`) is unchanged by the bump —
+  no source changes were needed. The pin id itself is the release-
+  hygiene acceptance check: it reads `paseto-0.3.0-…` where the old
+  0.2.0 tag's id read `paseto-0.1.0-…` (that tag shipped with a
+  stale zon version; 0.3.0 declares correctly).
+
+### Testing
+
+- Full suite 332/332 in debug AND `--release=safe`; consumer
+  dependency-instantiation check (path dependency, `.{ .target,
+  .optimize }` forwarded) green in both modes; examples run
+  (localhost live, auth-paseto).
+
 ## [0.1.8] - 2026-08-28
 
 qmsg listeners answer stateless resets (the under-load death-detection
