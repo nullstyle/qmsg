@@ -1078,6 +1078,20 @@ pub const Node = struct {
             const can_dispatch_reliable = comptime dispatcherHas(@TypeOf(dispatcher), "dispatchQuicReliable");
             if (attachment == null and !can_dispatch_reliable) continue;
 
+            // Messages on the session's OWN request streams are
+            // replies to outbound requests, not inbound requests:
+            // leave them queued for the embedder's correlation
+            // (recvReliable). Dispatching them made rep-dispatchers
+            // answer replies — an echo whose sender then failed on
+            // the already-reaped request stream.
+            if (attachment == null) {
+                const head_stream = runtime.runtime.peekReliableStreamId() orelse continue;
+                if (!transport.quic_session_runtime.isPeerBidiStreamId(
+                    runtime.runtime.session.role,
+                    head_stream,
+                )) continue;
+            }
+
             var received = runtime.runtime.recvReliable() orelse continue;
             const stream_id = received.stream_id;
             var incoming = received.takeMessage();
@@ -2430,6 +2444,102 @@ test "Node.deinit with a live driver-owned session tears down cleanly" {
     // without a crash, double free, or leak IS the acceptance check.
 }
 
+test "Node runOnce leaves replies on own request streams undispatched" {
+    const allocator = std.testing.allocator;
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    const runtime = try n.openQuicSession(.{
+        .role = .client,
+        .transport = .{ .peer_id = "client-a" },
+    });
+    try readyQuicRuntimeForTest(runtime, "server-a", false);
+
+    // A reply to the client's own request (stream 0: locally
+    // initiated for the client role) queued ahead of a genuine
+    // inbound request on a peer-initiated stream (stream 1).
+    try queueReliableForTest(runtime, 0, .{
+        .subject = "user.get",
+        .id = 7,
+        .flags = .{ .final = true },
+        .body = "user-42",
+    });
+    try queueReliableForTest(runtime, 1, .{
+        .subject = "time.now",
+        .id = 9,
+        .body = "?",
+    });
+
+    const Dispatcher = struct {
+        calls: usize = 0,
+
+        const Result = struct {
+            allocator: std.mem.Allocator,
+            replies: std.ArrayList(message.Message) = .empty,
+            publications: std.ArrayList(message.Message) = .empty,
+
+            fn deinit(self: *Result) void {
+                for (self.replies.items) |*msg| msg.deinit();
+                self.replies.deinit(self.allocator);
+                for (self.publications.items) |*msg| msg.deinit();
+                self.publications.deinit(self.allocator);
+            }
+        };
+
+        fn dispatchQuicReliable(
+            self: *@This(),
+            kind: socket.Pattern,
+            incoming: message.Message,
+            sess: *session.Session,
+        ) !Result {
+            _ = kind;
+            _ = sess;
+            self.calls += 1;
+
+            // An answering dispatcher: the echo that used to be sent
+            // back onto the (already reaped) request stream.
+            var owned = incoming;
+            defer owned.deinit();
+            var result = Result{ .allocator = owned.allocator };
+            const reply = try message.Message.init(owned.allocator, .{
+                .subject = owned.subject,
+                .id = owned.id,
+                .flags = .{ .final = true },
+                .body = "echo",
+            });
+            errdefer {
+                var cleanup = reply;
+                cleanup.deinit();
+            }
+            try result.replies.append(owned.allocator, reply);
+            return result;
+        }
+    };
+
+    var dispatcher = Dispatcher{};
+    const result = try n.runOnce(&dispatcher);
+
+    // The reply at the inbox head gates dispatch for the session:
+    // nothing was dispatched (an answering dispatcher would have
+    // echoed onto a reaped stream), and the inbox is untouched for
+    // the embedder's own correlation.
+    try std.testing.expectEqual(@as(usize, 0), dispatcher.calls);
+    try std.testing.expect(!result.didWork());
+    try std.testing.expectEqual(@as(usize, 2), runtime.runtime.inboxLen());
+
+    var reply = runtime.runtime.recvReliable() orelse return error.ReplyMissing;
+    defer reply.deinit();
+    try std.testing.expectEqual(@as(u64, 0), reply.stream_id);
+    try std.testing.expectEqual(@as(message.MessageId, 7), reply.message.id);
+    try std.testing.expectEqualStrings("user-42", reply.message.body);
+
+    var request = runtime.runtime.recvReliable() orelse return error.RequestMissing;
+    defer request.deinit();
+    try std.testing.expectEqual(@as(u64, 1), request.stream_id);
+    try std.testing.expectEqualStrings("time.now", request.message.subject);
+}
+
 // ---- live-UDP acceptance (skipped when the sandbox denies binds) ------------
 
 test "live UDP: queueReliable round trip needs no explicit accept and deinit with live sessions is clean" {
@@ -2504,14 +2614,13 @@ test "live UDP: queueReliable round trip needs no explicit accept and deinit wit
     while (step < 20_000 and reply == null) : (step += 1) {
         now_us += 1_000;
         try n.tick(now_us);
-        // Check the reply BEFORE runOnce: runOnce dispatches every
-        // received reliable message through the .rep path, and a
-        // dispatched REPLY would be answered again (the localhost
-        // example checks the client reply first for the same reason).
+        // runOnce runs BEFORE the reply check on purpose: a reply on
+        // the client's own request stream must survive runOnce
+        // undispatched (a rep-dispatcher would otherwise answer it,
+        // and that echo sender fails on the reaped request stream).
+        // It stays queued for this recvReliable.
+        _ = try n.runOnce(&dispatcher);
         reply = client.runtime.recvReliable();
-        if (reply == null) {
-            _ = try n.runOnce(&dispatcher);
-        }
     }
     var got = reply orelse return error.ReplyMissing;
     defer got.deinit();

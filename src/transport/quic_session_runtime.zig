@@ -411,6 +411,15 @@ pub const QuicSessionRuntime = struct {
         return self.inbox.orderedRemove(0);
     }
 
+    /// The stream id of the next queued reliable message, without
+    /// dequeuing it — lets a dispatcher distinguish an inbound request
+    /// (peer-initiated bidi stream) from a reply to an outbound
+    /// request (locally-initiated stream) before consuming anything.
+    pub fn peekReliableStreamId(self: *const QuicSessionRuntime) ?u64 {
+        if (self.inbox.items.len == 0) return null;
+        return self.inbox.items[0].stream_id;
+    }
+
     pub fn inboxLen(self: QuicSessionRuntime) usize {
         return self.inbox.items.len;
     }

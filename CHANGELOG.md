@@ -5,6 +5,31 @@ All notable changes to qmsg are documented in this file.
 The project is pre-1.0. Any 0.x release may include breaking API
 changes.
 
+## [0.1.3] - 2026-08-27
+
+`Node.runOnce` no longer dispatches replies as requests. A reliable
+message on a session's OWN bidi stream is a reply to an outbound
+request (client-side correlation is the embedder's, via
+`recvReliable`); only messages on peer-initiated streams are inbound
+requests. Previously every received reliable message went through
+the `.rep` dispatch path, so an answering dispatcher replied to
+replies — an echo whose sender then failed on the already-reaped
+request stream. Replies now stay queued for the embedder; socket
+attachments are unchanged (they route raw messages and let the
+socket's own state machine classify). Note the FIFO consequence: a
+reply at the head of a session's inbox gates dispatch of later
+messages on that same session until the embedder drains it — mixed
+request/reply sessions should drain replies each loop iteration
+(dial and listener sessions do not mix in practice).
+
+- New `QuicSessionRuntime.peekReliableStreamId` (stream id of the
+  next queued reliable message, without dequeuing) supports the
+  distinction.
+- Regression coverage: a hermetic test asserts a reply and a
+  peer-initiated request both survive `runOnce` undispatched in
+  order, and the live-UDP acceptance test now runs `runOnce` BEFORE
+  checking the client reply — both fail against the old behavior.
+
 ## [0.1.2] - 2026-08-27
 
 Two consumer-reported fixes from mruby-quic's live QUIC round-trip
