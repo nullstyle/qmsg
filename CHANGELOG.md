@@ -5,6 +5,65 @@ All notable changes to qmsg are documented in this file.
 The project is pre-1.0. Any 0.x release may include breaking API
 changes.
 
+## [0.2.0] - 2026-08-28
+
+QUIC pub/sub across the process wall (swarm item 2, per the
+mruby-quic consumer request; ROADMAP phase 5's "automatic
+live-session emission" plus its two companions). Design recorded
+before code in docs/QUIC_PUBSUB.md.
+
+### Added
+
+- **`Node.subscribeQuic` / `Node.unsubscribeQuic`** — node-level
+  subscriptions that emit on every session and RE-EMIT the full set
+  on each NEW session's first ready tick: a redial's replacement
+  session inherits the mesh's subscriptions with no re-subscribe
+  call. Tick-driven sync (not edge hooks) over the existing
+  control-frame queue/flush machinery; per-session failures never
+  unwind the set. Bounded by `NodeOptions.max_quic_subscriptions`.
+- **`Node.publishQuicSubscribed`** — registry-aware datagram
+  fan-out to every session whose registry entry matches the subject
+  (dial peers and embedded qmsg/1 clients, one registry keyed by
+  session id). Sessions without datagram support and over-budget
+  outboxes are skipped-and-counted (`message_dropped`,
+  `Stats.dropped`); a subscriber's `on_full` queue policy sheds
+  drop-newest or drop-oldest at the new
+  `NodeOptions.quic_datagram_outbox_max` bound. Slow consumers
+  shed; the fan-out never blocks.
+- **Inbound SUBSCRIBE/UNSUBSCRIBE on the listener/embedded seam** —
+  control frames beyond HELLO ride follow-up uni streams; the
+  embedded seat arms incremental control readers for them (deferred
+  until the session reaches ready — a first-ready-tick flush can
+  ride the same flight as the HELLO tail) and applies decoded frames
+  into the node registry. Because `ServerDispatch` delegates to
+  `EmbeddedDispatch`, external qmsg clients subscribing to a qmsg
+  App node work unchanged. `Registry.removePeer` runs in
+  `destroyQuicSession`, so dying subscribers leave the fan-out set
+  on every death path (reaper, explicit close, embedded teardown).
+
+### Scope
+
+Datagram-first (reliable-stream publication later); replay stays
+unwired (live-only subscriptions); no subscription-changed event;
+dial-side inbound control frames unwired (nothing in the consumer
+model subscribes server-side — the seat machinery is where it would
+attach).
+
+### Testing
+
+- Live, the consumer's hardest contract: dial, subscribe ONCE,
+  delivery crosses the wall both directions; silent kill, same-key
+  reborn, idle-window death observed, redial — the reborn hub knows
+  the NEW session's subscription with no subscribe call. Verified
+  red on: no full-set emission, no control-read arming, and no
+  outbox bound (each neuter breaks exactly the matching test).
+- Hermetic: fan-out matching, the datagram gate both ways,
+  drop-newest vs drop-oldest shedding with `message_dropped`, and
+  emission mechanics (full set on first ready tick, duplicate
+  no-op, unsubscribe delta, set-before-sessions).
+- Full suite 335 tests (252 root + 83 transport) in debug AND
+  `--release=safe`.
+
 ## [0.1.9] - 2026-08-28
 
 Dependency integration: `paseto-zig` 0.2.0 → 0.3.0.
