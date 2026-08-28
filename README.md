@@ -299,7 +299,7 @@ direct `.quic` endpoints.
 - Patterns are compile-time selected where practical, e.g. `Socket(.req)`.
 - Blocking/simple loop first, embeddable poll/tick API underneath.
 - Pluggable transports, but QUIC is the reference transport.
-- PASETO/PASERK auth targets `paseto-zig` release `0.2.0`; qmsg owns only
+- PASETO/PASERK auth targets `paseto-zig` release `0.3.0`; qmsg owns only
   session policy, key lookup, replay hooks, and subject/pattern authorization.
 
 ## Authentication Surface
@@ -316,7 +316,7 @@ const auth = qmsg.AuthConfig{
 
 `Authorization` is session state exposed to handlers after credentials have
 been validated. `qmsg.PasetoAuth` uses
-[`paseto-zig` `0.2.0`](https://github.com/nullstyle/paseto-zig/releases/tag/0.2.0)
+[`paseto-zig` `0.3.0`](https://github.com/nullstyle/paseto-zig/releases/tag/0.3.0)
 for typed PASERK IDs and bounded fail-closed v4.public token verification,
 while the rest of core keeps auth interfaces transport-independent.
 See [examples/auth_paseto.zig](examples/auth_paseto.zig) for the current

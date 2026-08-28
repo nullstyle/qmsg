@@ -21,7 +21,7 @@ phase.
 | 7 Push/pull | Partial | Inproc push/pull has fair selection, puller credit, queue policy handling, at-most-once semantics, transport-agnostic CREDIT helpers, and QUIC control-frame queue/apply state. Automatic live-session emission remains. |
 | 8 Survey/respondent and bus | Not started | No public API or state machines yet. |
 | 9 Typed codecs and ergonomics | Not started | Raw bytes remain first-class; typed helpers are future work. |
-| 10 PASETO/PASERK auth kit | Partial | `paseto-zig` 0.2.0 is wired, v4.public verification, PASERK id lookup, qmsg claim parsing, replay hook, key rotation example, HELLO implicit assertion binding, bounded HELLO challenge propagation, listener-side challenge config helpers, and audience/purpose policy exist. Per-connection challenge minting in the QUIC listener loop remains. |
+| 10 PASETO/PASERK auth kit | Partial | `paseto-zig` 0.3.0 is wired, v4.public verification, PASERK id lookup, qmsg claim parsing, replay hook, key rotation example, HELLO implicit assertion binding, bounded HELLO challenge propagation, listener-side challenge config helpers, and audience/purpose policy exist. Per-connection challenge minting in the QUIC listener loop remains. |
 
 ## Phase 0: Decisions and Spikes
 
@@ -43,7 +43,7 @@ Tasks:
   - optional datagram send/receive probe.
 - Wire the local `quic-zig` package into qmsg builds and keep the public qmsg
   API behind qmsg-owned wrapper types.
-- Track `paseto-zig` `0.2.0` as the PASETO/PASERK dependency target and keep
+- Track `paseto-zig` `0.3.0` as the PASETO/PASERK dependency target and keep
   qmsg's auth boundary aligned with its release API.
 
 Exit criteria:
@@ -276,7 +276,7 @@ core of qmsg.
 
 Tasks:
 
-- Add `paseto-zig` `0.2.0` as the optional auth-kit dependency.
+- Add `paseto-zig` `0.3.0` as the optional auth-kit dependency.
 - Support PASETO v4.public verification for HELLO credentials via
   `paseto.v4.Public.verifyToken`.
 - Support typed PASERK `pid` key-id lookup using keys generated or parsed by
