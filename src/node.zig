@@ -1670,9 +1670,41 @@ pub const Node = struct {
         for (self.quic_clients.items) |client| {
             _ = try client.client.recvAndFeedOne(now_us);
             try client.client.tick(now_us);
+            // A dial connection that reached QUIC's TERMINAL closed
+            // state (peer CONNECTION_CLOSE observed through the
+            // draining deadline, a stateless reset, an idle or
+            // handshake timeout) will never carry bytes again: stop
+            // pumping it and close the session below, through the
+            // same path an explicit `closeQuicSession` takes.
+            // Terminal-only on purpose — `closeState()`'s
+            // closing/draining are an in-progress close, not death —
+            // and detection lags the wire event by the draining
+            // window: late and certain beats early and guessed.
+            if (client.client.runtime.connection().isClosed()) continue;
             try self.ensureClientReady(client);
             try self.pumpClientSession(client);
             while (try client.client.drainAndSendOne(now_us)) |_| {}
+        }
+        try self.reapDeadQuicClients();
+    }
+
+    /// Closes every dial session whose connection is terminally dead.
+    /// `closeQuicSession` removes entries from `quic_clients` — the
+    /// list being scanned — so the scan restarts after each close
+    /// instead of iterating a mutating list. Each close emits
+    /// `.closed` and destroys the session; pending requests classify
+    /// `.peer_closed` in the same tick's outcome sweep (the sweep
+    /// runs after `tickQuicClients` in `tick`).
+    fn reapDeadQuicClients(self: *Node) !void {
+        while (true) {
+            var dead: ?QuicSessionId = null;
+            for (self.quic_clients.items) |client| {
+                if (!client.client.runtime.connection().isClosed()) continue;
+                dead = client.id();
+                break;
+            }
+            const id = dead orelse return;
+            try self.closeQuicSession(id);
         }
     }
 
@@ -4008,6 +4040,200 @@ test "live UDP: answered and unanswered requests on one dial session (phase B mi
     try std.testing.expectEqual(@as(usize, 0), stray_failures);
     try std.testing.expectEqual(@as(usize, 0), n.quic_pending.items.len);
     try std.testing.expectEqual(transport.quic.State.ready, client.state());
+}
+
+// The consumer's swarm visibility seam: a dial session must OBSERVE
+// its connection dying. The remote closes (CONNECTION_CLOSE on the
+// wire), the dial passes through closing/draining, and once the
+// connection is terminally closed the node tears the session down
+// through closeQuicSession's path: `.closed` emitted, session gone,
+// and in-flight requestQuic pendings classify `.peer_closed` in the
+// same tick's sweep. Detection lags the wire event by the draining
+// window — late and certain.
+test "live UDP: dial session observes remote death, closes, and classifies pendings" {
+    const allocator = std.testing.allocator;
+    const control = @import("control.zig");
+
+    const server_opts: transport.quic.QuicOptions = .{
+        .peer_id = "doomed-server",
+        .role_flags = control.RoleFlags.server,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+    const client_opts: transport.quic.QuicOptions = .{
+        .peer_id = "death-watcher",
+        .role_flags = control.RoleFlags.client,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+
+    var server = try Node.init(allocator, .{});
+    const server_listener_id = server.listenQuic("127.0.0.1:0", .{
+        .tls_cert_pem = dispatch_test_cert_pem,
+        .tls_key_pem = dispatch_test_key_pem,
+        .transport = server_opts,
+    }) catch |err| switch (err) {
+        error.AccessDenied,
+        error.AddressInUse,
+        error.AddressUnavailable,
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const server_listener = server.quic_listeners.items[server_listener_id];
+    const target = try localhostEndpoint(allocator, server_listener.localAddress());
+    defer allocator.free(target);
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+    const client_session_id = try n.dialQuic(target, .{
+        .server_name = "localhost",
+        .ca_pem = dispatch_test_cert_pem,
+        .transport = client_opts,
+    });
+    const client = n.quicSession(client_session_id) orelse return error.EndpointNotFound;
+
+    var now_us: u64 = 1_000;
+    var step: u32 = 0;
+    while (step < 20_000) : (step += 1) {
+        now_us += 1_000;
+        try server.tick(now_us);
+        try n.tick(now_us);
+        if (client.state() == .ready and liveServerSessionReady(&n, client_session_id)) break;
+    }
+    try std.testing.expectEqual(transport.quic.State.ready, client.state());
+
+    // Healthy ticks emit no `.closed` — terminal-only detection must
+    // not fire on a live connection.
+    {
+        var healthy_steps: u32 = 0;
+        while (healthy_steps < 50) : (healthy_steps += 1) {
+            now_us += 1_000;
+            try server.tick(now_us);
+            try n.tick(now_us);
+        }
+        var events: [4]Event = undefined;
+        const count = try n.poll(&events);
+        for (events[0..count]) |*event| {
+            defer event.deinit();
+            switch (event.*) {
+                .closed => return error.UnexpectedClosed,
+                else => {},
+            }
+        }
+    }
+
+    // One request in flight when the remote dies (deadline far out,
+    // so only the death — not the deadline — can classify it).
+    const stream_id = try n.requestQuic(client_session_id, .{
+        .subject = "remote.slow",
+        .id = 99,
+        .deadline_ms = 60_000,
+        .body = "in flight",
+    });
+
+    // Kill the remote: close the SERVER-side connection so a
+    // CONNECTION_CLOSE goes out on the wire, then keep both loops
+    // driving while the client drains to terminal.
+    const server_conn = server_listener.listener.runtime.connection(0) orelse
+        return error.ServerConnectionMissing;
+    server_conn.close(false, transport.quic_cancel.AppErrorCode.graceful_shutdown, "remote died");
+
+    var saw_closed = false;
+    var saw_peer_closed = false;
+    var closed_count: usize = 0;
+    step = 0;
+    while (step < 20_000 and !(saw_closed and saw_peer_closed)) : (step += 1) {
+        now_us += 1_000;
+        server.tick(now_us) catch {};
+        try n.tick(now_us);
+        var events: [4]Event = undefined;
+        const count = try n.poll(&events);
+        for (events[0..count]) |*event| {
+            defer event.deinit();
+            switch (event.*) {
+                .closed => |id| {
+                    closed_count += 1;
+                    try std.testing.expectEqual(client_session_id, id);
+                    saw_closed = true;
+                },
+                .quic_request_failed => |ev| {
+                    try std.testing.expectEqual(client_session_id, ev.session_id);
+                    try std.testing.expectEqual(stream_id, ev.stream_id);
+                    try std.testing.expectEqual(@as(message.MessageId, 99), ev.id);
+                    try std.testing.expectEqual(RequestFailure.peer_closed, ev.failure);
+                    saw_peer_closed = true;
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(saw_closed);
+    try std.testing.expect(saw_peer_closed);
+    try std.testing.expectEqual(@as(usize, 1), closed_count);
+    try std.testing.expectEqual(@as(?*QuicSessionRuntime, null), n.quicSession(client_session_id));
+    try std.testing.expectEqual(@as(usize, 0), n.quic_pending.items.len);
+}
+
+// The never-landing dial (consumer hazard 4): nothing listens at the
+// target, quic-zig's handshake timeout eventually flips the
+// connection terminally closed, and the death observation closes the
+// session through the same path — `.closed` exactly once. Consumer
+// connect-timeout recycling may race this; whichever side closes
+// first, the routing is idempotent per session.
+test "live UDP: never-landing dial closes when the handshake times out" {
+    const allocator = std.testing.allocator;
+    const control = @import("control.zig");
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+    const client_session_id = n.dialQuic("127.0.0.1:1", .{
+        .server_name = "localhost",
+        .ca_pem = dispatch_test_cert_pem,
+        .transport = .{
+            .peer_id = "dead-port-dialer",
+            .role_flags = control.RoleFlags.client,
+            .supported_patterns = control.PatternBits.req,
+        },
+    }) catch |err| switch (err) {
+        // Environments that deny UDP binds skip rather than fail.
+        error.AccessDenied,
+        error.AddressInUse,
+        error.AddressUnavailable,
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => return error.SkipZigTest,
+        else => return err,
+    };
+
+    // The default handshake timeout is 30s; the virtual clock
+    // advances 1ms per tick, so terminal close lands near 30_000
+    // iterations. Dead-port sends may also surface transient socket
+    // errors (ICMP-driven refusals) — they are not the death signal
+    // and must not stall the drive.
+    var now_us: u64 = 1_000;
+    var closed_count: usize = 0;
+    var step: u32 = 0;
+    while (step < 60_000 and closed_count == 0) : (step += 1) {
+        now_us += 1_000;
+        n.tick(now_us) catch {};
+        var events: [4]Event = undefined;
+        const count = try n.poll(&events);
+        for (events[0..count]) |*event| {
+            defer event.deinit();
+            switch (event.*) {
+                .closed => |id| {
+                    try std.testing.expectEqual(client_session_id, id);
+                    closed_count += 1;
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), closed_count);
+    try std.testing.expectEqual(@as(?*QuicSessionRuntime, null), n.quicSession(client_session_id));
 }
 
 fn localhostEndpoint(allocator: std.mem.Allocator, address: std.Io.net.IpAddress) ![]u8 {

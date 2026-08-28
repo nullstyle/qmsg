@@ -221,6 +221,21 @@ ignores — see
 a request); send-path errors from `requestQuic` stay synchronous and
 map through `classifyRequestError` like the inproc ones.
 
+**Dial sessions observe connection death.** A node-owned dial whose
+connection reaches QUIC's terminal closed state — a peer
+CONNECTION_CLOSE observed through the draining deadline, a stateless
+reset, an idle or handshake timeout — is closed through the same
+path an explicit `closeQuicSession` takes: one `.closed` event, the
+session gone from `quicSession`, and every still-pending request
+classified `.peer_closed` in the same tick. Detection is
+terminal-only on purpose (`closeState()`'s closing/draining are an
+in-progress close, not death) and lags the wire event by the
+draining window — on real clocks that is seconds; on a
+virtual-clock embedder, whenever `now_us` crosses the deadline.
+Late-and-certain is the contract; peers that need earlier signal can
+close on their own deadlines. Driver-owned (listener-side) sessions
+are untouched — they already die through the will-close teardown.
+
 ## Relation to the App facade
 
 `App` (the handler-registration facade over the same Node) consumes
