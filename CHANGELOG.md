@@ -5,6 +5,48 @@ All notable changes to qmsg are documented in this file.
 The project is pre-1.0. Any 0.x release may include breaking API
 changes.
 
+## [0.1.7] - 2026-08-28
+
+Dial sessions now observe connection death (the swarm peer-visibility
+seam, per the mruby-quic consumer report).
+
+### Fixed
+
+- **A client dial session whose connection died emitted nothing,
+  forever.** `tickQuicClients` never inspected the connection's
+  close state, quic-zig's `Connection.tick` early-returns once
+  closed, and the connection was unreachable from the embedder side —
+  so a silently dead remote (process kill, partition) left the peer
+  visibly up with no event, and consumer redial machinery keyed on
+  `.closed` never fired. The client tick now stops pumping a
+  terminally-dead connection and tears its session down through the
+  existing `closeQuicSession` path: exactly one `.closed` event, the
+  session gone from `quicSession`, and every still-pending
+  `requestQuic` classified `.peer_closed` in the same tick's outcome
+  sweep. Detection is terminal-only by design (`Connection.isClosed`;
+  `closeState()`'s closing/draining are an in-progress close, not
+  death) and lags the wire event by the draining window — documented
+  in EMBEDDING.md as late-and-certain. Driver-owned (listener-side)
+  sessions are untouched (will-close teardown already handles them),
+  and a never-landing dial whose handshake times out closes through
+  the same path — intentional, and safe to race consumer-side
+  connect-timeout recycling (`closeQuicSession` is idempotent per
+  session on the consumer's event routing).
+
+### Testing
+
+- Live kill-remote acceptance: dial to a live listener, drive to
+  ready, fifty healthy ticks emit no `.closed`, then the server-side
+  connection closes (CONNECTION_CLOSE on the wire) with a request
+  in flight — the dial emits `.closed` exactly once, the session is
+  gone, and the pending classifies `.peer_closed` with the right
+  (session, stream, id).
+- Live never-landing dial: a dial to a dead port closes through the
+  handshake-timeout path with exactly one `.closed`. Both tests fail
+  on v0.1.6 (verified by neutering the reaper: 246/248).
+- Full suite 331 tests (248 root + 83 transport), all green in
+  debug; examples run (localhost live).
+
 ## [0.1.6] - 2026-08-28
 
 Dial-side QUIC request outcomes (the Phase B item deferred since the
