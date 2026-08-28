@@ -5,6 +5,49 @@ All notable changes to qmsg are documented in this file.
 The project is pre-1.0. Any 0.x release may include breaking API
 changes.
 
+## [0.1.2] - 2026-08-27
+
+Two consumer-reported fixes from mruby-quic's live QUIC round-trip
+testing (a real listener on an ephemeral localhost port, client
+embedded in their single-threaded tick loop), plus the requested
+dial documentation.
+
+### Fixed
+
+- **`queueReliable` now arms the reply receiver on the request's own
+  stream.** A reply to `queueReliable` arrives on the requester's OWN
+  bidi stream, which `acceptPeerBidiStreamsConnection` never covers
+  (it auto-accepts only peer-initiated streams) — so the reply's
+  bytes landed on the connection while `recvReliable()` returned null
+  forever and every outbound request expired. Consumers no longer
+  need the explicit `acceptReliableStream` workaround; a stream a
+  request is sent on is a stream a reply is expected on. A stream
+  that never receives its reply keeps an idle receiver until session
+  deinit.
+- **`Node.deinit` no longer use-after-frees live sessions.** It freed
+  `quic_sessions` before `quic_listeners`; a live listener's
+  `Server.deinit` then fired the will-close hook per connection,
+  whose user_data pointed at session runtimes already freed —
+  SIGBUS at 0xaaaaaaaaaaaaaaaa on teardown with any connected
+  session (a graceful client-side close did not help; the
+  server-side session never retires through `runOnce` alone).
+  Teardown order is now listeners (whose hook destroys each
+  driver-owned session exactly once) → clients → remaining
+  sessions, and `QuicListenerRuntime.deinit` tears the listener's
+  Server down before the dispatch that owns the hook state.
+
+### Added
+
+- Live-UDP acceptance test (skipped when the sandbox denies binds):
+  request/reply over real QUIC with no explicit accept anywhere, then
+  plain `Node.deinit` with both sessions still live. Verified it
+  reproduces the consumer's exact crash signature under the old
+  teardown order.
+- `QuicDialOptions` now documents that `supported_patterns` is
+  announced in the HELLO and is meaningful on dials (announce
+  `req | rep` for a req/rep dial; req-only is the plausible-looking
+  mistake).
+
 ## [0.1.1] - 2026-08-27
 
 The dependency-build fix: qmsg could not be instantiated as a

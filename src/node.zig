@@ -274,6 +274,14 @@ pub const QuicListenOptions = struct {
     receive_timeout: std.Io.Timeout = transport.quic_udp.default_receive_timeout,
 };
 
+/// Options for one outbound QUIC client session (`Node.dialQuic`).
+///
+/// `transport.supported_patterns` is ANNOUNCED in the qmsg HELLO and
+/// is meaningful on dials: announce the patterns the dial will
+/// actually use — a req/rep dial announces `req | rep` (see the
+/// examples). A req-only announcement looks plausible but tells the
+/// peer this client will not accept replies, which the peer's policy
+/// may enforce.
 pub const QuicDialOptions = struct {
     server_name: []const u8,
     ca_pem: ?[]const u8 = null,
@@ -306,8 +314,13 @@ pub const QuicListenerRuntime = struct {
 
     fn deinit(self: *QuicListenerRuntime, allocator: std.mem.Allocator) void {
         _ = allocator;
-        self.dispatch.deinit();
+        // Listener FIRST: quic-zig's Server.deinit fires the will-close
+        // hook per live connection, and that hook's user_data is the
+        // dispatch's driver — so the dispatch must still be alive (its
+        // session table intact) when the Server runs. The hook then
+        // destroys each driver-owned session through the owner.
         self.listener.deinit();
+        self.dispatch.deinit();
         self.* = undefined;
     }
 };
@@ -459,6 +472,28 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        // Listeners FIRST: a live listener's Server.deinit fires the
+        // will-close hook per connection, which destroys each
+        // driver-owned session through the proper path (exactly once,
+        // events emitted, socket refs dropped). Tearing sessions down
+        // before listeners leaves the hook's user_data pointing at
+        // freed runtimes — use-after-free on any live session.
+        for (self.quic_listeners.items) |runtime| {
+            runtime.deinit(self.allocator);
+            self.allocator.destroy(runtime);
+        }
+        self.quic_listeners.deinit(self.allocator);
+        for (self.quic_clients.items) |client| {
+            client.deinit();
+            self.allocator.destroy(client);
+        }
+        self.quic_clients.deinit(self.allocator);
+        for (self.quic_sessions.items) |runtime| {
+            runtime.deinit();
+            self.allocator.destroy(runtime);
+        }
+        self.quic_sessions.deinit(self.allocator);
+        self.quic_socket_attachments.deinit(self.allocator);
         self.inproc_pending.deinit(self.allocator);
         if (self.inproc_sub) |sub| {
             sub.deinit();
@@ -474,22 +509,6 @@ pub const Node = struct {
             self.allocator.destroy(req_dial);
         }
         self.inproc_dials.deinit(self.allocator);
-        for (self.quic_clients.items) |client| {
-            client.deinit();
-            self.allocator.destroy(client);
-        }
-        self.quic_clients.deinit(self.allocator);
-        for (self.quic_sessions.items) |runtime| {
-            runtime.deinit();
-            self.allocator.destroy(runtime);
-        }
-        self.quic_sessions.deinit(self.allocator);
-        self.quic_socket_attachments.deinit(self.allocator);
-        for (self.quic_listeners.items) |runtime| {
-            runtime.deinit(self.allocator);
-            self.allocator.destroy(runtime);
-        }
-        self.quic_listeners.deinit(self.allocator);
         for (self.inproc_rep_endpoints.items) |endpoint| {
             endpoint.deinit(self.allocator);
             self.allocator.destroy(endpoint);
@@ -2281,10 +2300,9 @@ test "listener dispatch drives qmsg sessions through quic.app.Driver end to end"
         .flags = .{ .final = true },
         .body = "Ada Lovelace",
     });
-    // Reply receiver on the client's own request stream: request/
-    // reply correlation is app-driven on the dial side (the server
-    // side is what the dispatch automates).
-    try client_sess.runtime.acceptReliableStream(stream_id);
+    // The reply receiver on the client's own request stream was armed
+    // by queueReliable itself — no explicit accept needed on the dial
+    // side anymore.
     var reply: ?transport.quic_session_runtime.ReceivedReliable = null;
     step = 0;
     while (step < 4_000 and reply == null) : (step += 1) {
@@ -2328,4 +2346,244 @@ test "listener dispatch drives qmsg sessions through quic.app.Driver end to end"
     };
     try std.testing.expect(saw_connected_server);
     try std.testing.expect(saw_closed_server);
+}
+
+test "Node.deinit with a live driver-owned session tears down cleanly" {
+    const allocator = std.testing.allocator;
+    const control = @import("control.zig");
+
+    const server_opts: transport.quic.QuicOptions = .{
+        .peer_id = "dispatch-server",
+        .role_flags = control.RoleFlags.server,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+    const client_opts: transport.quic.QuicOptions = .{
+        .peer_id = "dispatch-client",
+        .role_flags = control.RoleFlags.client,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+
+    var node = try Node.init(allocator, .{});
+    defer node.deinit();
+
+    var p: DispatchTestPeers = undefined;
+    p.now_us = 1_000;
+    p.listener = try transport.quic_runtime.ListenerRuntime.init(allocator, "127.0.0.1:4433", .{
+        .tls_cert_pem = dispatch_test_cert_pem,
+        .tls_key_pem = dispatch_test_key_pem,
+        .transport = server_opts,
+    });
+    try p.dispatch.init(allocator, &node, server_opts);
+    // Defer order (LIFO): listener FIRST (its Server.deinit fires the
+    // will-close hook that destroys the driver-owned session), then
+    // the dispatch, then the client — mirroring the fixed
+    // QuicListenerRuntime/Node teardown order under test.
+    defer p.dispatch.deinit();
+    defer p.listener.deinit();
+    p.dispatch.attach(&p.listener.server);
+    p.client = try transport.quic_runtime.ClientRuntime.init(allocator, "127.0.0.1:4433", .{
+        .server_name = "localhost",
+        .insecure_skip_verify = true, // self-signed test fixture
+        .transport = client_opts,
+    });
+    defer p.client.deinit();
+
+    const client_sess = try node.openQuicSession(.{
+        .role = .client,
+        .transport = client_opts,
+    });
+    client_sess.transport_ready = true;
+    try client_sess.runtime.onQuicReady();
+
+    // Drive to a fully ready pair, then deinit with the connection
+    // STILL LIVE: the listener's Server.deinit must fire the
+    // will-close hook (dispatch alive) and destroy the driver-owned
+    // server session exactly once, before Node frees anything it
+    // points at. No graceful close, no reap — plain teardown.
+    var step: u32 = 0;
+    while (step < 4_000) : (step += 1) {
+        try p.drive();
+        if (p.client.connection().handshakeDone() and
+            p.listener.connectionCount() > 0 and
+            p.listener.connection(0).?.handshakeDone()) break;
+    }
+    var server_sess: ?*QuicSessionRuntime = null;
+    step = 0;
+    while (step < 4_000) : (step += 1) {
+        _ = try client_sess.runtime.pumpConnection(p.client.connection());
+        try p.drive();
+        if (server_sess == null) {
+            for (node.quic_sessions.items) |candidate| {
+                if (candidate != client_sess) server_sess = candidate;
+            }
+        }
+        const server_ready = if (server_sess) |sess| sess.state() == .ready else false;
+        if (client_sess.state() == .ready and server_ready) break;
+    }
+    try std.testing.expectEqual(transport.quic.State.ready, client_sess.state());
+    const srv_sess = server_sess orelse return error.ServerSessionMissing;
+    try std.testing.expectEqual(transport.quic.State.ready, srv_sess.state());
+    try std.testing.expectEqual(@as(usize, 2), node.quic_sessions.items.len);
+
+    // defers above run node.deinit() first (listeners -> hook ->
+    // session destroy), then the peer runtimes — exiting this test
+    // without a crash, double free, or leak IS the acceptance check.
+}
+
+// ---- live-UDP acceptance (skipped when the sandbox denies binds) ------------
+
+test "live UDP: queueReliable round trip needs no explicit accept and deinit with live sessions is clean" {
+    const allocator = std.testing.allocator;
+    const control = @import("control.zig");
+
+    const server_opts: transport.quic.QuicOptions = .{
+        .peer_id = "live-server",
+        .role_flags = control.RoleFlags.server,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+    const client_opts: transport.quic.QuicOptions = .{
+        .peer_id = "live-client",
+        .role_flags = control.RoleFlags.client,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    const listener_id = n.listenQuic("127.0.0.1:0", .{
+        .tls_cert_pem = dispatch_test_cert_pem,
+        .tls_key_pem = dispatch_test_key_pem,
+        .transport = server_opts,
+    }) catch |err| switch (err) {
+        // Environments that deny UDP binds skip this test rather
+        // than fail it; everywhere else it is the acceptance check
+        // for both embedded-dial behaviors.
+        error.AccessDenied,
+        error.AddressInUse,
+        error.AddressUnavailable,
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => return error.SkipZigTest,
+        else => return err,
+    };
+    const listener = n.quic_listeners.items[listener_id];
+    const target = try localhostEndpoint(allocator, listener.localAddress());
+    defer allocator.free(target);
+
+    const client_session_id = try n.dialQuic(target, .{
+        .server_name = "localhost",
+        // The fixture cert is a self-signed CA with a localhost SAN,
+        // so it verifies against itself.
+        .ca_pem = dispatch_test_cert_pem,
+        .transport = client_opts,
+    });
+    const client = n.quicSession(client_session_id) orelse return error.EndpointNotFound;
+
+    var now_us: u64 = 1_000;
+    var step: u32 = 0;
+    while (step < 20_000) : (step += 1) {
+        now_us += 1_000;
+        try n.tick(now_us);
+        if (client.state() == .ready and liveServerSessionReady(&n, client_session_id)) break;
+    }
+    try std.testing.expectEqual(transport.quic.State.ready, client.state());
+
+    // Ask-1 acceptance: send a request and receive its reply with NO
+    // explicit acceptReliableStream anywhere — queueReliable armed the
+    // reply receiver on the requester's own stream.
+    const stream_id = try client.queueReliable(.{
+        .subject = "user.get",
+        .id = 7,
+        .deadline_ms = 2_000,
+        .body = "42",
+    });
+    var dispatcher = LiveUdpDispatcher{ .allocator = allocator };
+    var reply: ?transport.quic_session_runtime.ReceivedReliable = null;
+    step = 0;
+    while (step < 20_000 and reply == null) : (step += 1) {
+        now_us += 1_000;
+        try n.tick(now_us);
+        // Check the reply BEFORE runOnce: runOnce dispatches every
+        // received reliable message through the .rep path, and a
+        // dispatched REPLY would be answered again (the localhost
+        // example checks the client reply first for the same reason).
+        reply = client.runtime.recvReliable();
+        if (reply == null) {
+            _ = try n.runOnce(&dispatcher);
+        }
+    }
+    var got = reply orelse return error.ReplyMissing;
+    defer got.deinit();
+    try std.testing.expectEqual(stream_id, got.stream_id);
+    try std.testing.expectEqual(@as(message.MessageId, 7), got.message.id);
+    try std.testing.expectEqualStrings("user-42", got.message.body);
+
+    // Ask-2 acceptance: fall off the end with BOTH sessions live (the
+    // server's driver-owned, the client's dial-owned) and the listener
+    // still connected. node.deinit() runs on scope exit and must tear
+    // down listeners (whose Server.deinit fires the will-close hook
+    // into live dispatch state) before freeing any session.
+}
+
+const LiveUdpDispatcher = struct {
+    allocator: std.mem.Allocator,
+
+    const Result = struct {
+        allocator: std.mem.Allocator,
+        replies: std.ArrayList(message.Message) = .empty,
+        publications: std.ArrayList(message.Message) = .empty,
+
+        fn deinit(self: *Result) void {
+            for (self.replies.items) |*msg| msg.deinit();
+            self.replies.deinit(self.allocator);
+            for (self.publications.items) |*msg| msg.deinit();
+            self.publications.deinit(self.allocator);
+        }
+    };
+
+    fn dispatchQuicReliable(
+        self: *@This(),
+        kind: socket.Pattern,
+        incoming: message.Message,
+        sess: *session.Session,
+    ) !Result {
+        _ = kind;
+        _ = sess;
+
+        var owned = incoming;
+        defer owned.deinit();
+
+        var result = Result{ .allocator = self.allocator };
+        // Echo the request subject, as the App facade does for empty
+        // reply subjects — the envelope layer rejects "".
+        const reply = try message.Message.init(self.allocator, .{
+            .subject = owned.subject,
+            .id = owned.id,
+            .flags = .{ .final = true },
+            .deadline_ms = owned.deadline_ms,
+            .body = "user-42",
+        });
+        errdefer {
+            var cleanup = reply;
+            cleanup.deinit();
+        }
+        try result.replies.append(self.allocator, reply);
+        return result;
+    }
+};
+
+fn liveServerSessionReady(n: *const Node, exclude: QuicSessionId) bool {
+    for (n.quic_sessions.items) |runtime| {
+        if (runtime.id() == exclude) continue;
+        if (runtime.state() == .ready) return true;
+    }
+    return false;
+}
+
+fn localhostEndpoint(allocator: std.mem.Allocator, address: std.Io.net.IpAddress) ![]u8 {
+    return switch (address) {
+        .ip4 => |ip4| try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{ip4.port}),
+        .ip6 => |ip6| try std.fmt.allocPrint(allocator, "[::1]:{d}", .{ip6.port}),
+    };
 }

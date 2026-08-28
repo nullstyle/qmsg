@@ -167,11 +167,26 @@ pub const QuicSessionRuntime = struct {
         try self.queueLocalHello();
     }
 
+    /// Queues one reliable message on a freshly opened bidi stream.
+    ///
+    /// A request sent on a bidi stream expects its reply on that same
+    /// stream, and the requester's OWN stream id is never covered by
+    /// `acceptPeerBidiStreamsConnection` (which auto-accepts only
+    /// peer-initiated streams) — so the reply receiver is armed here.
+    /// Without it the reply's bytes land on the connection while
+    /// `recvReliable` returns null forever and the request expires.
+    /// A stream that never receives its reply keeps an idle receiver
+    /// until the session deinits.
     pub fn queueReliable(self: *QuicSessionRuntime, outgoing: message.OutgoingMessage) !u64 {
         try self.ensureReadyForApplicationData();
 
         const stream_id = try self.stream_ids.nextBidi();
         try self.queueReliableOnStream(stream_id, outgoing, .{});
+
+        self.acceptReliableStream(stream_id) catch |err| switch (err) {
+            error.StreamAlreadyOpen => {},
+            else => return err,
+        };
         return stream_id;
     }
 
@@ -973,6 +988,51 @@ test "session runtime transfers receiver ownership to inbox" {
     try std.testing.expectEqualStrings("jobs.run", received.message.subject);
     try std.testing.expectEqualStrings("now", received.message.body);
     try std.testing.expectEqual(@as(usize, 0), runtime.inboxLen());
+}
+
+test "queueReliable arms the reply receiver on the request's own stream" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .client, .{ .peer_id = "client-a" });
+    defer runtime.deinit();
+    var peer = try QuicSessionRuntime.init(allocator, 2, .server, .{ .peer_id = "server-a" });
+    defer peer.deinit();
+    var io = FakeTransport.init(allocator);
+    defer io.deinit();
+    var peer_io = FakeTransport.init(allocator);
+    defer peer_io.deinit();
+    try runtime.onQuicReady();
+    try peer.onQuicReady();
+    try pumpBoth(&runtime, &io, &peer, &peer_io);
+
+    const stream_id = try runtime.queueReliable(.{
+        .subject = "user.get",
+        .id = 7,
+        .body = "42",
+    });
+    try std.testing.expectEqual(@as(u64, 0), stream_id);
+    // The reply arrives on the requester's OWN bidi stream, which the
+    // peer-initiated auto-accept never covers — queueReliable must
+    // have armed the receiver itself.
+    try std.testing.expectEqual(@as(usize, 1), runtime.pendingReliableReceivers());
+
+    const encoded = try quic_streams.encodeReliableMessage(allocator, .{
+        .subject = "user.get",
+        .id = 7,
+        .flags = .{ .final = true },
+        .body = "user-42",
+    }, .{});
+    defer allocator.free(encoded);
+
+    const entry = try io.getOrPutStream(stream_id);
+    try entry.value_ptr.incoming.appendSlice(allocator, encoded);
+    entry.value_ptr.final_size = encoded.len;
+
+    _ = try runtime.pump(&io);
+    var received = runtime.recvReliable() orelse return error.ReplyMissing;
+    defer received.deinit();
+    try std.testing.expectEqual(stream_id, received.stream_id);
+    try std.testing.expectEqualStrings("user-42", received.message.body);
 }
 
 test "session runtime replies on an accepted peer stream" {
