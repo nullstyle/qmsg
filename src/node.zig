@@ -352,6 +352,18 @@ pub const QuicListenOptions = struct {
     rx_buffer_bytes: usize = transport.quic_runtime.default_rx_buffer_bytes,
     tx_buffer_bytes: usize = transport.quic_runtime.default_tx_buffer_bytes,
     receive_timeout: std.Io.Timeout = transport.quic_udp.default_receive_timeout,
+    /// RFC 9000 §10.3 stateless-reset HMAC key. Null (the default)
+    /// generates a fresh random key per listener, so every qmsg
+    /// listener answers orphan probes with a Stateless Reset by
+    /// default. The probing peer detects the reset through the
+    /// per-CID token it was advertised at handshake — no shared
+    /// secret on the peer side. Pin ONE key across instances and
+    /// restarts (`stateless_reset_key = same_value` on every
+    /// listener) in multi-instance or replacement deployments: a
+    /// reborn listener can only kill a dead instance's orphans when
+    /// its reset verifies against the tokens the dead instance
+    /// minted, which requires the same key.
+    stateless_reset_key: ?[32]u8 = null,
 };
 
 /// Options for one outbound QUIC client session (`Node.dialQuic`).
@@ -654,6 +666,19 @@ pub const Node = struct {
         var owns_runtime = true;
         errdefer if (owns_runtime) self.allocator.destroy(runtime);
 
+        // Reset posture by default: a keyed listener answers
+        // orphan probes (unroutable short-header datagrams) with a
+        // Stateless Reset instead of silently dropping them, so a
+        // probing orphan dies at its first PTO instead of probing
+        // forever. Fresh random key per listener; deployments that
+        // replace or scale listeners pin one via the option.
+        var stateless_reset_key = options.stateless_reset_key;
+        if (stateless_reset_key == null) {
+            var generated: [32]u8 = undefined;
+            self.options.io.random(&generated);
+            stateless_reset_key = generated;
+        }
+
         runtime.* = .{
             .id = id,
             .listener = try transport.quic_udp.Listener.start(self.allocator, self.options.io, .{
@@ -662,6 +687,7 @@ pub const Node = struct {
                     .tls_cert_pem = options.tls_cert_pem,
                     .tls_key_pem = options.tls_key_pem,
                     .transport = options.transport,
+                    .stateless_reset_key = stateless_reset_key,
                 },
                 .rx_buffer_bytes = options.rx_buffer_bytes,
                 .tx_buffer_bytes = options.tx_buffer_bytes,
@@ -4234,6 +4260,145 @@ test "live UDP: never-landing dial closes when the handshake times out" {
     }
     try std.testing.expectEqual(@as(usize, 1), closed_count);
     try std.testing.expectEqual(@as(?*QuicSessionRuntime, null), n.quicSession(client_session_id));
+}
+
+// The under-load starvation the consumer hit: a connection with
+// unacked data in flight never idles (quic-zig bumps the activity
+// clock on SEND, so every PTO probe resets the idle timer), so a
+// silently-dead remote with a deadline-less request pending leaves
+// the session visibly ready forever. A KEYED listener closes that
+// hole: the reborn listener on the same port (same pinned reset key)
+// answers the orphan's probes with a Stateless Reset, the client
+// verifies it through the per-CID token it was advertised at
+// handshake, and the v0.1.7 death observation closes the session —
+// at the first PTO after rebirth, not after the idle window.
+test "live UDP: keyed reborn listener resets an orphan under load, fast" {
+    const allocator = std.testing.allocator;
+    const control = @import("control.zig");
+
+    // One pinned key across death and rebirth — the multi-instance /
+    // replacement posture. A fresh random key on the reborn listener
+    // would emit resets the orphan cannot verify.
+    var reset_key: [32]u8 = undefined;
+    for (&reset_key, 0..) |*byte, index| byte.* = @intCast(index *% 7 +% 3);
+
+    const listen_opts: transport.quic.QuicOptions = .{
+        .peer_id = "reborn-server",
+        .role_flags = control.RoleFlags.server,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+    const client_opts: transport.quic.QuicOptions = .{
+        .peer_id = "orphan-prober",
+        .role_flags = control.RoleFlags.client,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+
+    var server = try Node.init(allocator, .{});
+    const server_listener_id = server.listenQuic("127.0.0.1:0", .{
+        .tls_cert_pem = dispatch_test_cert_pem,
+        .tls_key_pem = dispatch_test_key_pem,
+        .transport = listen_opts,
+        .stateless_reset_key = reset_key,
+    }) catch |err| switch (err) {
+        error.AccessDenied,
+        error.AddressInUse,
+        error.AddressUnavailable,
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => return error.SkipZigTest,
+        else => return err,
+    };
+    const server_listener = server.quic_listeners.items[server_listener_id];
+    const target = try localhostEndpoint(allocator, server_listener.localAddress());
+    defer allocator.free(target);
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+    const client_session_id = try n.dialQuic(target, .{
+        .server_name = "localhost",
+        .ca_pem = dispatch_test_cert_pem,
+        .transport = client_opts,
+    });
+    const client = n.quicSession(client_session_id) orelse return error.EndpointNotFound;
+
+    var now_us: u64 = 1_000;
+    var step: u32 = 0;
+    while (step < 20_000) : (step += 1) {
+        now_us += 1_000;
+        try server.tick(now_us);
+        try n.tick(now_us);
+        if (client.state() == .ready and liveServerSessionReady(&n, client_session_id)) break;
+    }
+    try std.testing.expectEqual(transport.quic.State.ready, client.state());
+
+    // The starving shape: a DEADLINE-LESS request in flight when the
+    // remote dies silently. Nothing but the reset can classify it.
+    const stream_id = try n.requestQuic(client_session_id, .{
+        .subject = "remote.slow",
+        .id = 100,
+        .body = "never answered",
+    });
+
+    // Silent kill: plain deinit — quic-zig's Server.deinit is local
+    // teardown only, no CONNECTION_CLOSE ships — then the reborn
+    // listener takes the same port with the SAME key.
+    server.deinit();
+    var reborn = try Node.init(allocator, .{});
+    defer reborn.deinit();
+    _ = reborn.listenQuic(target, .{
+        .tls_cert_pem = dispatch_test_cert_pem,
+        .tls_key_pem = dispatch_test_key_pem,
+        .transport = listen_opts,
+        .stateless_reset_key = reset_key,
+    }) catch |err| switch (err) {
+        // The old socket may still hold the port briefly in some
+        // environments; that is an environment limit, not a failure
+        // of the behavior under test.
+        error.AddressInUse, error.AddressUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const death_us = now_us;
+    var saw_closed = false;
+    var saw_peer_closed = false;
+    var closed_count: usize = 0;
+    step = 0;
+    while (step < 20_000 and !(saw_closed and saw_peer_closed)) : (step += 1) {
+        now_us += 1_000;
+        try reborn.tick(now_us);
+        try n.tick(now_us);
+        var events: [4]Event = undefined;
+        const count = try n.poll(&events);
+        for (events[0..count]) |*event| {
+            defer event.deinit();
+            switch (event.*) {
+                .closed => |id| {
+                    closed_count += 1;
+                    try std.testing.expectEqual(client_session_id, id);
+                    saw_closed = true;
+                },
+                .quic_request_failed => |ev| {
+                    try std.testing.expectEqual(client_session_id, ev.session_id);
+                    try std.testing.expectEqual(stream_id, ev.stream_id);
+                    try std.testing.expectEqual(@as(message.MessageId, 100), ev.id);
+                    try std.testing.expectEqual(RequestFailure.peer_closed, ev.failure);
+                    saw_peer_closed = true;
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(saw_closed);
+    try std.testing.expect(saw_peer_closed);
+    try std.testing.expectEqual(@as(usize, 1), closed_count);
+    try std.testing.expectEqual(@as(?*QuicSessionRuntime, null), n.quicSession(client_session_id));
+
+    // Fast, not the idle window: the reset lands at the first PTO
+    // after rebirth (sub-second probes), while idle death needs the
+    // full quiet window. 10s of virtual time is generous for one and
+    // impossible for the other.
+    try std.testing.expect(now_us - death_us < 10_000_000);
 }
 
 fn localhostEndpoint(allocator: std.mem.Allocator, address: std.Io.net.IpAddress) ![]u8 {

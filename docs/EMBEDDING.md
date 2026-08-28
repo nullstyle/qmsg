@@ -236,6 +236,24 @@ Late-and-certain is the contract; peers that need earlier signal can
 close on their own deadlines. Driver-owned (listener-side) sessions
 are untouched — they already die through the will-close teardown.
 
+One QUIC caveat survives this: a connection with UNACKED data in
+flight never idles — every PTO probe resets the idle timer — so a
+silently-dead remote plus a deadline-less pending request would
+probe forever. qmsg listeners therefore answer stateless resets by
+default: every `listenQuic` arms a fresh random RFC 9000 §10.3
+stateless-reset key (overridable via `QuicListenOptions
+.stateless_reset_key`), and a keyed listener responds to unroutable
+orphan probes with a Stateless Reset the probing peer verifies
+through the per-CID token it was advertised at handshake — the
+orphan dies at its first PTO. Pin ONE key across instances and
+restarts in multi-instance or replacement deployments: a reborn
+listener can only kill a dead instance's orphans when its reset
+verifies against the tokens the dead instance minted, which requires
+the same key. What resets cannot fix: a port where NOTHING listens
+is silent, so detection there still waits for quiet-plus-idle (or a
+request deadline) — that residual is QUIC, and the consumer-side
+answer is deadlines on cross-peer requests.
+
 ## Relation to the App facade
 
 `App` (the handler-registration facade over the same Node) consumes

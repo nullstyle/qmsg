@@ -47,6 +47,16 @@ pub const ListenerOptions = struct {
     tls_cert_pem: []const u8,
     tls_key_pem: []const u8,
     transport: quic.QuicOptions = .{},
+    /// RFC 9000 §10.3 stateless-reset HMAC key. A keyed listener
+    /// answers unroutable short-header datagrams (orphan probes for
+    /// connections it never knew) with a Stateless Reset, which the
+    /// probing peer detects through the per-CID token it was
+    /// advertised at handshake — no shared secret on the peer. Null
+    /// disables resets (silent drop). Multi-instance and
+    /// replacement deployments pin ONE key across instances/restarts
+    /// so a reborn listener's reset verifies against tokens minted
+    /// by the instance that died.
+    stateless_reset_key: ?[32]u8 = null,
 };
 
 pub const ClientOptions = struct {
@@ -182,6 +192,7 @@ pub const ListenerRuntime = struct {
             .tls_key_pem = options.tls_key_pem,
             .alpn_protocols = options.transport.alpn_protocols,
             .transport_params = transportParamsFromOptions(options.transport),
+            .stateless_reset_key = options.stateless_reset_key,
         }) catch |err| return mapQuicError(err);
 
         return .{
