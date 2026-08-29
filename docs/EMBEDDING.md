@@ -263,6 +263,22 @@ Three operational notes, each learned the hard way downstream:
   but it will surprise someone. Settle the subscription before
   publishing when certainty matters.
 
+**Auth tokens are fail-closed on the `qmsg` claim.** A PASETO token
+without a `qmsg` claim is rejected outright under the default
+`require_qmsg_claim = true` (and with the claim, `patterns` is
+required and must be non-empty — a token that parses but carries no
+patterns would deny every pattern a real HELLO announces). There is
+no unset-means-allow-all path: every usable token carries
+`{"sub":…, "iss":…, "qmsg":{"patterns":[…], "datagram":true?}}`.
+Claim pattern spellings differ from the identifiers you will meet in
+source: claims use `"pub"`/`"sub"`, while the enum tags are
+`.@"pub"`/`.sub` and the `PatternBits` fields are `pub_`/`sub`. A
+working example token's claims:
+
+```json
+{"sub":"actor-7","iss":"swarm-ca","qmsg":{"patterns":["req","rep","sub"],"datagram":true}}
+```
+
 **Dial sessions observe connection death.** A node-owned dial whose
 connection reaches QUIC's terminal closed state — a peer
 CONNECTION_CLOSE observed through the draining deadline, a stateless
