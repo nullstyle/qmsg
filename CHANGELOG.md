@@ -5,6 +5,59 @@ All notable changes to qmsg are documented in this file.
 The project is pre-1.0. Any 0.x release may include breaking API
 changes.
 
+## [0.3.0] - 2026-08-28
+
+Channel binding end to end: the QUIC adapter now wires the HELLO
+challenge hooks (minted per accepted session, verified per credential)
+that 0.2.1 shipped as library primitives without transport support.
+Found and specified by the mruby-quic consumer against the v0.2.1
+tarball; implemented, tested live over UDP here.
+
+### Added
+
+- **`QuicOptions.hello_challenge` — per-connection challenge minting
+  in the QUIC listener loop.** A listener armed with an
+  `auth.HelloChallengeConfig` template mints a fresh challenge for
+  every accepted session at `Node.driverServerSessionCreate` (the
+  seam both listener dispatches converge on): bytes from the node's
+  io, binding installed into that session's `AuthConfig`
+  (`hello_binding` required), challenge advertised in the outgoing
+  HELLO. The session owns the binding, so a challenge dies with its
+  connection — a token verified here is bound to THIS connection's
+  implicit assertion and replays nowhere else (proven live: a
+  captured token re-presented statically on a second connection is
+  rejected and the session torn down). Static-credential listeners
+  are untouched; the template is strictly opt-in.
+- **`QuicOptions.credential_provider` + `auth.CredentialProvider` —
+  dial-side bound minting.** Fn-pointer shape mirrors
+  `Authenticator` (`ptr` + `provide_fn`, root-re-exported). A dial
+  with a provider defers its local HELLO until the peer's arrives,
+  then calls the provider with an `auth.PeerHelloContext`
+  (peer id + advertised challenge); the returned
+  `auth.ProvidedCredential` (token, optional hint, allocator-owned)
+  rides the HELLO, the session owning its copies. A provider error
+  closes the session, exactly like a rejected static credential.
+  Mutual deferral (providers on both ends) is unsupported and
+  documented: one side must send eagerly, and listeners always do.
+- **`auth.HelloChallengeState.fromOwnedChallenge`** — build a binding
+  state around caller-filled bytes, for seams that draw randomness
+  from `std.Io` rather than a `std.Random` (the node's own path).
+- **The peer's advertised challenge is retained and honored**: the
+  session stores `peer_hello_challenge`, and what
+  `Session.authenticateHello` validates is now the real advertised
+  bytes (previously decoded-then-dropped, and the policy check saw
+  empty). A binding policy tighter than the codec's 128-byte wire
+  bound now rejects over-long challenges — the challenge is policy
+  input, not decoration.
+
+### Documentation
+
+- AUTH.md's replay-defense section now documents the adapter wiring
+  (both hooks, ownership lifetimes, the mutual-deferral limitation)
+  in place of the "still needs to wire" note. ROADMAP item 10
+  reflects the shipped minting; the remaining gap is replay-cache
+  wiring at the listener seam.
+
 ## [0.2.1] - 2026-08-28
 
 Fixes the published-tarball auth-path breakage (found by the

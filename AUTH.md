@@ -353,7 +353,35 @@ The core API now carries this hook in the HELLO auth surface:
   `consume()`/`discard()` on the binding so the installed config is invalidated
   with the challenge.
 
-The QUIC adapter still needs to wire those hooks into its per-connection state.
+The QUIC adapter wires those hooks into its per-connection state:
+
+- **Listener side.** Set `QuicOptions.hello_challenge` (an
+  `auth.HelloChallengeConfig` template) on a listener's transport options.
+  Where the adapter creates server sessions (`Node.driverServerSessionCreate`,
+  the seam both listener dispatches converge on), each accepted session mints a
+  fresh challenge from the template -- bytes from the node's io -- installs the
+  binding's `AuthConfig` (with `hello_binding` required) into that session's
+  options, and advertises the bytes in the outgoing HELLO. The session owns the
+  binding for its lifetime, so a challenge dies with its connection; a fresh
+  mint per session makes `consume()`/`discard()` unnecessary on this path.
+- **Dial side.** Set `QuicOptions.credential_provider` (an
+  `auth.CredentialProvider` fn-pointer, mirroring `Authenticator`). The
+  transport defers the local HELLO until the peer's arrives, then calls the
+  provider with an `auth.PeerHelloContext` carrying the peer's advertised
+  challenge and peer id. The returned `auth.ProvidedCredential` (token + hint,
+  allocator-owned) rides the HELLO; the session owns its copies. A provider
+  error closes the session, exactly like a rejected static credential. The
+  peer's advertised challenge is also retained on the session
+  (`peer_hello_challenge`) and forwarded into binding validation.
+- **Mutual deferral is not supported**: a provider on BOTH ends of one
+  connection would deadlock the HELLO exchange. One side must send eagerly
+  (listeners always do).
+
+Static credentials (`QuicOptions.auth.credential`) still verify against the
+listener's binding exactly as before -- a token signed blind cannot match a
+per-connection challenge, which is the property. An embedded app wanting the
+manual dance instead of the template can still drive
+`HelloChallengeConfig.mintBinding()` itself at the raw session seams.
 
 The concrete PASETO helper accepts an optional `auth.ReplayCache`. When present,
 `authenticateV4Public` requires `jti`, parses qmsg claims into an

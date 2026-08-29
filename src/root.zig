@@ -105,6 +105,9 @@ pub const QuicSocketAttachment = node.QuicSocketAttachment;
 pub const HelloChallengeConfig = auth.HelloChallengeConfig;
 pub const HelloChallengeBinding = auth.HelloChallengeBinding;
 pub const HelloChallengeState = auth.HelloChallengeState;
+pub const PeerHelloContext = auth.PeerHelloContext;
+pub const ProvidedCredential = auth.ProvidedCredential;
+pub const CredentialProvider = auth.CredentialProvider;
 
 pub const Error = error{
     InvalidSubject,

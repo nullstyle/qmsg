@@ -233,6 +233,21 @@ pub const QuicOptions = struct {
     heartbeat_interval_ms: u64 = 0,
     auth: control.AuthProperties = .{},
     auth_config: auth.AuthConfig = .{},
+    /// Listener template for channel binding: when set, each accepted
+    /// session mints a fresh HELLO challenge from this config,
+    /// advertises it in the outgoing HELLO, and verifies inbound
+    /// credentials against the challenge-bound implicit assertion.
+    /// Wired where the adapter creates server sessions (Node's
+    /// driverServerSessionCreate); the session owns the minted
+    /// binding for its lifetime.
+    hello_challenge: ?auth.HelloChallengeConfig = null,
+    /// Dial-side channel binding: when set, the local HELLO is
+    /// deferred until the peer's HELLO arrives and its credential is
+    /// minted by this provider, bound to the peer's advertised
+    /// challenge. The static `auth` credential fields are then
+    /// ignored. Both ends deferring (provider on both sides) is not
+    /// supported -- one side must send its HELLO eagerly.
+    credential_provider: ?auth.CredentialProvider = null,
     control_codec: control.CodecOptions = .{},
 
     max_idle_timeout_ms: u64 = 30_000,
@@ -336,6 +351,20 @@ pub const QuicSession = struct {
     local_hello_sent: bool = false,
     peer_hello_received: bool = false,
     peer_id: ?[]u8 = null,
+    /// Server side: the per-connection challenge binding minted from
+    /// `options.hello_challenge` at session creation. Owns the
+    /// challenge bytes that `options.auth.challenge` and
+    /// `options.auth_config.hello_binding.context.challenge` borrow.
+    hello_challenge_binding: ?auth.HelloChallengeBinding = null,
+    /// The peer's advertised HELLO challenge (empty when it sent
+    /// none) -- the input a dial-side CredentialProvider binds its
+    /// token to.
+    peer_hello_challenge: []u8 = &.{},
+    /// Copies of the provider-minted auth properties (owned for the
+    /// session's lifetime; the provider's originals die with its
+    /// call). Null when the credential came in statically.
+    owned_auth_credential: ?[]u8 = null,
+    owned_auth_key_id_hint: ?[]u8 = null,
     session: session_mod.Session,
 
     pub fn init(
@@ -362,6 +391,10 @@ pub const QuicSession = struct {
 
     pub fn deinit(self: *QuicSession) void {
         if (self.peer_id) |peer_id| self.allocator.free(peer_id);
+        if (self.hello_challenge_binding) |*binding| binding.deinit(self.allocator);
+        if (self.peer_hello_challenge.len > 0) self.allocator.free(self.peer_hello_challenge);
+        if (self.owned_auth_credential) |credential| self.allocator.free(credential);
+        if (self.owned_auth_key_id_hint) |hint| self.allocator.free(hint);
         self.session.clearAuthorization(self.allocator);
         self.* = undefined;
     }
@@ -468,12 +501,19 @@ pub const QuicSession = struct {
         const owned_peer_id = try self.allocator.dupe(u8, hello.peer_id);
         errdefer self.allocator.free(owned_peer_id);
 
+        const owned_challenge: []u8 = if (hello.auth.challenge.len > 0)
+            try self.allocator.dupe(u8, hello.auth.challenge)
+        else
+            &.{};
+        errdefer if (owned_challenge.len > 0) self.allocator.free(owned_challenge);
+
         var auth_committed = false;
         errdefer if (!auth_committed) self.session.clearAuthorization(self.allocator);
         try self.authenticateHello(hello);
 
         if (self.peer_id) |previous| self.allocator.free(previous);
         self.peer_id = owned_peer_id;
+        self.peer_hello_challenge = owned_challenge;
         self.peer_hello_received = true;
 
         self.session.peer_id = self.peer_id.?;
@@ -496,6 +536,7 @@ pub const QuicSession = struct {
             .scheme = hello.auth.scheme,
             .credential = hello.auth.credential,
             .key_id_hint = hello.auth.key_id_hint,
+            .challenge = hello.auth.challenge,
         });
 
         if (self.session.authorizationCache()) |authorization| {
@@ -894,6 +935,49 @@ test "QUIC session permits anonymous HELLO when auth is optional" {
     try sess.acceptPeerControl(bytes);
     try std.testing.expectEqualStrings("server-a", sess.peerId());
     try std.testing.expect(sess.session.isAnonymous());
+}
+
+test "QUIC session retains the peer's advertised HELLO challenge" {
+    const allocator = std.testing.allocator;
+
+    var sess = try QuicSession.init(allocator, 1, .client, .{ .peer_id = "client-a" });
+    defer sess.deinit();
+    try sess.onQuicReady();
+
+    const bytes = try encodeHelloControlStream(allocator, .{
+        .peer_id = "server-a",
+        .supported_patterns = control.PatternBits.pair,
+        .auth = .{ .challenge = "nonce-1" },
+    });
+    defer allocator.free(bytes);
+
+    try sess.acceptPeerControl(bytes);
+    try std.testing.expectEqualStrings("nonce-1", sess.peer_hello_challenge);
+    try std.testing.expect(sess.session.isAnonymous());
+}
+
+test "QUIC session forwards the peer challenge into binding validation" {
+    const allocator = std.testing.allocator;
+
+    // A binding policy tighter than the codec's 128-byte wire bound
+    // must reject an over-long advertised challenge: the challenge is
+    // policy input now, not decoration.
+    var sess = try QuicSession.init(allocator, 1, .client, .{
+        .peer_id = "client-a",
+        .auth_config = .{ .hello_binding = .{ .max_challenge_bytes = 8 } },
+    });
+    defer sess.deinit();
+    try sess.onQuicReady();
+
+    const bytes = try encodeHelloControlStream(allocator, .{
+        .peer_id = "server-a",
+        .supported_patterns = control.PatternBits.pair,
+        .auth = .{ .challenge = "nine-bytes" },
+    });
+    defer allocator.free(bytes);
+
+    try std.testing.expectError(auth.Error.ChallengeTooLarge, sess.acceptPeerControl(bytes));
+    try std.testing.expectEqual(@as(usize, 0), sess.peer_hello_challenge.len);
 }
 
 test "QUIC session rejects unsupported scheme and authenticator unknown key" {

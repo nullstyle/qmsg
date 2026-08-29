@@ -169,7 +169,12 @@ pub const QuicSessionRuntime = struct {
     pub fn onQuicReady(self: *QuicSessionRuntime) !void {
         try self.session.onQuicReady();
         try self.armPeerControlReceiver();
-        try self.queueLocalHello();
+        // A provider-credentialed dial defers its HELLO until the
+        // peer's arrives, so the credential can be minted against the
+        // peer's advertised challenge (see resolveDeferredCredential).
+        if (self.session.options.credential_provider == null) {
+            try self.queueLocalHello();
+        }
     }
 
     /// Queues one reliable message on a freshly opened bidi stream.
@@ -406,6 +411,8 @@ pub const QuicSessionRuntime = struct {
             }
         }
 
+        try self.resolveDeferredCredential();
+
         result.reliable_sent_complete += try self.pumpReliableSenders(transport);
         result.reliable_received += try self.pumpReliableReceivers(transport);
         return result;
@@ -471,6 +478,44 @@ pub const QuicSessionRuntime = struct {
             quic.peerControlStreamId(self.session.role),
             .{ .codec = self.session.options.control_codec },
         );
+    }
+
+    /// Channel binding on the dial side: once the peer's HELLO has
+    /// been accepted, hand its advertised challenge to the configured
+    /// CredentialProvider and queue the local HELLO carrying the
+    /// freshly minted credential. A provider failure propagates and
+    /// closes the session, exactly like a rejected static credential.
+    fn resolveDeferredCredential(self: *QuicSessionRuntime) !void {
+        if (self.session.local_hello_sent) return;
+        const provider = self.session.options.credential_provider orelse return;
+        if (!self.session.peer_hello_received) return;
+
+        var provided = try provider.provide(self.allocator, .{
+            .peer_id = self.session.peerId(),
+            .challenge = self.session.peer_hello_challenge,
+        });
+        defer provided.deinit(self.allocator);
+
+        // The provider's slices die with this call; the session owns
+        // its copies for its lifetime.
+        const credential = try self.allocator.dupe(u8, provided.credential);
+        errdefer self.allocator.free(credential);
+        const key_id_hint: ?[]u8 = if (provided.key_id_hint) |hint|
+            try self.allocator.dupe(u8, hint)
+        else
+            null;
+        errdefer if (key_id_hint) |hint| self.allocator.free(hint);
+
+        self.session.options.auth = .{
+            .scheme = provided.scheme,
+            .credential = credential,
+            .key_id_hint = key_id_hint,
+            .challenge = self.session.options.auth.challenge,
+        };
+        self.session.owned_auth_credential = credential;
+        self.session.owned_auth_key_id_hint = key_id_hint;
+
+        try self.queueLocalHello();
     }
 
     fn queueLocalHello(self: *QuicSessionRuntime) !void {

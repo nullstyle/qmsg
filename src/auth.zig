@@ -486,6 +486,27 @@ pub const HelloChallengeState = struct {
         return mint(allocator, random, context, default_hello_challenge_bytes, options);
     }
 
+    /// Build a state around challenge bytes the caller has already
+    /// filled -- for seams that draw randomness from `std.Io` instead
+    /// of a `std.Random`. Takes ownership of `owned_challenge`.
+    pub fn fromOwnedChallenge(
+        context: HelloAuthContext,
+        owned_challenge: []u8,
+        options: HelloChallengeOptions,
+    ) HelloBindingError!HelloChallengeState {
+        try validateHelloChallenge(owned_challenge, .{
+            .required = true,
+            .max_bytes = options.max_bytes,
+        });
+        var bound_context = context;
+        bound_context.challenge = owned_challenge;
+        return .{
+            .context = bound_context,
+            .challenge_bytes = owned_challenge,
+            .max_challenge_bytes = options.max_bytes,
+        };
+    }
+
     pub fn deinit(self: *HelloChallengeState, allocator: std.mem.Allocator) void {
         self.discard(allocator);
     }
@@ -655,6 +676,49 @@ pub const Authenticator = struct {
         credential: Credential,
     ) !Authorization {
         return try self.authenticate_fn(self.ptr, allocator, credential);
+    }
+};
+
+/// What a CredentialProvider learns from the peer's HELLO: everything
+/// needed to mint a credential bound to THIS session (channel
+/// binding). `challenge` is the peer's advertised HELLO challenge,
+/// empty when it sent none.
+pub const PeerHelloContext = struct {
+    peer_id: []const u8 = "",
+    challenge: []const u8 = &.{},
+};
+
+/// A credential minted by a CredentialProvider for one session.
+/// `scheme` is a static name (not freed); `credential` and
+/// `key_id_hint` are allocated with the allocator passed to the
+/// provider and freed by `deinit`.
+pub const ProvidedCredential = struct {
+    scheme: []const u8 = hello_auth_scheme_paseto,
+    credential: []const u8,
+    key_id_hint: ?[]const u8 = null,
+
+    pub fn deinit(self: *ProvidedCredential, allocator: std.mem.Allocator) void {
+        if (self.key_id_hint) |hint| allocator.free(hint);
+        allocator.free(self.credential);
+        self.* = undefined;
+    }
+};
+
+/// Supplies the HELLO credential for a dial whose token must be bound
+/// to the peer's per-connection challenge: the transport defers the
+/// local HELLO until the peer's arrives, then asks the provider. The
+/// fn-pointer shape mirrors Authenticator so embedders can construct
+/// one from any context.
+pub const CredentialProvider = struct {
+    ptr: ?*anyopaque = null,
+    provide_fn: *const fn (?*anyopaque, std.mem.Allocator, PeerHelloContext) anyerror!ProvidedCredential,
+
+    pub fn provide(
+        self: CredentialProvider,
+        allocator: std.mem.Allocator,
+        context: PeerHelloContext,
+    ) !ProvidedCredential {
+        return try self.provide_fn(self.ptr, allocator, context);
     }
 };
 
@@ -1317,6 +1381,32 @@ test "HELLO challenge state mints owns and installs binding config" {
     try std.testing.expectEqualStrings("listener-a", context.listener_id);
     try std.testing.expect(helloChallengeMatches(state.challenge(), context.challenge));
     try config.hello_binding.validate();
+}
+
+test "HELLO challenge state fromOwnedChallenge takes caller-filled bytes" {
+    const allocator = std.testing.allocator;
+
+    const bytes = try allocator.alloc(u8, 4);
+    @memcpy(bytes, &[_]u8{ 1, 2, 3, 4 });
+    var state = try HelloChallengeState.fromOwnedChallenge(.{
+        .listener_id = "listener-a",
+    }, bytes, .{});
+    defer state.deinit(allocator);
+
+    try std.testing.expect(state.isActive());
+    try std.testing.expectEqualSlices(u8, bytes, state.challenge());
+    try std.testing.expectEqual(state.challenge().ptr, state.context.challenge.ptr);
+
+    const policy = try state.bindingPolicy();
+    try std.testing.expect(policy.require_challenge);
+    try std.testing.expect(helloChallengeMatches(bytes, policy.context.?.challenge));
+    try std.testing.expectEqualStrings("listener-a", policy.context.?.listener_id);
+
+    // Empty bytes are not a challenge, whatever filled them.
+    try std.testing.expectError(
+        error.ChallengeRequired,
+        HelloChallengeState.fromOwnedChallenge(.{}, &.{}, .{}),
+    );
 }
 
 test "HELLO challenge state consume and discard fail closed" {

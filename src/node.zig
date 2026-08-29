@@ -3,6 +3,7 @@ const message = @import("message.zig");
 const queue = @import("queue.zig");
 const socket = @import("socket.zig");
 const session = @import("session.zig");
+const auth = @import("auth.zig");
 const transport = @import("transport/root.zig");
 const protocol = @import("protocol/root.zig");
 
@@ -1819,14 +1820,54 @@ pub const Node = struct {
 
     pub fn driverServerSessionCreate(
         self: *Node,
-        options: transport.quic.QuicOptions,
+        options_in: transport.quic.QuicOptions,
     ) !DriverSession {
+        var options = options_in;
+        var minted: ?auth.HelloChallengeBinding = null;
+        errdefer if (minted) |*binding| binding.deinit(self.allocator);
+
+        // Channel binding: a listener armed with a challenge template
+        // mints a fresh challenge for every accepted session so a
+        // credential presented here verifies only against THIS
+        // connection's implicit assertion. The session owns the
+        // binding (and its bytes) for its lifetime.
+        if (options.hello_challenge) |template| {
+            minted = try self.mintHelloChallengeBinding(template, options.auth_config);
+            options.auth_config = try minted.?.authConfig();
+            options.auth.challenge = minted.?.challenge();
+        }
+
         const runtime = try self.createQuicSession(.server, options, null);
         errdefer self.destroyQuicSession(runtime);
+        if (minted) |binding| {
+            runtime.runtime.session.hello_challenge_binding = binding;
+            minted = null;
+        }
         runtime.driver_owned = true;
         runtime.transport_ready = true;
         try runtime.runtime.onQuicReady();
         return runtime;
+    }
+
+    /// Mint a per-connection HELLO challenge from a listener
+    /// template. Bytes come from the node's io (like the
+    /// stateless-reset key), so no `std.Random` is needed at this
+    /// seam; the binding takes ownership.
+    fn mintHelloChallengeBinding(
+        self: *Node,
+        template: auth.HelloChallengeConfig,
+        base_config: auth.AuthConfig,
+    ) !auth.HelloChallengeBinding {
+        try template.validate();
+        const bytes = try self.allocator.alloc(u8, template.bytes);
+        errdefer self.allocator.free(bytes);
+        self.options.io.random(bytes);
+        const state = try auth.HelloChallengeState.fromOwnedChallenge(
+            template.context,
+            bytes,
+            .{ .required = true, .max_bytes = template.max_bytes },
+        );
+        return auth.HelloChallengeBinding.init(state, base_config);
     }
 
     pub fn driverServerSessionDestroy(self: *Node, sess: DriverSession) void {
@@ -4925,6 +4966,215 @@ test "live UDP: keyed reborn listener resets an orphan under load, fast" {
 fn soleQuicSessionId(n: *const Node) ?QuicSessionId {
     if (n.quic_sessions.items.len != 1) return null;
     return n.quic_sessions.items[0].id();
+}
+
+// Channel-binding dial side: signs a fresh PASETO per session, bound
+// to the challenge the listener advertised in its HELLO. Records what
+// it saw and minted so tests can assert freshness and replay tokens.
+const BoundDialProvider = struct {
+    const auth_paseto = @import("auth_paseto.zig");
+
+    key: auth_paseto.V4Public,
+    kid: []const u8,
+    claims: []const u8,
+    seen_challenges: std.ArrayListUnmanaged([]const u8) = .empty,
+    minted_tokens: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    fn deinit(self: *BoundDialProvider, allocator: std.mem.Allocator) void {
+        for (self.seen_challenges.items) |challenge| allocator.free(challenge);
+        self.seen_challenges.deinit(allocator);
+        for (self.minted_tokens.items) |token| allocator.free(token);
+        self.minted_tokens.deinit(allocator);
+    }
+
+    fn provider(self: *BoundDialProvider) auth.CredentialProvider {
+        return .{ .ptr = self, .provide_fn = provide };
+    }
+
+    fn provide(
+        ptr: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        context: auth.PeerHelloContext,
+    ) anyerror!auth.ProvidedCredential {
+        const self: *BoundDialProvider = @ptrCast(@alignCast(ptr.?));
+        // The returned credential is freed by the runtime that asked
+        // for it, so both records take their own copies.
+        try self.seen_challenges.append(allocator, try allocator.dupe(u8, context.challenge));
+
+        const assertion = try auth.allocHelloImplicitAssertion(allocator, .{
+            .challenge = context.challenge,
+        });
+        defer allocator.free(assertion);
+        const token = try self.key.sign(allocator, self.claims, .{
+            .implicit_assertion = assertion,
+        });
+        errdefer allocator.free(token);
+        try self.minted_tokens.append(allocator, try allocator.dupe(u8, token));
+
+        return .{
+            .credential = token,
+            .key_id_hint = try allocator.dupe(u8, self.kid),
+        };
+    }
+};
+
+// The channel-binding acceptance test: a listener armed with the
+// challenge template mints a fresh challenge per accepted session, a
+// provider-credentialed dial binds its token to the advertised
+// challenge and authenticates, the next dial earns a DIFFERENT
+// challenge, and the first dial's captured token replayed
+// statically never authenticates -- the whole point of the binding.
+test "live UDP: per-connection HELLO challenge binds credentials and kills replays" {
+    const allocator = std.testing.allocator;
+    const auth_paseto = @import("auth_paseto.zig");
+    const control = @import("control.zig");
+
+    const key = try auth_paseto.V4Public.fromSeed(&@as([32]u8, @splat(15)));
+    const key_id = try auth_paseto.v4PublicKeyId(key);
+    const kid = try key_id.toString(allocator);
+    defer allocator.free(kid);
+
+    const entries = [_]auth_paseto.PublicKeyEntry{.{ .key_id = key_id, .key = key }};
+    const store = auth_paseto.StaticKeyStore{ .v4_public_keys = &entries };
+    var authenticator = auth_paseto.V4PublicAuthenticator{
+        .keys = store.keyStore(),
+        .options = .{ .verify = .{ .require_footer_key_id = false } },
+    };
+
+    var dialer = BoundDialProvider{
+        .key = key,
+        .kid = kid,
+        .claims =
+        \\{"sub":"bound-client","iss":"node-test","qmsg":{"patterns":["req","rep"]}}
+        ,
+    };
+    defer dialer.deinit(allocator);
+
+    const server_opts: transport.quic.QuicOptions = .{
+        .peer_id = "bound-server",
+        .role_flags = control.RoleFlags.server,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+        .auth_config = .{
+            .required = true,
+            .authenticator = authenticator.authenticator(),
+        },
+        .hello_challenge = .{},
+    };
+    const client_opts: transport.quic.QuicOptions = .{
+        .peer_id = "bound-client",
+        .role_flags = control.RoleFlags.client,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+        .credential_provider = dialer.provider(),
+    };
+
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+
+    const listener_id = n.listenQuic("127.0.0.1:0", .{
+        .tls_cert_pem = dispatch_test_cert_pem,
+        .tls_key_pem = dispatch_test_key_pem,
+        .transport = server_opts,
+    }) catch |err| switch (err) {
+        // Environments that deny UDP binds skip this test rather
+        // than fail it.
+        error.AccessDenied,
+        error.AddressInUse,
+        error.AddressUnavailable,
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => return error.SkipZigTest,
+        else => return err,
+    };
+    const listener = n.quic_listeners.items[listener_id];
+    const target = try localhostEndpoint(allocator, listener.localAddress());
+    defer allocator.free(target);
+
+    // Dial 1: the deferred-HELLO exchange -- server advertises its
+    // challenge, the provider mints against it, the session lands.
+    const first_id = try n.dialQuic(target, .{
+        .server_name = "localhost",
+        // The fixture cert is a self-signed CA with a localhost SAN,
+        // so it verifies against itself.
+        .ca_pem = dispatch_test_cert_pem,
+        .transport = client_opts,
+    });
+    const first = n.quicSession(first_id) orelse return error.EndpointNotFound;
+
+    var now_us: u64 = 1_000;
+    var step: u32 = 0;
+    while (step < 20_000) : (step += 1) {
+        now_us += 1_000;
+        try n.tick(now_us);
+        if (first.state() == .ready and liveServerSessionReady(&n, first_id)) break;
+    }
+    try std.testing.expectEqual(transport.quic.State.ready, first.state());
+    try std.testing.expectEqual(@as(usize, 1), dialer.seen_challenges.items.len);
+    const first_challenge = dialer.seen_challenges.items[0];
+    try std.testing.expectEqual(auth.default_hello_challenge_bytes, first_challenge.len);
+
+    // The challenge the provider bound to is THIS session's mint, not
+    // a static listener value.
+    var server_challenge: ?[]const u8 = null;
+    for (n.quic_sessions.items) |runtime| {
+        if (runtime.id() == first_id) continue;
+        if (runtime.state() != .ready) continue;
+        const binding = runtime.runtime.session.hello_challenge_binding orelse continue;
+        server_challenge = binding.challenge();
+        break;
+    }
+    try std.testing.expectEqualSlices(
+        u8,
+        first_challenge,
+        server_challenge orelse return error.ServerSessionMissing,
+    );
+
+    // Dial 2: a fresh dial earns a FRESH challenge -- dial 1's token
+    // could not verify here.
+    const second_id = try n.dialQuic(target, .{
+        .server_name = "localhost",
+        .ca_pem = dispatch_test_cert_pem,
+        .transport = client_opts,
+    });
+    const second = n.quicSession(second_id) orelse return error.EndpointNotFound;
+    step = 0;
+    while (step < 20_000) : (step += 1) {
+        now_us += 1_000;
+        try n.tick(now_us);
+        if (second.state() == .ready) break;
+    }
+    try std.testing.expectEqual(transport.quic.State.ready, second.state());
+    try std.testing.expectEqual(@as(usize, 2), dialer.seen_challenges.items.len);
+    try std.testing.expect(!std.mem.eql(u8, first_challenge, dialer.seen_challenges.items[1]));
+
+    // Dial 3, the replay: dial 1's captured token presented
+    // statically. The listener mints a new challenge, the signature
+    // no longer matches, and the session never authenticates.
+    const replay_id = try n.dialQuic(target, .{
+        .server_name = "localhost",
+        .ca_pem = dispatch_test_cert_pem,
+        .transport = .{
+            .peer_id = "replay-client",
+            .role_flags = control.RoleFlags.client,
+            .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+            .auth = .{
+                .scheme = auth.hello_auth_scheme_paseto,
+                .credential = dialer.minted_tokens.items[0],
+                .key_id_hint = kid,
+            },
+        },
+    });
+    step = 0;
+    while (step < 20_000) : (step += 1) {
+        now_us += 1_000;
+        try n.tick(now_us);
+        // A rejected session is destroyed by the node -- re-fetch per
+        // step; the session vanishing IS the rejection signal.
+        const replay_session = n.quicSession(replay_id) orelse break;
+        if (replay_session.state() == .ready) break;
+    }
+    const replay_final = n.quicSession(replay_id);
+    try std.testing.expect(replay_final == null or replay_final.?.state() != .ready);
 }
 
 fn localhostEndpoint(allocator: std.mem.Allocator, address: std.Io.net.IpAddress) ![]u8 {
