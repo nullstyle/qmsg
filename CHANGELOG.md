@@ -7,8 +7,29 @@ changes.
 
 ## [0.2.1] - 2026-08-28
 
-Documentation from the v0.2.0 adoption review (mruby-quic; all
-contracts green their side, zero workarounds outstanding).
+Fixes the published-tarball auth-path breakage (found by the
+mruby-quic consumer, reproduced cold on our side), plus the v0.2.0
+adoption-review documentation.
+
+### Fixed
+
+- **The v0.1.9 and v0.2.0 tarballs do not compile their auth path
+  against their own paseto pin.** paseto 0.3.0 changed
+  `verifyToken` to take the token by reference; the v0.1.9 pin bump
+  (and everything tagged through v0.2.0) still passed it by value —
+  warm-cache suite runs from the checkout never surfaced it, and the
+  published artifact failed with
+  `auth_paseto.zig:246: error: expected type '*const token.Token'`.
+  This release rides the repair (adapted call, paseto pinned to
+  0.4.0, `paseto-0.4.0-EBI95RcXCADs0jz3tebS1xMaAiT2r3Tpx8HsF5LfpqOS`)
+  and is itself verified the way the broken tags were not: cold
+  build + full suite from the packed archive (335/335). Treat
+  v0.1.9 and v0.2.0 tarballs as broken for auth; v0.1.8 is the last
+  sound earlier pin.
+- **Release process:** `tools/tarball-smoke.sh` is now the release
+  gate — `git archive` of the tag, cold caches, full build + tests.
+  A checkout-built CI cannot catch a tree that is internally
+  incoherent; the packed artifact can, and now does before tagging.
 
 ### Documentation
 
@@ -28,6 +49,12 @@ contracts green their side, zero workarounds outstanding).
 - **A publication racing a reborn subscriber's re-sync is a lost
   datagram by design** — noted so the first person it surprises has
   a doc to find.
+- **Auth claims from the consumer's mapping** (EMBEDDING.md): the
+  `qmsg` claim is fail-closed by default (missing claim rejected,
+  `patterns` required and non-empty — no unset-means-allow-all), with
+  a working example token; and the claim-vs-identifier pattern
+  spelling table (`"pub"`/`"sub"` in claims vs `.@"pub"`/`.sub` enum
+  tags vs `pub_`/`sub` PatternBits fields).
 
 ## [0.2.0] - 2026-08-28
 
