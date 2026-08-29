@@ -5,6 +5,30 @@ All notable changes to qmsg are documented in this file.
 The project is pre-1.0. Any 0.x release may include breaking API
 changes.
 
+## [0.2.1] - 2026-08-28
+
+Documentation from the v0.2.0 adoption review (mruby-quic; all
+contracts green their side, zero workarounds outstanding).
+
+### Documentation
+
+- **Pattern-bit gate is silent**: a session negotiated without
+  `pub_ | sub` (and `datagram_enabled`) carries no pub/sub —
+  handshake completes, requests flow, subscriptions never register,
+  no error or drop. Both operational notes now live in
+  EMBEDDING.md's pub/sub section and QUIC_PUBSUB.md's scope: both
+  ends announce the bits.
+- **Dial-side deliveries are inbox-only by design** — recorded as
+  the direct-consumption twin of dial-side replies through
+  `recvReliable` (embedded sessions get `quic_delivery` events;
+  dial sessions surface through `recvDatagram`). Consumers draining
+  dial inboxes by hand keep their drain; if qmsg ever emits
+  dial-side delivery events, first-wins makes deleting it a
+  one-liner downstream.
+- **A publication racing a reborn subscriber's re-sync is a lost
+  datagram by design** — noted so the first person it surprises has
+  a doc to find.
+
 ## [0.2.0] - 2026-08-28
 
 QUIC pub/sub across the process wall (swarm item 2, per the
