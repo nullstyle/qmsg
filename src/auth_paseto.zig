@@ -243,7 +243,7 @@ pub fn verifyV4Public(
 
     const claims = key.verifyToken(
         allocator,
-        token,
+        &token,
         credential.implicit_assertion,
     ) catch |err| return mapPasetoError(err);
     errdefer allocator.free(claims);
