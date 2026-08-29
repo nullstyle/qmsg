@@ -83,7 +83,7 @@ pub const QuicSessionRuntime = struct {
         role: quic.Role,
         options: quic.QuicOptions,
     ) !QuicSessionRuntime {
-        var stream_ids = quic_streams.StreamIdAllocator.init(streamRole(role));
+        var stream_ids = quic_streams.StreamIdAllocator.init(role);
         const hello_stream_id = try stream_ids.nextUni();
         std.debug.assert(hello_stream_id == quic.localControlStreamId(role));
 
@@ -615,13 +615,6 @@ pub fn mapDatagramError(err: anyerror) Error {
         => error.MalformedFrame,
         error.EndpointClosed => error.EndpointClosed,
         else => error.InvalidState,
-    };
-}
-
-fn streamRole(role: quic.Role) quic_streams.Role {
-    return switch (role) {
-        .client => .client,
-        .server => .server,
     };
 }
 

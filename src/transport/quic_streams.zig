@@ -1,5 +1,6 @@
 const std = @import("std");
 const quic_zig = @import("quic");
+const quic = @import("quic.zig");
 
 const control = @import("../control.zig");
 const envelope = @import("../envelope.zig");
@@ -7,10 +8,10 @@ const message = @import("../message.zig");
 
 pub const control_stream_type: u64 = 0x51;
 
-pub const Role = enum {
-    client,
-    server,
-};
+/// Aliases `quic.Role` — the stream-id helpers speak the same
+/// role vocabulary as the rest of the transport surface, so call
+/// sites never map between two identical enums.
+pub const Role = quic.Role;
 
 pub const StreamIdAllocator = struct {
     next_bidi: u64,

@@ -279,11 +279,7 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
                 // The peer's FIRST uni stream is the HELLO control
                 // stream (pre-armed by id on the runtime); every
                 // later uni stream carries follow-up control frames.
-                const role: quic_streams.Role = switch (rt.session.role) {
-                    .client => .client,
-                    .server => .server,
-                };
-                if (stream_id == quic_streams.peerControlStreamId(role)) return;
+                if (stream_id == quic_streams.peerControlStreamId(rt.session.role)) return;
 
                 // The stream may open before the session reaches
                 // ready (same flight as the HELLO tail); arm it once
