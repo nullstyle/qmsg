@@ -18,8 +18,8 @@
     },
     .dependencies = .{
         .paseto = .{
-            .url = "https://github.com/nullstyle/paseto-zig/archive/refs/tags/0.3.0.tar.gz",
-            .hash = "paseto-0.3.0-EBI95S2uBwBha2qo-qgtyvS3BJVrGAf7HDhlrsCmCrQL",
+            .url = "https://github.com/nullstyle/paseto-zig/archive/refs/tags/0.4.0.tar.gz",
+            .hash = "paseto-0.4.0-EBI95RcXCADs0jz3tebS1xMaAiT2r3Tpx8HsF5LfpqOS",
         },
         .quic = .{
             .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.19.0.tar.gz",
