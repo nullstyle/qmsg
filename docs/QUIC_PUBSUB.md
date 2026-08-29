@@ -68,6 +68,13 @@ fan-out set.
 
 ## Scope decisions
 
+- Both ends announce `pub_ | sub` and `datagram_enabled` in their
+  transport options; a session negotiated without the bits silently
+  carries no pub/sub (no error, no drop).
+- Dial-side deliveries are inbox-only (`recvDatagram`), mirroring
+  dial-side replies (`recvReliable`); `quic_delivery` events are the
+  embedded-session surface. A publication racing a reborn
+  subscriber's re-sync is a lost datagram by design.
 - Datagram-first; reliable-stream publication is future work.
 - Replay/update machinery stays unwired (live-only subscriptions).
 - No subscription-changed event; the registry stays invisible to

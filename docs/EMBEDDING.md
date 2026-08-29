@@ -239,6 +239,30 @@ the fan-out set whole on every death path. Full contract in
 [QUIC_PUBSUB.md](QUIC_PUBSUB.md); replay and reliable-stream
 publication are future work.
 
+Three operational notes, each learned the hard way downstream:
+
+- **Both ends must announce `pub_ | sub` (and
+  `datagram_enabled = true`) in their transport options.** A session
+  negotiated without the pattern bits silently carries no pub/sub:
+  the handshake completes, requests flow, and subscriptions simply
+  do not register — no error, no drop counter. Pattern announcement
+  is a contract, not a formality.
+- **Dial-side deliveries are inbox-only by design.** `quic_delivery`
+  events fire for embedded (event-delivery) sessions; datagrams
+  arriving on the node's OWN dial sessions land in the session's
+  `recvDatagram()` inbox and surface nowhere in `poll` — the
+  direct-consumption twin of dial-side replies surfacing through
+  `recvReliable()` rather than `quic_reply` events. Consumers
+  driving dials drain both inboxes themselves. (If qmsg ever emits
+  dial-side `quic_delivery` events, consumers draining by hand can
+  delete their drain — first-wins, one or the other.)
+- **A publication racing a reborn subscriber's re-sync loses, by
+  design.** After a redial heals the mesh, the subscriber's set
+  re-emits on its first ready tick; a publication sent before that
+  tick lands is a lost datagram — correct lossy pub/sub behavior,
+  but it will surprise someone. Settle the subscription before
+  publishing when certainty matters.
+
 **Dial sessions observe connection death.** A node-owned dial whose
 connection reaches QUIC's terminal closed state — a peer
 CONNECTION_CLOSE observed through the draining deadline, a stateless
