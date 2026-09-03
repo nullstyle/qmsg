@@ -5,6 +5,24 @@ All notable changes to qmsg are documented in this file.
 The project is pre-1.0. Any 0.x release may include breaking API
 changes.
 
+## [Unreleased]
+
+### Changed
+
+- The `quic` dependency is now configured with `.optimize` forwarded and
+  `.@"sanitize-c" = "trap"` (previously only `.target`). Two reasons,
+  one behavioral and one structural. Behaviorally, `trap` keeps C/UB
+  checks in BoringSSL's statically linked objects without needing a
+  UBSan runtime, which Linux/lld ReleaseSafe links otherwise fail to
+  resolve — the same rationale capnp-zig documents for its identical
+  quic pin. Structurally, the build system only deduplicates a shared
+  dependency module when every parent configures it with an identical
+  option set; aligning with capnp-zig's map is what lets one binary link
+  qmsg and capnp-zig against a single quic (see
+  `capnp-qmsg-demo/` in the workspace). The historical note that quic's
+  build rejects an `optimize` option applied to an older quic build;
+  v0.19.0 declares it.
+
 ## [0.3.0] - 2026-08-28
 
 Channel binding end to end: the QUIC adapter now wires the HELLO
