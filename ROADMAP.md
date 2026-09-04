@@ -20,7 +20,7 @@ phase.
 | 6 QUIC datagrams | Partial | HELLO carries datagram capability and qmsg has compact datagram envelope plus send/receive/error-mapping helpers. Node queues decoded datagrams and dispatches them through App handlers; live UDP datagram examples plus ack/loss reconciliation remain. |
 | 7 Push/pull | Partial | Inproc push/pull has fair selection, puller credit, queue policy handling, at-most-once semantics, transport-agnostic CREDIT helpers, and QUIC control-frame queue/apply state. Automatic live-session emission remains. |
 | 8 Survey/respondent and bus | Not started | No public API or state machines yet. |
-| 9 Typed codecs and ergonomics | Not started | Raw bytes remain first-class; typed helpers are future work. |
+| 9 Typed codecs and ergonomics | Partial | Raw bytes remain first-class. The first typed codec shipped in 0.4.0: an optional Cap'n Proto body codec behind `-Dcapnp=true` (lazy dependency, `qmsg-codec-capnp` module; the standard packed encoding, interoperable with any Cap'n Proto implementation). JSON/protobuf/msgpack helpers and `app.rpcTyped` remain future work. |
 | 10 PASETO/PASERK auth kit | Partial | `paseto-zig` 0.3.0 is wired, v4.public verification, PASERK id lookup, qmsg claim parsing, replay hook, key rotation example, HELLO implicit assertion binding, bounded HELLO challenge propagation, listener-side challenge config helpers, and audience/purpose policy exist. Per-connection challenge minting in the QUIC listener loop shipped in 0.3.0 (`QuicOptions.hello_challenge` template + dial-side `credential_provider`); replay cache wiring at the listener seam remains. |
 
 ## Phase 0: Decisions and Spikes
@@ -304,6 +304,14 @@ Exit criteria:
 - Tests cover footer/HELLO key-id tampering and wrong-key verification failure.
 
 ## Validation Strategy
+
+CI (`.github/workflows/ci.yml`) runs the unit+QUIC lane on Linux and macOS,
+the examples lane, and the optional capnp-codec lane on every push and PR,
+on the `mise.toml`-pinned toolchain. Known toolchain note: the private
+ziglang fork's in-flight builds (dev.2001+ as of 2026-09-03) regressed
+`@hasDecl` on struct decls, which `Node.runOnce`'s dispatcher probes use —
+four tests fail there deterministically and pass on the pinned dev.1786;
+that is a compiler regression to report to the fork, not a qmsg bug.
 
 Unit tests:
 
