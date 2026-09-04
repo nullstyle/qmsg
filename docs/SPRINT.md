@@ -45,10 +45,17 @@ Landed so far (additive, all green — currently 410/410):
 1. ~~Negotiation~~ **DONE**: see above. The effective value is computed
    lazily by `heartbeatInterval()` — no eager computation needed.
 2. ~~State~~ **DONE** (part of the sweep slice above).
-3. ~~Sweep~~ **DONE** at the runtime level; remaining: CALL SITES —
-   `Node.tickQuicClients` / `tickQuicListeners` (both have `now_us`,
-   pass the connection as transport); for embedded seats, record
-   `last_now_us` on `Node.tick` and sweep in `pumpEmbeddedQuic`.
+3. ~~Sweep~~ **DONE** including call sites: `tickQuicClients` sweeps
+   each dial session (connection wrapped in `QuicConnectionAdapter`);
+   listener sessions sweep via the owner clock — `Node.tickQuicListeners`
+   calls `ServerDispatch.setHeartbeatClock(now_us)`, `service` threads it
+   into the stateless `EmbeddedDispatch`, and `pumpSeat` runs
+   `tickHeartbeat` before the pump. Foreign embedders using
+   `EmbeddedDispatch` directly get the same public
+   `setHeartbeatClock`; zero (default) means no sweep — sessions live at
+   the embedder's pleasure. Remaining in S2: PONG reply/match at the two
+   control-frame application points, GOAWAY both directions, the
+   `.session_goaway` event, and the unknown-tag tolerance check.
 4. **Inbound PING → PONG**: intercept in the two control-frame
    application points BEFORE registry apply — the embedded path
    `pumpControlReads` (`src/transport/quic_embedded.zig`) and the

@@ -1917,6 +1917,9 @@ pub const Node = struct {
 
     fn tickQuicListeners(self: *Node, now_us: u64) !void {
         for (self.quic_listeners.items) |listener| {
+            // Listener/embedded sessions sweep on the same node clock;
+            // serviceSeat picks this up for every seat it pumps.
+            listener.dispatch.setHeartbeatClock(now_us);
             _ = try listener.listener.recvAndFeedOne(now_us);
             // Service BEFORE tick: quic-zig's ordering contract — the
             // stream GC inside tick must never reap a stream whose
@@ -1945,6 +1948,12 @@ pub const Node = struct {
             if (client.client.runtime.connection().isClosed()) continue;
             try self.ensureClientReady(client);
             try self.pumpClientSession(client);
+            // Liveness sweep: dial sessions heartbeat on the node clock.
+            // Errors are classified by the sweep itself (timeout begins
+            // closing); transport-level failures surface via the pump.
+            const hb_conn = client.client.runtime.connection();
+            var hb_adapter = transport.quic_streams.QuicConnectionAdapter.init(hb_conn);
+            _ = client.runtime.runtime.tickHeartbeat(now_us, &hb_adapter) catch {};
             while (try client.client.drainAndSendOne(now_us)) |_| {}
         }
         try self.reapDeadQuicClients();

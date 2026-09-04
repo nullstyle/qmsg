@@ -223,6 +223,10 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
         owner: *Owner,
         transport_options: quic.QuicOptions,
         delivery: Delivery,
+        /// Node clock for the liveness sweep. The owner's tick sets this
+        /// (`setHeartbeatClock`); zero means no sweep runs (fresh
+        /// dispatches heartbeat only once the owner starts ticking).
+        heartbeat_now_us: u64 = 0,
 
         /// The transport options carry the `auth_config` credentials
         /// verify against at HELLO (once, at session establishment —
@@ -440,9 +444,23 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
         /// runs one qmsg session pump against the seat adapter.
         /// Protocol errors close THIS connection instead of
         /// propagating out of the embedder's loop.
+        /// Record the owner's clock for `pumpSeat`'s liveness sweep.
+        /// Call from the owner's tick; embedders that never tick never
+        /// heartbeat (their sessions live at the embedder's pleasure).
+        pub fn setHeartbeatClock(self: *Self, now_us: u64) void {
+            self.heartbeat_now_us = now_us;
+        }
+
         fn pumpSeat(self: *Self, seat: *Seat, conn: *quic_zig.Connection) !void {
             const sess = seat.sess orelse return;
             const rt = Owner.driverSessionRuntime(sess);
+
+            // Liveness sweep on the owner-supplied clock, before the
+            // pump: a PING emitted here flushes in the same pass.
+            if (self.heartbeat_now_us != 0) {
+                var adapter: quic_streams.QuicConnectionAdapter = .{ .conn = conn };
+                _ = rt.tickHeartbeat(self.heartbeat_now_us, &adapter) catch {};
+            }
 
             if (rt.state() == .ready and seat.pending_accepts.items.len > 0) {
                 for (seat.pending_accepts.items) |stream_id| {

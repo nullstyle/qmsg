@@ -62,6 +62,8 @@ pub fn ServerDispatch(comptime Owner: type) type {
 
         app: App,
         driver: D,
+        /// Owner clock for the liveness sweep (see ).
+        heartbeat_now_us: u64 = 0,
 
         /// In place: `self` must already sit at its final address
         /// (the Driver stores `&self.app`).
@@ -118,8 +120,16 @@ pub fn ServerDispatch(comptime Owner: type) type {
                 const ds = self.driver.sessionOn(slot) orelse continue;
                 if (ds.app.seat == null) continue;
                 var dispatch = self.embedded();
+                dispatch.heartbeat_now_us = self.heartbeat_now_us;
                 try dispatch.serviceSeat(&ds.app.seat.?, slot.conn);
             }
+        }
+
+        /// Record the owner's clock for the per-seat liveness sweep in
+        /// `service`. Call from the owner's tick; zero (the default)
+        /// means no sweep runs.
+        pub fn setHeartbeatClock(self: *Self, now_us: u64) void {
+            self.heartbeat_now_us = now_us;
         }
 
         fn embedded(self: *Self) Embedded {
