@@ -19,6 +19,14 @@ pub const Tag = enum(u64) {
     subscribe = 3,
     unsubscribe = 4,
     credit = 5,
+    /// Liveness probe: sent on a follow-up control stream when a session
+    /// has been idle for the negotiated heartbeat interval. The peer MUST
+    /// answer with `pong` carrying the same token. Not yet emitted or
+    /// consumed by the runtime (the wire shape is landed ahead of the
+    /// session behavior; see docs/SPRINT.md).
+    ping = 6,
+    /// Liveness answer: echoes the `ping` token verbatim.
+    pong = 7,
 
     pub fn fromInt(value: u64) !Tag {
         return switch (value) {
@@ -27,6 +35,8 @@ pub const Tag = enum(u64) {
             3 => .subscribe,
             4 => .unsubscribe,
             5 => .credit,
+            6 => .ping,
+            7 => .pong,
             else => error.UnknownControlFrame,
         };
     }
@@ -155,6 +165,8 @@ pub const Frame = union(Tag) {
     subscribe: Subscription,
     unsubscribe: Unsubscribe,
     credit: Credit,
+    ping: Ping,
+    pong: Pong,
 
     pub fn deinit(self: *Frame) void {
         switch (self.*) {
@@ -163,9 +175,21 @@ pub const Frame = union(Tag) {
             .subscribe => |*subscribe| subscribe.deinit(),
             .unsubscribe => |*unsubscribe| unsubscribe.deinit(),
             .credit => |*credit| credit.deinit(),
+            .ping, .pong => {},
         }
         self.* = undefined;
     }
+};
+
+/// Liveness probe payload. `token` is an opaque correlation value chosen
+/// by the pinger (a timestamp works); the pong echoes it verbatim.
+pub const Ping = struct {
+    token: u64 = 0,
+};
+
+/// Liveness answer payload.
+pub const Pong = struct {
+    token: u64 = 0,
 };
 
 pub const Sink = struct {
@@ -221,6 +245,12 @@ pub fn encodedSize(frame: Frame, options: CodecOptions) !usize {
             size = try addSize(size, try varIntLen(credit.messages));
             size = try addSize(size, try varIntLen(credit.bytes));
         },
+        .ping => |ping| {
+            size = try addSize(size, try varIntLen(ping.token));
+        },
+        .pong => |pong| {
+            size = try addSize(size, try varIntLen(pong.token));
+        },
     }
 
     if (size > options.max_frame_size) return error.FrameTooLarge;
@@ -272,6 +302,12 @@ pub fn encode(allocator: std.mem.Allocator, frame: Frame, options: CodecOptions)
             try appendVarInt(allocator, &bytes, credit.messages);
             try appendVarInt(allocator, &bytes, credit.bytes);
         },
+        .ping => |ping| {
+            try appendVarInt(allocator, &bytes, ping.token);
+        },
+        .pong => |pong| {
+            try appendVarInt(allocator, &bytes, pong.token);
+        },
     }
 
     std.debug.assert(bytes.items.len == expected_size);
@@ -290,6 +326,8 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8, options: CodecOpt
         .subscribe => .{ .subscribe = try decodeSubscribe(allocator, &reader, options) },
         .unsubscribe => .{ .unsubscribe = try decodeUnsubscribe(allocator, &reader, options) },
         .credit => .{ .credit = try decodeCredit(allocator, &reader, options) },
+        .ping => .{ .ping = .{ .token = try reader.readVarInt() } },
+        .pong => .{ .pong = .{ .token = try reader.readVarInt() } },
     };
     errdefer frame.deinit();
 
@@ -395,6 +433,7 @@ fn decodeGoaway(allocator: std.mem.Allocator, reader: *Reader, options: CodecOpt
 
 fn validateFrame(frame: Frame, options: CodecOptions) !void {
     switch (frame) {
+        .ping, .pong => {},
         .hello => |hello| {
             if (hello.peer_id.len == 0 or hello.peer_id.len > options.max_peer_id_len) return error.PeerIdTooLarge;
             if (hello.auth.scheme.len > options.max_auth_scheme_len) return error.AuthSchemeTooLarge;
@@ -806,4 +845,25 @@ test "varint uses canonical QUIC-style lengths" {
     try appendVarInt(allocator, &bytes, 16_384);
 
     try std.testing.expectEqualSlices(u8, &.{ 0x3f, 0x40, 0x40, 0x7f, 0xff, 0x80, 0x00, 0x40, 0x00 }, bytes.items);
+}
+
+
+test "ping and pong control frames round-trip with their tokens" {
+    const allocator = std.testing.allocator;
+    const options = CodecOptions{};
+
+    for ([_]u64{ 0, 1, 0xdead_beef, (1 << 62) - 1 }) |token| {
+        const ping_bytes = try encode(allocator, .{ .ping = .{ .token = token } }, options);
+        defer allocator.free(ping_bytes);
+        var ping = try decode(allocator, ping_bytes, options);
+        defer ping.deinit();
+        try std.testing.expectEqual(Tag.ping, std.meta.activeTag(ping));
+        try std.testing.expectEqual(token, ping.ping.token);
+
+        const pong_bytes = try encode(allocator, .{ .pong = .{ .token = token } }, options);
+        defer allocator.free(pong_bytes);
+        var pong = try decode(allocator, pong_bytes, options);
+        defer pong.deinit();
+        try std.testing.expectEqual(token, pong.pong.token);
+    }
 }
