@@ -6,6 +6,7 @@ const control = @import("../control.zig");
 const envelope = @import("../envelope.zig");
 const message = @import("../message.zig");
 const session_mod = @import("../session.zig");
+const quic_session_runtime = @import("quic_session_runtime.zig");
 
 pub const alpn = "qmsg/1";
 pub const control_stream_type: u64 = 0x51;
@@ -517,6 +518,7 @@ pub const QuicSession = struct {
         self.peer_hello_received = true;
 
         self.session.peer_id = self.peer_id.?;
+        self.session.peer_heartbeat_interval_ms = hello.heartbeat_interval_ms;
         self.session.datagram_enabled = self.options.datagram_enabled and hello.datagram_enabled;
         self.session.max_message_size = @min(self.options.max_message_size, hello.max_message_size);
         auth_committed = true;
@@ -845,6 +847,82 @@ test "QUIC session reaches ready after QUIC and HELLO exchange" {
     try std.testing.expectEqualStrings("client-a", server.peerId());
     try std.testing.expect(client.session.datagram_enabled);
     try std.testing.expectEqual(@as(usize, 4096), client.session.max_message_size);
+}
+
+test "HELLO exchange captures the peer heartbeat interval for negotiation" {
+    const allocator = std.testing.allocator;
+
+    var client = try QuicSession.init(allocator, 1, .client, .{
+        .peer_id = "client-hb",
+        .role_flags = control.RoleFlags.client,
+        .heartbeat_interval_ms = 30_000,
+    });
+    defer client.deinit();
+    var server = try QuicSession.init(allocator, 2, .server, .{
+        .peer_id = "server-hb",
+        .role_flags = control.RoleFlags.server,
+        .heartbeat_interval_ms = 10_000,
+    });
+    defer server.deinit();
+
+    try client.onQuicReady();
+    try server.onQuicReady();
+
+    const client_hello = try client.encodeLocalHello();
+    defer allocator.free(client_hello);
+    const server_hello = try server.encodeLocalHello();
+    defer allocator.free(server_hello);
+
+    try server.acceptPeerControl(client_hello);
+    try client.acceptPeerControl(server_hello);
+
+    // Each side captured the PEER's advertised interval verbatim...
+    try std.testing.expectEqual(@as(u64, 10_000), client.session.peer_heartbeat_interval_ms);
+    try std.testing.expectEqual(@as(u64, 30_000), server.session.peer_heartbeat_interval_ms);
+
+    // ...and the effective session heartbeat (QuicSessionRuntime's
+    // computation over its own session) is the min when both offer one.
+    var rt_client = try quic_session_runtime.QuicSessionRuntime.init(allocator, 901, .client, .{
+        .peer_id = "rt-client",
+        .role_flags = control.RoleFlags.client,
+        .heartbeat_interval_ms = 30_000,
+    });
+    defer rt_client.deinit();
+    rt_client.session.session.peer_heartbeat_interval_ms = client.session.peer_heartbeat_interval_ms;
+    try std.testing.expectEqual(@as(u64, 10_000), rt_client.heartbeatInterval());
+
+    // Opt-out is symmetric: either side advertising 0 means no heartbeat.
+    var quiet = try QuicSession.init(allocator, 3, .client, .{
+        .peer_id = "quiet",
+        .role_flags = control.RoleFlags.client,
+        .heartbeat_interval_ms = 5_000,
+    });
+    defer quiet.deinit();
+    var silent_server = try QuicSession.init(allocator, 4, .server, .{
+        .peer_id = "silent",
+        .role_flags = control.RoleFlags.server,
+        // heartbeat_interval_ms defaults to 0: no liveness offered.
+    });
+    defer silent_server.deinit();
+
+    try quiet.onQuicReady();
+    try silent_server.onQuicReady();
+    const quiet_hello = try quiet.encodeLocalHello();
+    defer allocator.free(quiet_hello);
+    const silent_hello = try silent_server.encodeLocalHello();
+    defer allocator.free(silent_hello);
+    try silent_server.acceptPeerControl(quiet_hello);
+    try quiet.acceptPeerControl(silent_hello);
+
+    try std.testing.expectEqual(@as(u64, 5_000), silent_server.session.peer_heartbeat_interval_ms);
+    var rt_quiet = try quic_session_runtime.QuicSessionRuntime.init(allocator, 902, .client, .{
+        .peer_id = "rt-quiet",
+        .role_flags = control.RoleFlags.client,
+        .heartbeat_interval_ms = 5_000,
+    });
+    defer rt_quiet.deinit();
+    rt_quiet.session.session.peer_heartbeat_interval_ms = 0; // peer opted out
+    try std.testing.expectEqual(@as(u64, 0), rt_quiet.heartbeatInterval());
 }
 
 test "QUIC session rejects control bytes before QUIC readiness" {

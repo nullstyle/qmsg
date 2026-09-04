@@ -19,18 +19,21 @@ recorded here; progress tracked per item.
 
 ## S2 — Liveness and graceful shutdown: IN PROGRESS
 
-Landed so far (additive, 344/344 green): `PING` (tag 6) / `PONG` (tag 7)
-control-frame codec — token round-trip tested, validation arms added,
-`Tag.fromInt` mapped. Not yet emitted or consumed by any runtime.
+Landed so far (additive, all green — currently 410/410):
+
+- `PING` (tag 6) / `PONG` (tag 7) control-frame codec — token round-trip
+  tested, validation arms added, `Tag.fromInt` mapped. Not yet emitted or
+  consumed by any runtime.
+- **Negotiation slice**: `acceptHello` captures the peer's
+  `HELLO.heartbeat_interval_ms` onto `Session.peer_heartbeat_interval_ms`;
+  `QuicSessionRuntime.heartbeatInterval()` computes the effective
+  `min(local, peer)`, zero when either side opts out. Tested end-to-end
+  through a real HELLO exchange plus the opt-out arm.
 
 ### Remaining wiring (design settled; anchors verified 2026-09-04)
 
-1. **Negotiation**: heartbeat interval = `min(local, peer)` of the two
-   HELLOs' `heartbeat_interval_ms` fields, zero if either is zero
-   (none negotiated). Hook: `QuicSession.acceptHello`
-   (`src/transport/quic.zig`, `session.peer_hello_received` flip) — store
-   the peer's interval on `session.Session`, compute the effective value
-   in `QuicSessionRuntime` when the session turns ready.
+1. ~~Negotiation~~ **DONE**: see above. The effective value is computed
+   lazily by `heartbeatInterval()` — no eager computation needed.
 2. **State**: on `QuicSessionRuntime` —
    `last_activity_us: u64`, `outstanding_ping: ?struct { token: u64,
    deadline_us: u64 }`. Update `last_activity_us` in `pump()` whenever

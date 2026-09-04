@@ -145,6 +145,17 @@ pub const QuicSessionRuntime = struct {
         if (self.isClosingOrClosed()) return error.EndpointClosed;
     }
 
+    /// Effective liveness interval for this session: `min(local, peer)`
+    /// when BOTH sides advertised a nonzero `HELLO.heartbeat_interval_ms`,
+    /// else 0 (no heartbeat). Called from the sweep sites once per tick;
+    /// cheap and pure once the peer HELLO has landed.
+    pub fn heartbeatInterval(self: *const QuicSessionRuntime) u64 {
+        const local = self.session.options.heartbeat_interval_ms;
+        const peer = self.session.session.peer_heartbeat_interval_ms;
+        if (local == 0 or peer == 0) return 0;
+        return @min(local, peer);
+    }
+
     pub fn beginClosing(self: *QuicSessionRuntime) void {
         if (!self.isClosed()) self.session.state_value = .closing;
     }

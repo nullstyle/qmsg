@@ -21,6 +21,11 @@ pub const Session = struct {
     authorization: ?auth.Authorization = null,
     datagram_enabled: bool = false,
     max_message_size: usize = 1024 * 1024,
+    /// Peer's advertised `HELLO.heartbeat_interval_ms` (0 = not offered).
+    /// The effective session heartbeat is `min(local, peer)` when BOTH
+    /// sides offer a nonzero interval — see
+    /// `QuicSessionRuntime.heartbeatInterval`.
+    peer_heartbeat_interval_ms: u64 = 0,
     user_data: ?*anyopaque = null,
 
     pub fn isAuthenticated(self: Session) bool {
