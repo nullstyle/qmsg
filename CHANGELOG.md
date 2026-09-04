@@ -7,6 +7,8 @@ changes.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-03
+
 ### Added
 
 - **Optional Cap'n Proto body codec** (`-Dcapnp=true`, module
