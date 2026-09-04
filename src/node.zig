@@ -2387,7 +2387,7 @@ test "Node runOnce dispatches queued QUIC datagram and queues publication datagr
             }
         };
 
-        fn dispatchQuicDatagram(self: *@This(), msg: message.Message, sess: *session.Session) !Result {
+        pub fn dispatchQuicDatagram(self: *@This(), msg: message.Message, sess: *session.Session) !Result {
             var owned = msg;
             defer owned.deinit();
 
@@ -2436,7 +2436,7 @@ test "Node runOnce dispatches one inproc rep request through dispatcher" {
     _ = try req.sendRequest(.{ .subject = "user.get", .body = "42" });
 
     const Dispatcher = struct {
-        fn dispatchInprocRep(_: *@This(), endpoint: *InprocRepEndpoint) !bool {
+        pub fn dispatchInprocRep(_: *@This(), endpoint: *InprocRepEndpoint) !bool {
             var request = (try endpoint.socket.tryRecv()) orelse return false;
             defer request.deinit();
 
@@ -3177,7 +3177,7 @@ test "Node runOnce leaves replies on own request streams undispatched" {
             }
         };
 
-        fn dispatchQuicReliable(
+        pub fn dispatchQuicReliable(
             self: *@This(),
             kind: socket.Pattern,
             incoming: message.Message,
@@ -4087,7 +4087,7 @@ const LiveUdpDispatcher = struct {
         }
     };
 
-    fn dispatchQuicReliable(
+    pub fn dispatchQuicReliable(
         self: *@This(),
         kind: socket.Pattern,
         incoming: message.Message,
@@ -4139,7 +4139,7 @@ const LivePhaseBDispatcher = struct {
         }
     };
 
-    fn dispatchQuicReliable(
+    pub fn dispatchQuicReliable(
         self: *@This(),
         kind: socket.Pattern,
         incoming: message.Message,
