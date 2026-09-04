@@ -49,6 +49,40 @@ pub fn build(b: *std.Build) void {
     qmsg_mod.addImport("paseto", paseto_mod);
     qmsg_mod.addImport("quic", quic_mod);
 
+    // Optional Cap'n Proto body codec (`zig build -Dcapnp=true`). The
+    // dependency is declared LAZY in build.zig.zon, so default builds —
+    // and consumers that never opt in — neither fetch nor compile
+    // capnp-zig. Registering the public modules BEFORE resolving the lazy
+    // dependency mirrors capnp-zig's own opt-in-QUIC pattern: when qmsg is
+    // itself a child dependency, Zig retries the child build after the
+    // fetch and needs the partial module set to already exist.
+    const enable_capnp = b.option(
+        bool,
+        "capnp",
+        "Enable the optional capnp body codec module (fetches capnp-zig)",
+    ) orelse false;
+    if (enable_capnp) {
+        const capnp_dep = b.dependency("capnp", .{
+            .target = target,
+        });
+        // The DEFAULT capnp-zig root (no options): a binary linking
+        // capnp-zig directly alongside this codec must resolve the same
+        // module or the build duplicates shared source files.
+        const capnp_mod = capnp_dep.module("capnpc-zig");
+
+        const codec_mod = b.addModule("qmsg-codec-capnp", .{
+            .root_source_file = b.path("src/codec_capnp.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        codec_mod.addImport("capnpc-zig", capnp_mod);
+
+        const codec_tests = b.addTest(.{ .root_module = codec_mod });
+        const run_codec_tests = b.addRunArtifact(codec_tests);
+        const codec_test_step = b.step("capnp-test", "Run the optional capnp body codec tests");
+        codec_test_step.dependOn(&run_codec_tests.step);
+    }
+
     const lib = b.addLibrary(.{
         .name = "qmsg",
         .root_module = qmsg_mod,

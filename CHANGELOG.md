@@ -7,6 +7,17 @@ changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Optional Cap'n Proto body codec** (`-Dcapnp=true`, module
+  `qmsg-codec-capnp`, `src/codec_capnp.zig`): the phase-9 typed-codec
+  slot's first resident. `encode` packs a capnp `MessageBuilder` into a
+  qmsg body, `decode` parses one back with bounded validation — the
+  standard packed encoding, interoperable with any Cap'n Proto
+  implementation. The capnp-zig dependency is LAZY: default builds and
+  non-opting consumers never fetch it. Run its tests with
+  `zig build -Dcapnp=true capnp-test`.
+
 ### Changed
 
 - The `quic` dependency is now configured with `.optimize` forwarded and

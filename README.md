@@ -322,6 +322,43 @@ while the rest of core keeps auth interfaces transport-independent.
 See [examples/auth_paseto.zig](examples/auth_paseto.zig) for the current
 PASERK key-rotation and v4.public verification shape.
 
+## Optional Cap'n Proto Body Codec
+
+Message bodies are raw bytes by design; the typed-codec slot (ROADMAP
+phase 9) has a Cap'n Proto implementation behind an opt-in build flag.
+It adds a LAZY dependency on
+[capnp-zig](https://github.com/nullstyle/capnp-zig) — builds without the
+flag never compile or link it into qmsg's module graph (note: on current
+0.17-dev toolchains, dependency resolution still downloads and
+hash-validates every manifest entry, lazy or not):
+
+```sh
+zig build -Dcapnp=true capnp-test
+```
+
+Consumers opt in by passing `-Dcapnp=true` when depending on qmsg and
+importing the extra module:
+
+```zig
+const qmsg = @import("qmsg");
+const capnp_codec = @import("qmsg-codec-capnp");
+
+// Encode a capnp MessageBuilder as a message body:
+const body = try capnp_codec.encode(allocator, &builder);
+
+// Decode a received body (zero-copy reads; malformed input is an error,
+// never a crash):
+var msg = try capnp_codec.decode(allocator, received.body);
+defer msg.deinit();
+```
+
+The codec uses the standard packed encoding, so bodies interoperate with
+any Cap'n Proto implementation. One constraint: the codec resolves the
+`capnpc-zig` module at its default root — a binary linking capnp-zig
+directly alongside this codec must resolve the same module (same
+version, default root, no extra options) or the build duplicates
+capnp-zig's shared source files.
+
 ## Development
 
 Run the unit tests:

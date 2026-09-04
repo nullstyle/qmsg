@@ -25,5 +25,14 @@
             .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.19.0.tar.gz",
             .hash = "quic-0.19.0-DnSYvfDZMADCQvF3_9ZQ75Kwdz3nJ4CBLSwxWizuCsLI",
         },
+        // Optional Cap'n Proto body codec dependency (`-Dcapnp=true`).
+        // LAZY: default builds and non-opting consumers never fetch or
+        // compile capnp-zig. Same tarball hash the release validation
+        // recorded (github.com/nullstyle/capnp-zig/releases/tag/v0.17.0).
+        .capnp = .{
+            .url = "https://github.com/nullstyle/capnp-zig/archive/refs/tags/v0.17.0.tar.gz",
+            .hash = "capnpc_zig-0.17.0-nUduFZYwNwDznNpR3qy-IV_-gehdwsAEFNJtMHTYxVJx",
+            .lazy = true,
+        },
     },
 }
