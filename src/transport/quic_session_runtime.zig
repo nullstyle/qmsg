@@ -71,6 +71,14 @@ pub const QuicSessionRuntime = struct {
     stream_ids: quic_streams.StreamIdAllocator,
     control_sender: ?quic_streams.ControlStreamSender = null,
     control_flush_sender: ?quic_control.FlushSender = null,
+    /// One-shot liveness probe stream (PING). Pumped like the other
+    /// control senders; nulled on completion.
+    ping_sender: ?quic_streams.ControlStreamSender = null,
+    /// Wall clock of the most recent `tickHeartbeat` call; inbound
+    /// progress during `pump` stamps activity with it.
+    heartbeat_now_us: u64 = 0,
+    last_activity_us: u64 = 0,
+    outstanding_ping: ?OutstandingPing = null,
     control_receiver: ?quic_streams.ControlStreamReceiver = null,
     reliable_senders: std.AutoHashMap(u64, quic_streams.ReliableMessageSender),
     reliable_receivers: std.AutoHashMap(u64, quic_streams.ReliableMessageReceiver),
@@ -100,6 +108,7 @@ pub const QuicSessionRuntime = struct {
     pub fn deinit(self: *QuicSessionRuntime) void {
         if (self.control_sender) |*sender| sender.deinit();
         if (self.control_flush_sender) |*sender| sender.deinit();
+        if (self.ping_sender) |*sender| sender.deinit();
         if (self.control_receiver) |*receiver| receiver.deinit();
 
         var senders = self.reliable_senders.valueIterator();
@@ -144,6 +153,77 @@ pub const QuicSessionRuntime = struct {
     pub fn ensureOpen(self: QuicSessionRuntime) Error!void {
         if (self.isClosingOrClosed()) return error.EndpointClosed;
     }
+
+    pub const OutstandingPing = struct {
+        token: u64,
+        deadline_us: u64,
+    };
+
+    /// One heartbeat sweep. `.none` when no interval is negotiated or the
+    /// session is not ready; `.ping_sent` when idle past the interval
+    /// emits a PING on a one-shot uni control stream; `.timed_out` when an
+    /// outstanding probe is past its deadline (2x interval, 1s floor),
+    /// which begins closing the session.
+    pub fn tickHeartbeat(self: *QuicSessionRuntime, now_us: u64, transport: anytype) !HeartbeatOutcome {
+        self.heartbeat_now_us = now_us;
+        if (self.ping_sender) |*sender| {
+            if (try sender.pump(transport) == .complete) {
+                sender.deinit();
+                self.ping_sender = null;
+            }
+        }
+        if (self.state() != .ready) return .none;
+        const interval_us = self.heartbeatInterval() * std.time.us_per_ms;
+        if (interval_us == 0) return .none;
+        if (self.last_activity_us == 0) self.last_activity_us = now_us;
+
+        if (self.outstanding_ping) |probe| {
+            if (now_us >= probe.deadline_us) {
+                self.outstanding_ping = null;
+                self.beginClosing();
+                return .timed_out;
+            }
+            return .none;
+        }
+
+        if (now_us -| self.last_activity_us >= interval_us) {
+            const stream_id = try self.stream_ids.nextUni();
+            const frames = [_]control.Frame{.{ .ping = .{ .token = now_us } }};
+            var sender = try quic_streams.ControlStreamSender.init(
+                self.allocator,
+                stream_id,
+                &frames,
+                self.session.options.control_codec,
+                .{},
+            );
+            errdefer sender.deinit();
+            // Replace-only: a previous sender must have completed (pumped
+            // to null above) or something is wrong with the sweep cadence.
+            if (self.ping_sender != null) return error.InvalidState;
+            self.ping_sender = sender;
+            // Flush immediately so  means bytes on the wire.
+            if (try self.ping_sender.?.pump(transport) == .complete) {
+                self.ping_sender.?.deinit();
+                self.ping_sender = null;
+            }
+            const deadline_margin = @max(2 * interval_us, std.time.us_per_s);
+            self.outstanding_ping = .{ .token = now_us, .deadline_us = now_us + deadline_margin };
+            return .ping_sent;
+        }
+        return .none;
+    }
+
+    /// Inbound progress marker: call (directly or via `pump`, which stamps
+    /// with `heartbeat_now_us`) whenever bytes arrive for this session.
+    pub fn noteInboundActivity(self: *QuicSessionRuntime, now_us: u64) void {
+        self.last_activity_us = now_us;
+        // Any inbound traffic also satisfies an outstanding probe: the
+        // peer is demonstrably alive (a conforming peer answers PING, but
+        // liveness is the question, not the specific frame).
+        self.outstanding_ping = null;
+    }
+
+    pub const HeartbeatOutcome = enum { none, ping_sent, timed_out };
 
     /// Effective liveness interval for this session: `min(local, peer)`
     /// when BOTH sides advertised a nonzero `HELLO.heartbeat_interval_ms`,
@@ -385,6 +465,7 @@ pub const QuicSessionRuntime = struct {
 
     pub fn pump(self: *QuicSessionRuntime, transport: anytype) !PumpResult {
         var result: PumpResult = .{};
+        var inbound_progress = false;
 
         if (self.control_sender) |*sender| {
             if (try sender.pump(transport) == .complete) {
@@ -426,6 +507,14 @@ pub const QuicSessionRuntime = struct {
 
         result.reliable_sent_complete += try self.pumpReliableSenders(transport);
         result.reliable_received += try self.pumpReliableReceivers(transport);
+
+        // Liveness: inbound-side progress counts as peer activity. The
+        // clock comes from the sweep cadence (tickHeartbeat sets it); when
+        // no sweep has run yet, heartbeat_now_us is 0 and this is a no-op.
+        inbound_progress = inbound_progress or result.control_frames_read > 0 or result.reliable_received > 0;
+        if (inbound_progress and self.heartbeat_now_us != 0) {
+            self.noteInboundActivity(self.heartbeat_now_us);
+        }
         return result;
     }
 
@@ -1390,4 +1479,99 @@ test "peer bidi stream id helper follows QUIC low bits" {
     try std.testing.expect(isPeerBidiStreamId(.client, 1));
     try std.testing.expect(!isPeerBidiStreamId(.client, 0));
     try std.testing.expect(!isPeerBidiStreamId(.client, 3));
+}
+
+// -- heartbeat sweep tests ----------------------------------------------------
+//
+// The sweep is driven with a recording transport: writes are captured per
+// stream so the PING's wire bytes can be decoded back, and reads return
+// nothing (no inbound progress), which is exactly the idle condition the
+// sweep exists to detect.
+
+const testing = std.testing;
+
+const HeartbeatFakeTransport = struct {
+    written: std.ArrayListUnmanaged(u8) = .empty,
+    wrote_stream: ?u64 = null,
+
+    opened_uni: ?u64 = null,
+
+    pub fn streamWrite(self: *HeartbeatFakeTransport, stream_id: u64, data: []const u8) !usize {
+        if (self.wrote_stream == null) self.wrote_stream = stream_id;
+        try self.written.appendSlice(testing.allocator, data);
+        return data.len;
+    }
+    pub fn streamFinish(_: *HeartbeatFakeTransport, _: u64) !void {}
+    pub fn openUni(self: *HeartbeatFakeTransport, stream_id: u64) !void {
+        self.opened_uni = stream_id;
+    }
+};
+
+fn heartbeatTestRuntime(allocator: std.mem.Allocator) !QuicSessionRuntime {
+    var rt = try QuicSessionRuntime.init(allocator, 1, .client, .{
+        .peer_id = "hb-client",
+        .role_flags = control.RoleFlags.client,
+        .heartbeat_interval_ms = 1_000,
+    });
+    rt.session.session.peer_heartbeat_interval_ms = 1_000; // negotiated
+    // Force the ready posture the sweep requires.
+    rt.session.onQuicReady() catch {};
+    rt.session.peer_hello_received = true;
+    // Mark the local HELLO as sent and refresh: the sweep requires .ready.
+    rt.session.local_hello_sent = true;
+    // state_value is directly settable from this module's tests; the
+    // private refreshState computes the same .ready from these flags.
+    rt.session.state_value = .ready;
+    return rt;
+}
+
+test "heartbeat sweep pings on idle and times out unanswered probes" {
+    const allocator = testing.allocator;
+    var rt = try heartbeatTestRuntime(allocator);
+    defer rt.deinit();
+    var transport = HeartbeatFakeTransport{};
+    defer transport.written.deinit(testing.allocator);
+
+    // Before the interval elapses: nothing.
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.none, try rt.tickHeartbeat(1_000_000, &transport));
+
+    // Idle past the interval (1s): PING goes out on a fresh uni stream.
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.ping_sent, try rt.tickHeartbeat(3_000_000, &transport));
+    const ping_stream = transport.wrote_stream.?;
+    try testing.expect(ping_stream % 4 == 2); // client uni stream id
+
+    // The probe is outstanding: repeated sweeps stay quiet.
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.none, try rt.tickHeartbeat(4_000_000, &transport));
+    try testing.expect(rt.outstanding_ping != null);
+    const probe = rt.outstanding_ping.?;
+    try testing.expectEqual(@as(u64, 3_000_000), probe.token);
+
+    // Before the deadline (now + max(2s, 1s)): still quiet.
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.none, try rt.tickHeartbeat(4_900_000, &transport));
+
+    // Past the deadline with no inbound activity: classified timeout and
+    // the session begins closing.
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.timed_out, try rt.tickHeartbeat(5_100_000, &transport));
+    try testing.expectEqual(quic.State.closing, rt.state());
+    try testing.expect(rt.outstanding_ping == null);
+}
+
+test "inbound activity resets the probe and defers the next ping" {
+    const allocator = testing.allocator;
+    var rt = try heartbeatTestRuntime(allocator);
+    defer rt.deinit();
+    var transport = HeartbeatFakeTransport{};
+    defer transport.written.deinit(testing.allocator);
+
+    // Prime the baseline, go idle, ping.
+    _ = try rt.tickHeartbeat(1_000_000, &transport);
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.ping_sent, try rt.tickHeartbeat(3_000_000, &transport));
+
+    // Inbound traffic arrives: the probe is satisfied and activity is
+    // stamped, so the next interval restarts from NOW.
+    rt.noteInboundActivity(3_500_000);
+    try testing.expect(rt.outstanding_ping == null);
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.none, try rt.tickHeartbeat(4_400_000, &transport));
+    // One microsecond past the refreshed interval: ping again.
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.ping_sent, try rt.tickHeartbeat(4_500_001, &transport));
 }

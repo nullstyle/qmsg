@@ -24,6 +24,16 @@ Landed so far (additive, all green — currently 410/410):
 - `PING` (tag 6) / `PONG` (tag 7) control-frame codec — token round-trip
   tested, validation arms added, `Tag.fromInt` mapped. Not yet emitted or
   consumed by any runtime.
+- **Sweep slice**: `QuicSessionRuntime.tickHeartbeat(now_us, transport)`
+  — the full probe state machine. Idle past the negotiated interval with
+  no outstanding probe → PING emitted on a one-shot uni control stream
+  (flushed before returning `.ping_sent`); outstanding probe past its
+  deadline (2x interval, 1s floor) → `beginClosing()` + `.timed_out`;
+  inbound progress during `pump` stamps activity via `heartbeat_now_us`
+  and satisfies any outstanding probe (`noteInboundActivity`). Tested
+  with a recording fake transport (wire bytes captured, timing edges
+  asserted). NOT yet called from Node tick paths — that plus PONG
+  reply/match is the remaining wiring.
 - **Negotiation slice**: `acceptHello` captures the peer's
   `HELLO.heartbeat_interval_ms` onto `Session.peer_heartbeat_interval_ms`;
   `QuicSessionRuntime.heartbeatInterval()` computes the effective
@@ -34,19 +44,10 @@ Landed so far (additive, all green — currently 410/410):
 
 1. ~~Negotiation~~ **DONE**: see above. The effective value is computed
    lazily by `heartbeatInterval()` — no eager computation needed.
-2. **State**: on `QuicSessionRuntime` —
-   `last_activity_us: u64`, `outstanding_ping: ?struct { token: u64,
-   deadline_us: u64 }`. Update `last_activity_us` in `pump()` whenever
-   inbound progress occurs (control frames, reliable bytes, datagrams).
-3. **Sweep**: `pub fn tickHeartbeat(self, now_us) !HeartbeatOutcome`
-   on `QuicSessionRuntime` — `.none` (no interval / not ready),
-   `.ping_sent` (idle >= interval and no outstanding: enqueue PING on a
-   one-shot uni stream via `stream_ids.nextUni()` + a
-   `quic_streams.ControlStreamSender`, mirroring `flushQueuedControl`
-   at `src/transport/quic_session_runtime.zig:277`), `.timed_out`
-   (outstanding past deadline = 2x interval, floor 1s → `beginClosing`
-   with a classified timeout outcome). Call sites: `Node.tickQuicClients`
-   / `tickQuicListeners` (both have `now_us`); for embedded seats, record
+2. ~~State~~ **DONE** (part of the sweep slice above).
+3. ~~Sweep~~ **DONE** at the runtime level; remaining: CALL SITES —
+   `Node.tickQuicClients` / `tickQuicListeners` (both have `now_us`,
+   pass the connection as transport); for embedded seats, record
    `last_now_us` on `Node.tick` and sweep in `pumpEmbeddedQuic`.
 4. **Inbound PING → PONG**: intercept in the two control-frame
    application points BEFORE registry apply — the embedded path
