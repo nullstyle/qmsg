@@ -9,6 +9,14 @@ changes.
 
 ## [0.4.0] - 2026-09-03
 
+> Re-cut once on 2026-09-03, minutes after the first push and before any
+> consumer could pin it: the original tag's build rejected
+> `-Dcapnp=true` in child-of-dependency configure passes (plain
+> `b.dependency` + an explicit option set for quic) and the codec did
+> not re-export the capnp message namespace, so consumers had no way to
+> reach the types. The re-cut carries both fixes; the version is
+> unchanged because no published artifact ever worked.
+
 ### Added
 
 - **Optional Cap'n Proto body codec** (`-Dcapnp=true`, module
@@ -18,10 +26,19 @@ changes.
   standard packed encoding, interoperable with any Cap'n Proto
   implementation. The capnp-zig dependency is LAZY: default builds and
   non-opting consumers never fetch it. Run its tests with
-  `zig build -Dcapnp=true capnp-test`.
+  `zig build -Dcapnp=true capnp-test`. The module re-exports
+  `message` (capnp-zig's serialization namespace) so consumers can
+  build and parse bodies without wiring the capnp module into their own
+  root.
 
 ### Changed
 
+- The `quic` dependency is resolved through `b.dependencyLazy` (and
+  `build` returns `!void`): with an explicit option set, the plain
+  `b.dependency` form rejects in child-of-dependency configure passes
+  (`invalid option: optimize` — quic's build registers `release` via its
+  preferred-mode policy). capnp-zig uses the lazy form for the same
+  dependency.
 - The `quic` dependency is now configured with `.optimize` forwarded and
   `.@"sanitize-c" = "trap"` (previously only `.target`). Two reasons,
   one behavioral and one structural. Behaviorally, `trap` keeps C/UB

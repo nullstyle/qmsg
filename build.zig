@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -34,7 +34,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
     const paseto_mod = paseto_dep.module("paseto");
-    const quic_dep = b.dependency("quic", .{
+    // `dependencyLazy` (not plain `dependency`): with an explicit option
+    // set, the plain form rejects in child-of-dependency configure passes
+    // (`invalid option: optimize` -- quic's build registers `release` via
+    // its preferred-mode policy). capnp-zig uses the lazy form for the
+    // same dependency; matching it also keeps one binary linking both
+    // packages on a single quic module.
+    const quic_dep = try b.dependencyLazy("quic", .{
         .target = target,
         .optimize = optimize,
         .@"sanitize-c" = @as([]const u8, "trap"),

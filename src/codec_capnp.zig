@@ -18,7 +18,10 @@
 const std = @import("std");
 const capnpc = @import("capnpc-zig");
 
-const message = capnpc.message;
+/// Re-exported so consumers can build/parse bodies through the same
+/// capnp-zig instance the codec resolves, without wiring the capnp module
+/// into their own root.
+pub const message = capnpc.message;
 
 /// Serialize a `MessageBuilder` into packed capnp bytes owned by
 /// `allocator`. The result is a complete qmsg message body — write it
