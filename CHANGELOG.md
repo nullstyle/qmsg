@@ -28,6 +28,10 @@ changes.
   timeout; when the socket is full the drained datagram is parked in a
   one-slot `pending_send` and retried before the next drain, so request
   deadlines and other peers still get their tick.
+- **quic-zig pinned at commit `2e73330`** (`fix/client-initial-padding`): a
+  client now pads every Initial-leading datagram to 1200 bytes, so a
+  server no longer waits for two probe timeouts before finishing the
+  handshake against a real network peer.
 
 ## [0.4.0] - 2026-09-03
 
