@@ -18,7 +18,7 @@ pub const default_receive_timeout: Io.Timeout = .{
 pub const Error = quic_runtime.Error ||
     std.mem.Allocator.Error ||
     Net.IpAddress.BindError ||
-    Net.Socket.SendError ||
+    Net.Socket.SendTimeoutError ||
     Net.Socket.ReceiveTimeoutError;
 
 pub const Datagram = struct {
@@ -30,6 +30,11 @@ pub const Datagram = struct {
 pub const SentDatagram = struct {
     drained: quic_runtime.DrainedDatagram,
     to: Net.IpAddress,
+};
+
+const PendingSend = struct {
+    bytes: []u8,
+    datagram: SentDatagram,
 };
 
 pub const ListenerOptions = struct {
@@ -62,6 +67,7 @@ pub const Listener = struct {
     rx_buffer: []u8,
     tx_buffer: []u8,
     receive_timeout: Io.Timeout,
+    pending_send: ?PendingSend = null,
 
     pub fn start(allocator: std.mem.Allocator, io: Io, options: ListenerOptions) Error!Listener {
         try validateListenerOptions(options);
@@ -91,6 +97,7 @@ pub const Listener = struct {
     }
 
     pub fn deinit(self: *Listener) void {
+        if (self.pending_send) |pending| self.allocator.free(pending.bytes);
         self.socket.close(self.io);
         self.runtime.deinit();
         self.allocator.free(self.rx_buffer);
@@ -123,13 +130,7 @@ pub const Listener = struct {
     }
 
     pub fn drainAndSendOne(self: *Listener, now_us: u64) Error!?SentDatagram {
-        const drained = (try self.drainOne(now_us)) orelse return null;
-        const to = try drainedTarget(drained);
-        try self.socket.send(self.io, &to, self.tx_buffer[0..drained.len]);
-        return .{
-            .drained = drained,
-            .to = to,
-        };
+        return sendNext(self, now_us);
     }
 
     pub fn tick(self: *Listener, now_us: u64) Error!void {
@@ -149,6 +150,7 @@ pub const Client = struct {
     rx_buffer: []u8,
     tx_buffer: []u8,
     receive_timeout: Io.Timeout,
+    pending_send: ?PendingSend = null,
 
     pub fn start(allocator: std.mem.Allocator, io: Io, options: ClientOptions) Error!Client {
         try validateClientOptions(options);
@@ -178,6 +180,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
+        if (self.pending_send) |pending| self.allocator.free(pending.bytes);
         self.socket.close(self.io);
         self.runtime.deinit();
         self.allocator.free(self.rx_buffer);
@@ -211,13 +214,7 @@ pub const Client = struct {
     }
 
     pub fn drainAndSendOne(self: *Client, now_us: u64) Error!?SentDatagram {
-        const drained = (try self.drainOne(now_us)) orelse return null;
-        const to = try drainedTarget(drained);
-        try self.socket.send(self.io, &to, self.tx_buffer[0..drained.len]);
-        return .{
-            .drained = drained,
-            .to = to,
-        };
+        return sendNext(self, now_us);
     }
 
     pub fn tick(self: *Client, now_us: u64) Error!void {
@@ -228,6 +225,35 @@ pub const Client = struct {
         return self.runtime.nextTimer(now_us);
     }
 };
+
+/// A pump must never block inside sendmsg: request deadlines and other peers
+/// need another tick even when this socket is full. Retain at most one drained
+/// packet, copying only on backpressure, and retry it before draining another.
+/// Both listener and client use this path; a busy socket is not a pump failure.
+fn sendNext(endpoint: anytype, now_us: u64) Error!?SentDatagram {
+    if (endpoint.pending_send) |pending| {
+        if (!try trySend(&endpoint.socket, endpoint.io, pending.datagram.to, pending.bytes)) return null;
+        endpoint.allocator.free(pending.bytes);
+        endpoint.pending_send = null;
+        return pending.datagram;
+    }
+    const drained = (try endpoint.drainOne(now_us)) orelse return null;
+    const datagram: SentDatagram = .{ .drained = drained, .to = try drainedTarget(drained) };
+    const bytes = endpoint.tx_buffer[0..drained.len];
+    if (!try trySend(&endpoint.socket, endpoint.io, datagram.to, bytes)) {
+        endpoint.pending_send = .{ .bytes = try endpoint.allocator.dupe(u8, bytes), .datagram = datagram };
+        return null;
+    }
+    return datagram;
+}
+
+fn trySend(socket: *const Net.Socket, io: Io, to: Net.IpAddress, bytes: []const u8) Error!bool {
+    socket.sendTimeout(io, &to, bytes, .{ .duration = .{ .raw = .zero, .clock = .awake } }) catch |err| switch (err) {
+        error.Timeout, error.SystemResources => return false,
+        else => return err,
+    };
+    return true;
+}
 
 pub fn validateListenerOptions(options: ListenerOptions) quic_runtime.Error!void {
     if (options.runtime.tls_cert_pem.len == 0 or options.runtime.tls_key_pem.len == 0) return error.InvalidEndpoint;

@@ -7,6 +7,8 @@ const auth = @import("auth.zig");
 const transport = @import("transport/root.zig");
 const protocol = @import("protocol/root.zig");
 
+const quic_packets_per_tick = 64;
+
 pub const NodeOptions = struct {
     max_sessions: usize = 1024,
     /// Bound on queued `Event`s. When the embedder stops draining,
@@ -1920,12 +1922,12 @@ pub const Node = struct {
             // Listener/embedded sessions sweep on the same node clock;
             // serviceSeat picks this up for every seat it pumps.
             listener.dispatch.setHeartbeatClock(now_us);
-            _ = try listener.listener.recvAndFeedOne(now_us);
+            try feedQuicEndpoint(&listener.listener, now_us);
             // Service BEFORE tick: quic-zig's ordering contract — the
             // stream GC inside tick must never reap a stream whose
             // arrived bytes the app has not read yet.
             try listener.dispatch.service(&listener.listener.runtime.server);
-            while (try listener.listener.drainAndSendOne(now_us)) |_| {}
+            try drainQuicEndpoint(&listener.listener, now_us);
             try listener.listener.tick(now_us);
             _ = listener.listener.runtime.reap();
         }
@@ -1933,7 +1935,7 @@ pub const Node = struct {
 
     fn tickQuicClients(self: *Node, now_us: u64) !void {
         for (self.quic_clients.items) |client| {
-            _ = try client.client.recvAndFeedOne(now_us);
+            try feedQuicEndpoint(&client.client, now_us);
             try client.client.tick(now_us);
             // A dial connection that reached QUIC's TERMINAL closed
             // state (peer CONNECTION_CLOSE observed through the
@@ -1954,9 +1956,28 @@ pub const Node = struct {
             const hb_conn = client.client.runtime.connection();
             var hb_adapter = transport.quic_streams.QuicConnectionAdapter.init(hb_conn);
             _ = client.runtime.runtime.tickHeartbeat(now_us, &hb_adapter) catch {};
-            while (try client.client.drainAndSendOne(now_us)) |_| {}
+            try drainQuicEndpoint(&client.client, now_us);
         }
         try self.reapDeadQuicClients();
+    }
+
+    /// Read what the socket already holds, up to the same bound as sends. One
+    /// datagram per tick starves a large transfer once a timed wait costs a
+    /// few milliseconds, and a full receive buffer then drops the rest.
+    fn feedQuicEndpoint(endpoint: anytype, now_us: u64) !void {
+        for (0..quic_packets_per_tick) |_| {
+            if (try endpoint.recvAndFeedOne(now_us) == null) return;
+        }
+    }
+
+    /// A producer may replenish its outbox while packets leave. Bound each
+    /// endpoint's send work so tick reaches other peers and request deadlines;
+    /// queued packets remain owned by QUIC (or UDP's pending-send slot) and
+    /// resume on the next tick.
+    fn drainQuicEndpoint(endpoint: anytype, now_us: u64) !void {
+        for (0..quic_packets_per_tick) |_| {
+            if (try endpoint.drainAndSendOne(now_us) == null) return;
+        }
     }
 
     /// Closes every dial session whose connection is terminally dead.

@@ -7,6 +7,28 @@ changes.
 
 ## [Unreleased]
 
+- **A request that finishes before the peer's HELLO lands is kept.** A
+  client is ready as soon as the server's HELLO arrives and sends its
+  first request at once; if the datagram carrying the client's own HELLO
+  was lost, that request reaches the server first. The server seat used
+  to park the stream, buffer the bytes, and drop both on FIN while the
+  session was still `local_hello_sent`; QUIC had acknowledged the bytes,
+  so the request was gone and the caller waited out its deadline. The
+  seat now keeps the pending accept and the buffer, accepts the stream
+  once ready, and frees the buffer after the receiver consumed it. Node
+  tests drive a listener and a client through lossy in-memory queues.
+- **The node pump moves up to 64 datagrams per endpoint per tick, in
+  and out.** Reading one datagram per tick starved large transfers
+  wherever a timed wait costs milliseconds (an OrbStack guest sleeps
+  about 3 ms for a 1 ms request), and a full receive buffer then drops
+  the rest on Linux. Sends already drained in a loop; both directions
+  are now bounded by the same constant so one busy peer cannot starve
+  the others or the request deadlines.
+- **UDP sends never block the pump.** `sendmsg` runs with a zero
+  timeout; when the socket is full the drained datagram is parked in a
+  one-slot `pending_send` and retried before the next drain, so request
+  deadlines and other peers still get their tick.
+
 ## [0.4.0] - 2026-09-03
 
 > Re-cut once on 2026-09-03, minutes after the first push and before any
