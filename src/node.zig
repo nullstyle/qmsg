@@ -5192,3 +5192,469 @@ fn localhostEndpoint(allocator: std.mem.Allocator, address: std.Io.net.IpAddress
         .ip6 => |ip6| try std.fmt.allocPrint(allocator, "[::1]:{d}", .{ip6.port}),
     };
 }
+
+// ---------------------------------------------------------------------
+// Loss reproduction:
+// A datagram FIFO per direction with a one-way delay; each endpoint
+// consumes ONE datagram per 1 ms tick (the quic_udp pump's
+// recvAndFeedOne cadence) and drains everything it has to send. Loss
+// policies model what the fleet saw on Linux VMs (the client's first
+// >1300-byte datagram after the server flight never reached the server:
+// Handshake Finished coalesced with the 1-RTT HELLO padded to the first
+// DPLPMTUD probe size).
+// ---------------------------------------------------------------------
+
+const wide_test_cert_pem = @embedFile("testdata/test_cert_wide.pem");
+const wide_test_key_pem = @embedFile("testdata/test_key_wide_cert.pem");
+
+fn leadsWithInitial(datagram: []const u8) bool {
+    if (datagram.len == 0) return false;
+    const first = datagram[0];
+    return (first & 0x80) != 0 and (first & 0x30) == 0x00;
+}
+
+fn packetKindLabel(datagram: []const u8) []const u8 {
+    if (datagram.len == 0) return "empty";
+    const first = datagram[0];
+    if ((first & 0x80) == 0) return "1rtt";
+    return switch ((first & 0x30) >> 4) {
+        0 => "initial",
+        1 => "0rtt",
+        2 => "handshake",
+        else => "retry",
+    };
+}
+
+fn readVarint(bytes: []const u8, pos: *usize) ?u64 {
+    if (pos.* >= bytes.len) return null;
+    const first = bytes[pos.*];
+    const len: usize = @as(usize, 1) << @intCast(first >> 6);
+    if (pos.* + len > bytes.len) return null;
+    var v: u64 = first & 0x3f;
+    var i: usize = 1;
+    while (i < len) : (i += 1) v = (v << 8) | bytes[pos.* + i];
+    pos.* += len;
+    return v;
+}
+
+/// Describes the coalesced QUIC packets in a datagram ("initial(1200)+handshake(51)").
+fn describeDatagram(buf: []u8, datagram: []const u8) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    var pos: usize = 0;
+    var first_pkt = true;
+    while (pos < datagram.len) {
+        const first = datagram[pos];
+        if (!first_pkt) w.writeAll("+") catch break;
+        first_pkt = false;
+        if ((first & 0x80) == 0) {
+            w.print("1rtt({d})", .{datagram.len - pos}) catch {};
+            break;
+        }
+        const start = pos;
+        var p = pos + 5;
+        if (p >= datagram.len) break;
+        const dcid_len = datagram[p];
+        p += 1 + dcid_len;
+        if (p >= datagram.len) break;
+        const scid_len = datagram[p];
+        p += 1 + scid_len;
+        const kind = (first & 0x30) >> 4;
+        if (kind == 0) {
+            const tok_len = readVarint(datagram, &p) orelse break;
+            p += @intCast(tok_len);
+        }
+        if (kind == 3) {
+            w.print("retry({d})", .{datagram.len - pos}) catch {};
+            break;
+        }
+        const len = readVarint(datagram, &p) orelse break;
+        pos = p + @as(usize, @intCast(len));
+        const label: []const u8 = switch (kind) {
+            0 => "initial",
+            1 => "0rtt",
+            else => "handshake",
+        };
+        w.print("{s}({d})", .{ label, pos - start }) catch break;
+    }
+    return w.buffered();
+}
+
+const DatagramQueue = struct {
+    const max_len = transport.quic_runtime.default_tx_buffer_bytes;
+    const Item = struct { len: usize, deliver_at_us: u64, bytes: [max_len]u8 };
+    items: std.ArrayList(Item) = .empty,
+
+    fn push(self: *DatagramQueue, allocator: std.mem.Allocator, bytes: []const u8, deliver_at_us: u64) !void {
+        var item: Item = .{ .len = bytes.len, .deliver_at_us = deliver_at_us, .bytes = undefined };
+        @memcpy(item.bytes[0..bytes.len], bytes);
+        try self.items.append(allocator, item);
+    }
+
+    fn pop(self: *DatagramQueue, now_us: u64) ?Item {
+        if (self.items.items.len == 0) return null;
+        if (self.items.items[0].deliver_at_us > now_us) return null;
+        return self.items.orderedRemove(0);
+    }
+};
+
+const LossPolicy = enum {
+    /// No loss (control).
+    none,
+    /// Drop exactly one datagram: the client's first >1300-byte datagram
+    /// after the server flight (Finished + HELLO-in-probe).
+    drop_first_large_once,
+    /// Path MTU 1280 over IPv4: every client datagram > 1252 bytes is lost.
+    mtu_1252,
+    /// Drop the client's first three >1300-byte datagrams (the coalesced
+    /// one and two HELLO-carrying probes).
+    drop_first_large_thrice,
+};
+
+const ServerSnap = struct {
+    hs: bool = false,
+    seat: bool = false,
+    sess: ?transport.quic.State = null,
+    s2_known: bool = false,
+    s2_read_offset: u64 = 0,
+    seat_s2_delivered: u64 = 0,
+    seat_s2_consumed: u64 = 0,
+    ctrl_receiver: bool = false,
+};
+
+const LossyDispatchPeers = struct {
+    allocator: std.mem.Allocator,
+    listener: transport.quic_runtime.ListenerRuntime,
+    dispatch: NodeServerDispatch,
+    client: transport.quic_runtime.ClientRuntime,
+    client_sess: *QuicSessionRuntime,
+    node: *Node,
+    /// Same size as quic_udp's default tx buffer.
+    rx: [transport.quic_runtime.default_tx_buffer_bytes]u8 = undefined,
+    c2s: DatagramQueue = .{},
+    s2c: DatagramQueue = .{},
+    now_us: u64 = 1_000,
+    tick: u32 = 0,
+    one_way_delay_us: u64 = 0,
+    policy: LossPolicy = .drop_first_large_once,
+    server_flight_seen: bool = false,
+    dropped: u32 = 0,
+    verbose: bool = true,
+    c2s_count: u32 = 0,
+    s2c_count: u32 = 0,
+    last_server_snap: ?ServerSnap = null,
+
+    fn deinit(self: *LossyDispatchPeers) void {
+        self.c2s.items.deinit(self.allocator);
+        self.s2c.items.deinit(self.allocator);
+    }
+
+    fn log(self: *LossyDispatchPeers, comptime fmt: []const u8, args: anytype) void {
+        if (!self.verbose) return;
+        std.debug.print("[t={d} now={d}ms] " ++ fmt ++ "\n", .{ self.tick, self.now_us / 1000 } ++ args);
+    }
+
+    fn serverSess(self: *LossyDispatchPeers) ?*QuicSessionRuntime {
+        for (self.node.quic_sessions.items) |candidate| {
+            if (candidate != self.client_sess) return candidate;
+        }
+        return null;
+    }
+
+    fn shouldDrop(self: *LossyDispatchPeers, bytes: []const u8) bool {
+        if (!self.server_flight_seen) return false;
+        switch (self.policy) {
+            .none => return false,
+            .drop_first_large_once => return self.dropped < 1 and bytes.len > 1300,
+            .drop_first_large_thrice => return self.dropped < 3 and bytes.len > 1300,
+            .mtu_1252 => return bytes.len > 1252,
+        }
+    }
+
+    /// Mirrors Node.tickQuicClients: recvAndFeedOne, tick, ensureClientReady,
+    /// pump session, heartbeat, drain (all outbound into the c2s FIFO, the
+    /// loss policy applied on the way).
+    fn clientTick(self: *LossyDispatchPeers) !void {
+        if (self.s2c.pop(self.now_us)) |popped| {
+            var item = popped;
+            self.server_flight_seen = true;
+            try self.client.feedInbound(.{ .bytes = item.bytes[0..item.len] }, self.now_us);
+        }
+        try self.client.tick(self.now_us);
+        const conn = self.client.connection();
+        if (!self.client_sess.transport_ready and conn.handshakeDone()) {
+            self.client_sess.transport_ready = true;
+            try self.client_sess.runtime.onQuicReady();
+            self.log("client handshakeDone -> onQuicReady (HELLO queued)", .{});
+        }
+        if (self.client_sess.transport_ready) {
+            _ = try self.client_sess.runtime.pumpConnection(conn);
+            var hb_adapter = transport.quic_streams.QuicConnectionAdapter.init(conn);
+            _ = self.client_sess.runtime.tickHeartbeat(self.now_us, &hb_adapter) catch {};
+        }
+        while (try self.client.drainOutbound(&self.rx, self.now_us)) |out| {
+            const bytes = self.rx[0..out.len];
+            self.c2s_count += 1;
+            var dbuf: [256]u8 = undefined;
+            if (self.shouldDrop(bytes)) {
+                self.dropped += 1;
+                self.log("c->s #{d} DROPPED {d} bytes = {s}", .{ self.c2s_count, bytes.len, describeDatagram(&dbuf, bytes) });
+                continue;
+            }
+            self.log("c->s #{d} {d} bytes = {s}", .{ self.c2s_count, bytes.len, describeDatagram(&dbuf, bytes) });
+            try self.c2s.push(self.allocator, bytes, self.now_us + self.one_way_delay_us);
+        }
+    }
+
+    fn serverSnap(self: *LossyDispatchPeers) ServerSnap {
+        var snap: ServerSnap = .{};
+        const slots = self.listener.server.iterator();
+        if (slots.len == 0) return snap;
+        const slot = slots[0];
+        snap.hs = slot.conn.handshakeDone();
+        if (slot.conn.streamRecvState(2)) |st| {
+            snap.s2_known = true;
+            snap.s2_read_offset = st.read_offset;
+        }
+        if (self.dispatch.driver.sessionOn(slot)) |ds| {
+            if (ds.app.seat) |*seat| {
+                snap.seat = true;
+                if (seat.streams.get(2)) |sb| {
+                    snap.seat_s2_delivered = sb.delivered;
+                    snap.seat_s2_consumed = sb.consumed;
+                }
+            }
+        }
+        if (self.serverSess()) |sess| {
+            snap.sess = sess.state();
+            snap.ctrl_receiver = sess.runtime.control_receiver != null;
+        }
+        return snap;
+    }
+
+    fn logServerSnap(self: *LossyDispatchPeers) void {
+        const snap = self.serverSnap();
+        if (self.last_server_snap) |last| {
+            if (std.meta.eql(last, snap)) return;
+        }
+        self.last_server_snap = snap;
+        self.log("server: hs={} seat={} sess={s} ctrl_rx={} | quic stream2 known={} read_off={d} | seat stream2 delivered={d} consumed={d}", .{
+            snap.hs,
+            snap.seat,
+            if (snap.sess) |st| @tagName(st) else "none",
+            snap.ctrl_receiver,
+            snap.s2_known,
+            snap.s2_read_offset,
+            snap.seat_s2_delivered,
+            snap.seat_s2_consumed,
+        });
+    }
+
+    /// Mirrors Node.tickQuicListeners: recvAndFeedOne, service, drain, tick, reap.
+    fn serverTick(self: *LossyDispatchPeers) !void {
+        const from: transport.quic_runtime.Address = .{ .ipv4 = .{
+            .addr = .{ 0x7f, 0, 0, 1 },
+            .port = 40_000,
+        } };
+        self.dispatch.setHeartbeatClock(self.now_us);
+        if (self.c2s.pop(self.now_us)) |popped| {
+            var item = popped;
+            var dbuf: [256]u8 = undefined;
+            const outcome = try self.listener.feedInbound(.{ .bytes = item.bytes[0..item.len], .from = from }, self.now_us);
+            self.log("server fed {d} bytes = {s} -> {s}", .{ item.len, describeDatagram(&dbuf, item.bytes[0..item.len]), @tagName(outcome) });
+            self.logServerSnap();
+        }
+        try self.dispatch.service(&self.listener.server);
+        self.logServerSnap();
+        while (try self.listener.drainOutbound(&self.rx, self.now_us)) |out| {
+            self.s2c_count += 1;
+            var dbuf: [256]u8 = undefined;
+            self.log("s->c #{d} {d} bytes = {s}", .{ self.s2c_count, out.len, describeDatagram(&dbuf, self.rx[0..out.len]) });
+            try self.s2c.push(self.allocator, self.rx[0..out.len], self.now_us + self.one_way_delay_us);
+        }
+        try self.listener.tick(self.now_us);
+        _ = self.listener.reap();
+    }
+
+    fn drive(self: *LossyDispatchPeers) !void {
+        try self.clientTick();
+        try self.serverTick();
+        self.now_us += 1_000;
+        self.tick += 1;
+    }
+};
+
+const ScenarioResult = struct {
+    dropped: u32 = 0,
+    ready_tick: ?u32 = null,
+    request_tick: ?u32 = null,
+    reply_tick: ?u32 = null,
+    client_state: transport.quic.State = .waiting_for_quic,
+    server_state: ?transport.quic.State = null,
+};
+
+fn runLossyScenario(
+    allocator: std.mem.Allocator,
+    one_way_delay_us: u64,
+    policy: LossPolicy,
+    verbose: bool,
+) !ScenarioResult {
+    const control = @import("control.zig");
+
+    const server_opts: transport.quic.QuicOptions = .{
+        .peer_id = "lossy-server",
+        .role_flags = control.RoleFlags.server,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+    const client_opts: transport.quic.QuicOptions = .{
+        .peer_id = "lossy-client",
+        .role_flags = control.RoleFlags.client,
+        .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+    };
+
+    var node = try Node.init(allocator, .{});
+    defer node.deinit();
+
+    var p: LossyDispatchPeers = .{
+        .allocator = allocator,
+        .listener = undefined,
+        .dispatch = undefined,
+        .client = undefined,
+        .client_sess = undefined,
+        .node = &node,
+        .one_way_delay_us = one_way_delay_us,
+        .policy = policy,
+        .verbose = verbose,
+    };
+    defer p.deinit();
+    // Deinit order: the listener's deinit fires the will-close hook into the
+    // driver, so the dispatch must still be alive then (LIFO defers).
+    try p.dispatch.init(allocator, &node, server_opts);
+    defer p.dispatch.deinit();
+    p.listener = try transport.quic_runtime.ListenerRuntime.init(allocator, "127.0.0.1:4433", .{
+        .tls_cert_pem = wide_test_cert_pem,
+        .tls_key_pem = wide_test_key_pem,
+        .transport = server_opts,
+    });
+    defer p.listener.deinit();
+    p.dispatch.attach(&p.listener.server);
+    p.client = try transport.quic_runtime.ClientRuntime.init(allocator, "127.0.0.1:4433", .{
+        .server_name = "localhost",
+        .insecure_skip_verify = true, // self-signed test fixture
+        .transport = client_opts,
+    });
+    defer p.client.deinit();
+
+    p.client_sess = try node.openQuicSession(.{
+        .role = .client,
+        .transport = client_opts,
+    });
+
+    var result: ScenarioResult = .{};
+
+    // Phase 1: handshake + HELLO exchange with the loss policy in the path,
+    // until the CLIENT is ready (the fleet client issues its request the
+    // moment its own session is ready, whether or not the server's is).
+    // 1 ms per tick; bound at 5 s simulated, far past any PTO/retransmit.
+    const max_ticks: u32 = 5_000;
+    var last_client: ?transport.quic.State = null;
+    while (p.tick < max_ticks) {
+        try p.drive();
+        const cs = p.client_sess.state();
+        if (last_client == null or last_client.? != cs) {
+            p.log("client: hs={} sess={s}", .{ p.client.connection().handshakeDone(), @tagName(cs) });
+            last_client = cs;
+        }
+        if (cs == .ready) break;
+    }
+    result.dropped = p.dropped;
+    result.client_state = p.client_sess.state();
+    result.server_state = if (p.serverSess()) |s| s.state() else null;
+    if (result.server_state != null and result.server_state.? == .ready) result.ready_tick = p.tick;
+
+    // Phase 2: request/reply. The request is issued as soon as the CLIENT
+    // is ready (what the fleet client does), whether or not the server is.
+    if (result.client_state == .ready) {
+        const stream_id = try p.client_sess.queueReliable(.{
+            .subject = "user.get",
+            .id = 4242,
+            .deadline_ms = 1_000,
+            .body = "ada",
+        });
+        result.request_tick = p.tick;
+        p.log("client queued request on stream {d}", .{stream_id});
+        const t_req = p.tick;
+        var request: ?transport.quic_session_runtime.ReceivedReliable = null;
+        while (p.tick < t_req + 3_000 and request == null) {
+            try p.drive();
+            if (p.serverSess()) |srv| {
+                if (result.ready_tick == null and srv.state() == .ready) result.ready_tick = p.tick;
+                request = srv.runtime.recvReliable();
+            }
+        }
+        if (request) |*req| {
+            defer req.deinit();
+            p.log("server popped request on stream {d} subject={s}", .{ req.stream_id, req.message.subject });
+            const srv = p.serverSess().?;
+            try srv.replyReliableOnStream(req.stream_id, .{
+                .subject = req.message.subject,
+                .id = req.message.id,
+                .flags = .{ .final = true },
+                .body = "Ada Lovelace",
+            });
+            var reply: ?transport.quic_session_runtime.ReceivedReliable = null;
+            while (p.tick < t_req + 4_000 and reply == null) {
+                try p.drive();
+                reply = p.client_sess.runtime.recvReliable();
+            }
+            if (reply) |*r| {
+                defer r.deinit();
+                if (std.mem.eql(u8, r.message.body, "Ada Lovelace")) result.reply_tick = p.tick;
+                p.log("client got reply body={s}", .{r.message.body});
+            } else {
+                p.log("reply missing after {d} ticks", .{p.tick - t_req});
+            }
+        } else {
+            p.log("request never reached the server inbox after {d} ticks", .{p.tick - t_req});
+        }
+        result.client_state = p.client_sess.state();
+        result.server_state = if (p.serverSess()) |s| s.state() else null;
+    }
+    return finishScenario(&p, &result);
+}
+
+fn finishScenario(p: *LossyDispatchPeers, result: *ScenarioResult) !ScenarioResult {
+    // Teardown with live connections: close the client and drain the
+    // listener so the will-close hook fires before the defers run.
+    p.verbose = false;
+    p.client.connection().close(false, 0, "done");
+    var step: u32 = 0;
+    while (step < 400 and p.listener.connectionCount() > 0) : (step += 1) {
+        try p.drive();
+        p.now_us += 10_000;
+    }
+    return result.*;
+}
+
+test "lossy: dropping the coalesced Finished+HELLO datagram still reaches ready and a reply" {
+    const allocator = std.testing.allocator;
+    const r = try runLossyScenario(allocator, 0, .drop_first_large_once, false);
+    try std.testing.expectEqual(@as(u32, 1), r.dropped);
+    try std.testing.expect(r.ready_tick != null);
+    try std.testing.expect(r.reply_tick != null);
+    try std.testing.expectEqual(transport.quic.State.ready, r.client_state);
+    try std.testing.expectEqual(transport.quic.State.ready, r.server_state.?);
+}
+
+test "lossy: the request survives when the first large datagram is dropped three times" {
+    const r = try runLossyScenario(std.testing.allocator, 1_000, .drop_first_large_thrice, false);
+    try std.testing.expect(r.dropped >= 1);
+    try std.testing.expect(r.reply_tick != null);
+    try std.testing.expectEqual(transport.quic.State.ready, r.server_state.?);
+}
+
+test "lossy: the request survives a path that never carries datagrams over 1252 bytes" {
+    const r = try runLossyScenario(std.testing.allocator, 1_000, .mtu_1252, false);
+    try std.testing.expect(r.dropped >= 1);
+    try std.testing.expect(r.reply_tick != null);
+    try std.testing.expectEqual(transport.quic.State.ready, r.server_state.?);
+}

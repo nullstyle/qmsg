@@ -331,6 +331,18 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
             stream_id: u64,
             end: quic_zig.app.StreamEnd,
         ) !void {
+            // A request stream can open and finish before the peer's HELLO has
+            // landed: the HELLO was lost and comes back after the request that
+            // followed it. QUIC has already acknowledged those bytes, so
+            // dropping the pending accept and the buffer here would lose the
+            // request for good. Keep both; pumpSeat accepts the stream once the
+            // session is ready and releases the buffer after it is consumed.
+            if (end == .fin and hasPendingAccept(seat, stream_id)) {
+                if (seat.streams.getPtr(stream_id)) |state| {
+                    state.final_size = state.delivered;
+                    return;
+                }
+            }
             removePendingAccept(seat, stream_id);
             removePendingControlRead(seat, stream_id);
             removeControlRead(seat, stream_id);
@@ -490,6 +502,7 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
                     return;
                 },
             };
+            releaseDrainedEndedStreams(seat, rt);
 
             // Follow-up control streams: decode complete frames and
             // hand them to the owner (registry apply is node-level).
@@ -584,6 +597,35 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
                     removed.receiver.deinit();
                 } else {
                     index += 1;
+                }
+            }
+        }
+
+        fn hasPendingAccept(seat: *Seat, stream_id: u64) bool {
+            for (seat.pending_accepts.items) |id| {
+                if (id == stream_id) return true;
+            }
+            return false;
+        }
+
+        /// Release the buffers of streams that finished before the session was
+        /// ready and have since been consumed by their receiver.
+        fn releaseDrainedEndedStreams(seat: *Seat, rt: *SessionRuntime) void {
+            var drained: std.ArrayListUnmanaged(u64) = .empty;
+            defer drained.deinit(seat.allocator);
+            var it = seat.streams.iterator();
+            while (it.next()) |entry| {
+                const state = entry.value_ptr;
+                const final_size = state.final_size orelse continue;
+                if (state.consumed < final_size) continue;
+                if (rt.reliable_receivers.contains(entry.key_ptr.*)) continue;
+                if (hasPendingAccept(seat, entry.key_ptr.*)) continue;
+                drained.append(seat.allocator, entry.key_ptr.*) catch return;
+            }
+            for (drained.items) |stream_id| {
+                if (seat.streams.fetchRemove(stream_id)) |kv| {
+                    var removed = kv.value;
+                    removed.buf.deinit(seat.allocator);
                 }
             }
         }
