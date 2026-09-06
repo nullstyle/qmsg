@@ -7,6 +7,17 @@ changes.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-06
+
+The lossy-network release. Three faults that only show once handshakes
+are fast and a path drops the occasional datagram: a request that arrived
+before the peer's HELLO was thrown away after QUIC had acknowledged it,
+the pump took in one datagram per tick and starved large transfers where
+a timed wait costs milliseconds, and a full UDP socket could block the
+pump. Verified on 0.17.0-dev.1786+75044cb04 (macOS) and, through the
+fleet-revisions consumer, on 0.17.0-dev.1978+c961124d9 on macOS and
+aarch64 Linux.
+
 - **A request that finishes before the peer's HELLO lands is kept.** A
   client is ready as soon as the server's HELLO arrives and sends its
   first request at once; if the datagram carrying the client's own HELLO
@@ -28,10 +39,9 @@ changes.
   timeout; when the socket is full the drained datagram is parked in a
   one-slot `pending_send` and retried before the next drain, so request
   deadlines and other peers still get their tick.
-- **quic-zig pinned at commit `2e73330`** (`fix/client-initial-padding`): a
-  client now pads every Initial-leading datagram to 1200 bytes, so a
-  server no longer waits for two probe timeouts before finishing the
-  handshake against a real network peer.
+- **quic-zig v0.20.0.** A client now pads every Initial-leading datagram
+  to 1200 bytes, so a server no longer waits for two probe timeouts
+  before finishing the handshake against a real network peer.
 
 ## [0.4.0] - 2026-09-03
 
