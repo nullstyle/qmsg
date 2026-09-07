@@ -21,9 +21,14 @@
             .url = "https://github.com/nullstyle/paseto-zig/archive/refs/tags/0.4.0.tar.gz",
             .hash = "paseto-0.4.0-EBI95RcXCADs0jz3tebS1xMaAiT2r3Tpx8HsF5LfpqOS",
         },
+        // Commit pin ahead of the next quic-zig release: 36a941f caches
+        // Handshake/0-RTT packet keys per secret and frees Initial keys
+        // at every drop site, fixing the AEAD-context leak — a long-lived
+        // qmsg session leaked one 640-byte BoringSSL context per sealed
+        // or opened packet at those levels.
         .quic = .{
-            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.21.0.tar.gz",
-            .hash = "quic-0.21.0-DnSYvexpMQDWBFgcnXGbfuDzqPNhV9jMPmp4KFjghBJO",
+            .url = "https://github.com/nullstyle/quic-zig/archive/36a941f37cd59e50d2d66d235e5f956efa10b617.tar.gz",
+            .hash = "N-V-__8AAB6OMQCZgBox7oApMMN4eYAoeZbVixup6eo8gJQZ",
         },
         // Optional Cap'n Proto body codec dependency (`-Dcapnp=true`).
         // LAZY: default builds and non-opting consumers never fetch or
