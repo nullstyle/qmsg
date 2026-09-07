@@ -117,6 +117,20 @@ pub fn build(b: *std.Build) !void {
     const quic_test_step = b.step("quic-test", "Run qmsg QUIC transport skeleton tests");
     quic_test_step.dependOn(&run_quic_tests.step);
 
+    // Two independent Nodes over real UDP. Separate step as well as
+    // part of `test`: it binds sockets, which some sandboxes deny.
+    const pair_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/node_pair_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pair_tests_mod.addImport("quic", quic_mod);
+    pair_tests_mod.addImport("paseto", paseto_mod);
+    const pair_tests = b.addTest(.{ .root_module = pair_tests_mod });
+    const run_pair_tests = b.addRunArtifact(pair_tests);
+    const pair_test_step = b.step("node-pair-test", "Run the two-node live UDP tests");
+    pair_test_step.dependOn(&run_pair_tests.step);
+
     const examples_step = b.step("examples", "Build qmsg examples");
     addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "inproc-reqrep", "examples/inproc_reqrep.zig");
     addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "embedded-inproc-node", "examples/embedded_inproc_node.zig");
@@ -131,6 +145,7 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run qmsg unit tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_quic_tests.step);
+    test_step.dependOn(&run_pair_tests.step);
 }
 
 fn addExample(

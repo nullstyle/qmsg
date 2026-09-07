@@ -7,6 +7,39 @@ changes.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-06
+
+The two-node release. Nothing in this repository had ever run two
+`Node`s against each other: the QUIC tests drive one side, and the
+localhost example listens and dials on a single node. So the behaviour
+between two separate embedders — a request across a process boundary,
+each side's view of the other's identity, and what a live node does
+about a peer that stopped answering — was unverified.
+
+- **`src/node_pair_test.zig`: two independent `App`s over real UDP.**
+  Each owns its own `Node`, socket and clock. The clock is virtual, so
+  idle-timeout behaviour that takes 30 wall-clock seconds is driven in
+  milliseconds while the sockets stay real. Also available on its own
+  as `zig build node-pair-test`. Four tests: a completed request across
+  the pair; both ends learning the other's certificate identity under
+  mutual TLS; `cert_binding` severing a peer that announces an id its
+  certificate does not back; and dead-peer detection.
+
+- **Measured: dead-peer detection is idle-timeout bound.** With the
+  negotiated idle timeout at 2s, a node drops a silent peer's session
+  2169ms after last contact — the timeout plus about one probe
+  interval. `max_idle_timeout_ms` defaults to 30_000, so by default a
+  crashed peer holds a session for roughly half a minute, and
+  `heartbeat_interval_ms` does not change that (it keeps a session
+  alive, it does not shorten detection). Applications that need faster
+  failure detection should run a membership layer rather than infer
+  liveness from qmsg sessions; qmesh-zig's SWIM defaults confirm a
+  death in about 5s.
+
+- **`App.TlsConfig.client_ca_pem`.** 0.6.0 added mutual TLS to
+  `Node.listenQuic` but not to the `App` facade, so the front door
+  could not reach the feature.
+
 ## [0.6.1] - 2026-09-06
 
 Build fix. Two consequences of one line, both only visible from

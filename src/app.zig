@@ -10,6 +10,12 @@ const transport = @import("transport/root.zig");
 pub const TlsConfig = struct {
     cert_pem: []const u8 = "",
     key_pem: []const u8 = "",
+    /// PEM bundle of CAs that may sign a CLIENT certificate. Setting it
+    /// makes the listener mutual-TLS, which is what populates
+    /// `Session.peer_cert_spki` on accepted sessions. Pair with
+    /// `quic.auth_config.cert_binding` to reject a HELLO announcing an
+    /// id the certificate does not back. See AUTH.md.
+    client_ca_pem: ?[]const u8 = null,
     quic: transport.quic.QuicOptions = .{},
 };
 
@@ -544,6 +550,7 @@ pub const App = struct {
         return self.node.listenQuic(addr, .{
             .tls_cert_pem = tls.cert_pem,
             .tls_key_pem = tls.key_pem,
+            .client_ca_pem = tls.client_ca_pem,
             .transport = tls.quic,
         });
     }
