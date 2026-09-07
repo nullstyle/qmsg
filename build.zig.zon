@@ -28,7 +28,7 @@
         // or opened packet at those levels.
         .quic = .{
             .url = "https://github.com/nullstyle/quic-zig/archive/36a941f37cd59e50d2d66d235e5f956efa10b617.tar.gz",
-            .hash = "N-V-__8AAB6OMQCZgBox7oApMMN4eYAoeZbVixup6eo8gJQZ",
+            .hash = "quic-0.21.0-DnSYvR6OMQBdGIb-q5HlAFWoHsE0Tt74-43IMSJVg027",
         },
         // Optional Cap'n Proto body codec dependency (`-Dcapnp=true`).
         // LAZY: default builds and non-opting consumers never fetch or
