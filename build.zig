@@ -34,15 +34,22 @@ pub fn build(b: *std.Build) !void {
         .target = target,
     });
     const paseto_mod = paseto_dep.module("paseto");
-    // `dependencyLazy` (not plain `dependency`): with an explicit option
-    // set, the plain form rejects in child-of-dependency configure passes
-    // (`invalid option: optimize` -- quic's build registers `release` via
-    // its preferred-mode policy). capnp-zig uses the lazy form for the
-    // same dependency; matching it also keeps one binary linking both
-    // packages on a single quic module.
+    // quic-zig deliberately registers NO `optimize` option: its build
+    // exposes a `-Drelease` policy knob instead (preferred mode
+    // ReleaseSafe), because ReleaseFast/ReleaseSmall would compile out
+    // the runtime safety checks its wire parsers rely on. Forwarding
+    // `.optimize` here therefore failed with `invalid option:
+    // "optimize"` on a COLD cache — a fresh clone's first
+    // `zig build` — and only appeared to work on the second run,
+    // after the lazy fetch had already completed. Do not add it back.
+    //
+    // The remaining map ({target, sanitize-c}) is also exactly
+    // qmesh-zig's, and Zig keys the dependency cache on
+    // {pkg_hash, option-set}: one binary linking both qmsg and qmesh
+    // shares a single quic module instead of compiling BoringSSL twice
+    // and minting two incompatible `quic.Connection` types.
     const quic_dep = try b.dependencyLazy("quic", .{
         .target = target,
-        .optimize = optimize,
         .@"sanitize-c" = @as([]const u8, "trap"),
     });
     const quic_mod = quic_dep.module("quic");

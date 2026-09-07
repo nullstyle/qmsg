@@ -7,6 +7,30 @@ changes.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-06
+
+Build fix. Two consequences of one line, both only visible from
+outside this repository.
+
+- **A fresh clone's first `zig build` failed.** The quic dependency
+  forwarded `.optimize`, and quic-zig deliberately registers no such
+  option — it exposes a `-Drelease` policy knob instead, because
+  ReleaseFast/ReleaseSmall would compile out the runtime safety checks
+  its wire parsers depend on. The result was
+  `error: invalid option: "optimize"` on a cold cache; a second
+  `zig build` appeared to succeed only because the lazy fetch had
+  completed by then, which is why it survived this long.
+
+- **qmsg and qmesh-zig could not co-exist in one binary.** Zig keys the
+  dependency cache on `{pkg_hash, option-set}`. qmsg forwarded
+  `{target, optimize, sanitize-c}` and qmesh-zig forwards
+  `{target, sanitize-c}`, so the same quic-0.21.0 package was
+  instantiated twice and a program importing both failed to compile
+  with `file exists in modules 'quic' and 'quic0'`. The maps now
+  agree, so one quic module — and one BoringSSL — serves both.
+
+No API or behavior change.
+
 ## [0.6.0] - 2026-09-06
 
 The peer-identity release. A qmsg listener accepted whatever `peer_id` a
