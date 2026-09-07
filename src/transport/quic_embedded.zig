@@ -264,10 +264,15 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
         /// calls are no-ops). Call from the embedder's on_handshake
         /// for qmsg-ALPN connections.
         pub fn onHandshake(self: *Self, seat: *Seat, conn: *quic_zig.Connection) !void {
-            _ = conn;
             if (seat.sess != null) return;
             const sess = try self.owner.driverServerSessionCreate(self.transport_options);
-            Owner.driverSessionRuntime(sess).event_delivery = self.delivery == .events;
+            const rt = Owner.driverSessionRuntime(sess);
+            rt.event_delivery = self.delivery == .events;
+            // Bind the handshake-authenticated identity BEFORE any
+            // HELLO can be accepted, so `AuthConfig.cert_binding` has
+            // something to check the announced id against. Present
+            // only on a mutual-TLS listener (`client_ca_pem`).
+            if (conn.peerCertSpkiDigest()) |digest| rt.session.bindCertIdentity(digest);
             seat.sess = sess;
         }
 

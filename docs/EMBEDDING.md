@@ -11,8 +11,9 @@ contract and this file is the explanation.
 The inproc surface is socketless from the embedder's point of view:
 the Node owns every qmsg socket, and the only I/O is message queues
 inside one process. QUIC transports (outbound `dialQuic`) coexist on
-the same Node; inbound QUIC attach is a designed-but-unbuilt seam —
-see [QUIC_EMBED_SEAM.md](QUIC_EMBED_SEAM.md).
+the same Node; inbound QUIC attach on a foreign embedder's listener is
+built — see "Inbound QUIC attach" below and
+[QUIC_EMBED_SEAM.md](QUIC_EMBED_SEAM.md).
 
 ## The loop
 

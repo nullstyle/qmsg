@@ -130,6 +130,52 @@ Current integration shape:
 - The QUIC adapter calls that helper while processing decoded HELLO control
   frames; no real QUIC connection is required to exercise HELLO auth.
 
+## Certificate-Bound Peer Identity
+
+The announced `HELLO.peer_id` is a claim made INSIDE the channel. A
+credential proves the peer holds a valid token; on its own it does not
+prove the peer is who the id says. With `AuthConfig.required = false`
+(the default) a listener also accepts peers presenting no credential
+at all.
+
+Mutual TLS closes that gap, because the handshake itself authenticates
+a key:
+
+1. The listener sets `QuicListenOptions.client_ca_pem`. A client
+   certificate becomes required and is chain-validated.
+2. The dial sets `QuicDialOptions.client_cert_pem` and
+   `.client_key_pem`. To dial a cluster peer by address rather than by
+   hostname, also set `.identity_verification = .none` — chain
+   validation against `ca_pem` stays mandatory, only the name check is
+   dropped.
+3. qmsg records the authenticated identity on the session as
+   `Session.peer_cert_spki`: SHA-256 over the peer leaf certificate's
+   DER SubjectPublicKeyInfo. `Session.certPeerIdHex()` renders the
+   canonical 64-character lowercase hex.
+4. The listener sets `AuthConfig.cert_binding` to bind the claim to
+   that identity.
+
+| `cert_binding` | Session with a certificate | Session without one |
+| --- | --- | --- |
+| `.off` (default) | announced id taken as-is | announced id taken as-is |
+| `.require_match` | non-empty announced id must equal the hex | allowed |
+| `.required` | non-empty announced id must equal the hex | `PeerIdentityRequired` |
+
+An empty announcement is not a lie — the certificate identity stands on
+its own — so only a non-empty mismatch raises `PeerIdentityMismatch`.
+
+The digest is the standard fingerprint:
+
+```
+openssl x509 -pubkey -in peer.pem \
+  | openssl pkey -pubin -outform DER \
+  | openssl dgst -sha256
+```
+
+so ids can be provisioned with any toolchain. It is also byte-for-byte
+qmesh-zig's `PeerId`, which is what lets one identity key both a qmsg
+session and a qmesh cluster member.
+
 ## Context Binding
 
 PASETO v3/v4 support implicit assertions. `qmsg` should use them to bind a

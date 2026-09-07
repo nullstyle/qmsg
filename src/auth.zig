@@ -25,6 +25,39 @@ pub const Error = error{
     CredentialNotYetValid,
     InvalidClaims,
     MessageTooLarge,
+    /// The HELLO announced a `peer_id` that is not this session's
+    /// transport-authenticated identity. An announced lie.
+    PeerIdentityMismatch,
+    /// `CertBinding.required` and the session carries no
+    /// transport-authenticated identity (no peer certificate).
+    PeerIdentityRequired,
+};
+
+/// Whether an announced `HELLO.peer_id` must equal the identity the
+/// TLS handshake actually authenticated.
+///
+/// qmsg's announced `peer_id` is a claim made *inside* the channel:
+/// without this policy any peer that satisfies the credential check
+/// may announce any id. `Session.peer_cert_spki` is the identity the
+/// handshake proves — SHA-256 over the peer leaf certificate's DER
+/// SubjectPublicKeyInfo — and these modes bind the claim to it.
+///
+/// Requires a listener configured with `client_ca_pem` (mutual TLS);
+/// without it no peer certificate is presented and there is nothing
+/// to bind to.
+pub const CertBinding = enum {
+    /// Announced ids are taken at face value. The default, and the
+    /// behavior of every release before 0.6.0.
+    off,
+    /// When the session HAS a transport identity, a non-empty
+    /// announced `peer_id` must equal its lowercase hex. Sessions
+    /// without one (inproc, or a listener with no `client_ca_pem`)
+    /// are unaffected — this is the mixed-deployment mode.
+    require_match,
+    /// As `require_match`, and every session must HAVE a transport
+    /// identity: an inproc session, or a QUIC session whose peer
+    /// presented no certificate, fails closed.
+    required,
 };
 
 pub const PatternSet = packed struct(u8) {
@@ -819,6 +852,9 @@ pub const AuthConfig = struct {
     require_audience: bool = false,
     expected_purposes: []const []const u8 = &.{},
     require_purpose: bool = false,
+    /// Bind the announced `HELLO.peer_id` to the certificate identity
+    /// the handshake authenticated. Off by default; see `CertBinding`.
+    cert_binding: CertBinding = .off,
 
     pub fn validateCredentialSize(self: AuthConfig, credential: Credential) Error!void {
         if (credential.token.len > self.max_token_bytes) return Error.TokenTooLarge;

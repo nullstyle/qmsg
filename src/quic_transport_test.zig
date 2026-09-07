@@ -1,5 +1,6 @@
 const std = @import("std");
 const quic_zig = @import("quic");
+const auth = @import("auth.zig");
 
 const control = @import("control.zig");
 const message = @import("message.zig");
@@ -632,4 +633,157 @@ test "runtime wrappers drive qmsg HELLO and reliable req rep with stream adapter
     try correlation.expectReply(stream_id, reply);
     try std.testing.expectEqualStrings("user.get", reply.subject);
     try std.testing.expectEqualStrings("Ada Lovelace", reply.body);
+}
+
+// ---- mutual TLS and cert-bound peer identity ---------------------
+
+/// A real handshake in which the CLIENT also presents a certificate.
+/// `test_cert_pem` is self-signed, so it serves as both the trust
+/// anchor (`client_ca_pem` / `ca_pem`) and the identity each side
+/// presents — the same fixture shape quic-zig's own peer-identity
+/// suite uses. `identity_verification = .none` keeps chain validation
+/// mandatory while dropping the hostname check, which is the posture
+/// for dialing a cluster peer by address.
+const MutualTlsPair = struct {
+    srv: quic_zig.Server,
+    cli: quic_zig.Client,
+    peer_addr: quic_zig.conn.path.Address = testAddress(0x54, 4433),
+
+    fn init(allocator: std.mem.Allocator) !MutualTlsPair {
+        const protos = [_][]const u8{quic.alpn};
+
+        var srv = try quic_zig.Server.init(.{
+            .allocator = allocator,
+            .tls_cert_pem = test_cert_pem,
+            .tls_key_pem = test_key_pem,
+            .client_ca_pem = test_cert_pem,
+            .alpn_protocols = &protos,
+            .transport_params = defaultParams(),
+        });
+        errdefer srv.deinit();
+
+        var cli = try quic_zig.Client.connect(.{
+            .allocator = allocator,
+            .server_name = "localhost",
+            .ca_pem = test_cert_pem,
+            .identity_verification = .none,
+            .client_cert_pem = test_cert_pem,
+            .client_key_pem = test_key_pem,
+            .alpn_protocols = &protos,
+            .transport_params = defaultParams(),
+        });
+        errdefer cli.deinit();
+
+        var pair: MutualTlsPair = .{ .srv = srv, .cli = cli };
+        try pair.handshake();
+        return pair;
+    }
+
+    fn deinit(self: *MutualTlsPair) void {
+        self.cli.deinit();
+        self.srv.deinit();
+        self.* = undefined;
+    }
+
+    fn serverConn(self: *MutualTlsPair) *quic_zig.Connection {
+        return self.srv.iterator()[0].conn;
+    }
+
+    fn handshake(self: *MutualTlsPair) !void {
+        try self.cli.conn.advance();
+        var rx: [8192]u8 = undefined;
+        var step: u32 = 0;
+        while (step < 32) : (step += 1) {
+            const now_us: u64 = @as(u64, step + 1) * 1_000;
+            _ = try pumpClientToServer(&self.cli, &self.srv, &rx, self.peer_addr, now_us);
+            while (self.srv.drainStatelessResponse()) |_| {}
+            _ = try pumpServerToClient(&self.srv, &self.cli, &rx, now_us);
+            try self.srv.tick(now_us);
+            try self.cli.conn.tick(now_us);
+            if (self.cli.conn.handshakeDone() and self.srv.iterator().len > 0 and
+                self.srv.iterator()[0].conn.handshakeDone()) break;
+        }
+        try std.testing.expect(self.cli.conn.handshakeDone());
+        try std.testing.expectEqual(@as(usize, 1), self.srv.connectionCount());
+        try std.testing.expect(self.serverConn().handshakeDone());
+    }
+};
+
+test "mutual TLS gives both ends a peer identity, and it is the same certificate" {
+    const allocator = std.testing.allocator;
+    var pair = try MutualTlsPair.init(allocator);
+    defer pair.deinit();
+
+    // The listener now learns WHICH peer authenticated: without
+    // client_ca_pem no client certificate is presented and this is
+    // null.
+    const server_view = pair.serverConn().peerCertSpkiDigest();
+    const client_view = pair.cli.conn.peerCertSpkiDigest();
+    try std.testing.expect(server_view != null);
+    try std.testing.expect(client_view != null);
+
+    // Both ends present the same self-signed fixture, so each side's
+    // view of the other is the same 32 bytes.
+    try std.testing.expectEqualSlices(u8, &server_view.?, &client_view.?);
+}
+
+test "a qmsg session over mutual TLS binds the announced id to the certificate" {
+    const allocator = std.testing.allocator;
+    var pair = try MutualTlsPair.init(allocator);
+    defer pair.deinit();
+
+    const digest = pair.serverConn().peerCertSpkiDigest().?;
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+
+    // A listener that binds announced ids to the certificate.
+    var server = try quic.QuicSession.init(allocator, 21, .server, .{
+        .peer_id = "server-a",
+        .auth_config = .{ .cert_binding = .require_match },
+    });
+    defer server.deinit();
+    server.bindCertIdentity(digest);
+    try server.onQuicReady();
+
+    // The peer announces exactly the identity its certificate proves.
+    const honest = try quic.encodeHelloControlStream(allocator, .{ .peer_id = &digest_hex });
+    defer allocator.free(honest);
+    try server.acceptPeerControl(honest);
+    try std.testing.expectEqualStrings(&digest_hex, server.session.peer_id);
+    try std.testing.expectEqualStrings(&digest_hex, &server.session.certPeerIdHex().?);
+}
+
+test "a qmsg session over mutual TLS rejects a HELLO that claims another identity" {
+    const allocator = std.testing.allocator;
+    var pair = try MutualTlsPair.init(allocator);
+    defer pair.deinit();
+
+    const digest = pair.serverConn().peerCertSpkiDigest().?;
+
+    var server = try quic.QuicSession.init(allocator, 22, .server, .{
+        .peer_id = "server-a",
+        .auth_config = .{ .cert_binding = .require_match },
+    });
+    defer server.deinit();
+    server.bindCertIdentity(digest);
+    try server.onQuicReady();
+
+    // A different, well-formed id the certificate does not back.
+    const impostor_hex = "0000000000000000000000000000000000000000000000000000000000000000";
+    const lie = try quic.encodeHelloControlStream(allocator, .{ .peer_id = impostor_hex });
+    defer allocator.free(lie);
+    try std.testing.expectError(
+        auth.Error.PeerIdentityMismatch,
+        server.acceptPeerControl(lie),
+    );
+
+    // Without the policy the same lie is accepted — the check is
+    // what closes the gap, not the transport.
+    var permissive = try quic.QuicSession.init(allocator, 23, .server, .{
+        .peer_id = "server-a",
+    });
+    defer permissive.deinit();
+    permissive.bindCertIdentity(digest);
+    try permissive.onQuicReady();
+    try permissive.acceptPeerControl(lie);
+    try std.testing.expectEqualStrings(impostor_hex, permissive.session.peer_id);
 }

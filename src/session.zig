@@ -26,6 +26,20 @@ pub const Session = struct {
     /// sides offer a nonzero interval — see
     /// `QuicSessionRuntime.heartbeatInterval`.
     peer_heartbeat_interval_ms: u64 = 0,
+    /// The identity the TLS handshake authenticated: SHA-256 over the
+    /// DER SubjectPublicKeyInfo of the peer's leaf certificate, from
+    /// `quic.Connection.peerCertSpkiDigest()`. Null before the
+    /// handshake completes, on inproc sessions, and on QUIC sessions
+    /// whose peer presented no certificate (a listener without
+    /// `client_ca_pem`).
+    ///
+    /// Unlike `peer_id` — a claim the peer makes inside the channel —
+    /// this is proved by the handshake. `AuthConfig.cert_binding`
+    /// makes the claim answer to it.
+    ///
+    /// These are the same 32 bytes qmesh-zig uses as its `PeerId`, so
+    /// one identity keys a qmsg session and a qmesh cluster member.
+    peer_cert_spki: ?[32]u8 = null,
     user_data: ?*anyopaque = null,
 
     pub fn isAuthenticated(self: Session) bool {
@@ -44,6 +58,33 @@ pub const Session = struct {
     pub fn clearAuthorization(self: *Session, allocator: std.mem.Allocator) void {
         if (self.authorization) |*authorization| authorization.deinit(allocator);
         self.setAnonymous();
+    }
+
+    /// Lowercase-hex rendering of `peer_cert_spki` (64 bytes), the
+    /// canonical string form of the transport identity. Byte-for-byte
+    /// equal to `qmesh.PeerId.hex()` for the same certificate, and to
+    /// the standard `openssl x509 -pubkey | openssl pkey -pubin
+    /// -outform DER | openssl dgst -sha256` fingerprint.
+    pub fn certPeerIdHex(self: Session) ?[64]u8 {
+        const digest = self.peer_cert_spki orelse return null;
+        return std.fmt.bytesToHex(digest, .lower);
+    }
+
+    /// Enforce `config.cert_binding` against an announced HELLO id.
+    /// An empty announcement is not a lie — the transport identity
+    /// stands on its own — so only a non-empty mismatch is rejected.
+    pub fn enforceCertBinding(
+        self: Session,
+        config: auth.AuthConfig,
+        announced: []const u8,
+    ) auth.Error!void {
+        if (config.cert_binding == .off) return;
+        const hex = self.certPeerIdHex() orelse {
+            if (config.cert_binding == .required) return auth.Error.PeerIdentityRequired;
+            return;
+        };
+        if (announced.len == 0) return;
+        if (!std.mem.eql(u8, announced, &hex)) return auth.Error.PeerIdentityMismatch;
     }
 
     pub fn setAuthorization(self: *Session, authorization: auth.Authorization) void {
@@ -501,4 +542,92 @@ test "Session permits anonymous HELLO only when configured" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+// ---- cert-bound peer identity ------------------------------------
+
+/// The digest a test session pretends the handshake authenticated.
+const test_digest: [32]u8 = .{
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+    0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+};
+const test_digest_hex = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+
+fn certSession(digest: ?[32]u8) Session {
+    return .{ .id = 1, .transport = .quic, .peer_cert_spki = digest };
+}
+
+test "certPeerIdHex renders the digest as lowercase hex" {
+    const bound = certSession(test_digest);
+    const hex = bound.certPeerIdHex().?;
+    try std.testing.expectEqualStrings(test_digest_hex, &hex);
+    // 64 hex characters: the same rendering qmesh's PeerId.hex()
+    // produces for the same certificate, so one identity keys both.
+    try std.testing.expectEqual(@as(usize, 64), hex.len);
+
+    // No certificate, no identity.
+    try std.testing.expect(certSession(null).certPeerIdHex() == null);
+}
+
+test "cert binding off takes an announced id at face value" {
+    const bound = certSession(test_digest);
+    try bound.enforceCertBinding(.{ .cert_binding = .off }, "someone-else");
+}
+
+test "cert binding require_match accepts the certificate's own id" {
+    const bound = certSession(test_digest);
+    try bound.enforceCertBinding(.{ .cert_binding = .require_match }, test_digest_hex);
+}
+
+test "cert binding require_match rejects an announced lie" {
+    const bound = certSession(test_digest);
+    try std.testing.expectError(
+        auth.Error.PeerIdentityMismatch,
+        bound.enforceCertBinding(.{ .cert_binding = .require_match }, "someone-else"),
+    );
+    // Right length, wrong value: not a length check.
+    const wrong_hex = "00" ++ test_digest_hex[2..];
+    try std.testing.expectError(
+        auth.Error.PeerIdentityMismatch,
+        bound.enforceCertBinding(.{ .cert_binding = .require_match }, wrong_hex),
+    );
+    // Uppercase is a different string; the rendering is canonical.
+    var upper: [64]u8 = undefined;
+    _ = std.ascii.upperString(&upper, test_digest_hex);
+    try std.testing.expectError(
+        auth.Error.PeerIdentityMismatch,
+        bound.enforceCertBinding(.{ .cert_binding = .require_match }, &upper),
+    );
+}
+
+test "cert binding require_match passes sessions that carry no certificate" {
+    // The mixed-deployment mode: an inproc session, or a listener
+    // without client_ca_pem, is unaffected.
+    const unbound = certSession(null);
+    try unbound.enforceCertBinding(.{ .cert_binding = .require_match }, "anything");
+}
+
+test "cert binding required fails closed without a certificate" {
+    const unbound = certSession(null);
+    try std.testing.expectError(
+        auth.Error.PeerIdentityRequired,
+        unbound.enforceCertBinding(.{ .cert_binding = .required }, "anything"),
+    );
+    // With a certificate it behaves exactly like require_match.
+    const bound = certSession(test_digest);
+    try bound.enforceCertBinding(.{ .cert_binding = .required }, test_digest_hex);
+    try std.testing.expectError(
+        auth.Error.PeerIdentityMismatch,
+        bound.enforceCertBinding(.{ .cert_binding = .required }, "someone-else"),
+    );
+}
+
+test "cert binding treats an empty announcement as no claim" {
+    // Announcing nothing is not a lie: the certificate identity
+    // stands on its own.
+    const bound = certSession(test_digest);
+    try bound.enforceCertBinding(.{ .cert_binding = .require_match }, "");
+    try bound.enforceCertBinding(.{ .cert_binding = .required }, "");
 }

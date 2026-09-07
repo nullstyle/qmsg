@@ -530,6 +530,18 @@ pub const QuicSession = struct {
         if (hello.supported_patterns == 0) return error.InvalidPattern;
         if ((hello.supported_patterns & ~control.PatternBits.all) != 0) return error.InvalidPattern;
         if ((hello.supported_patterns & self.options.supported_patterns) == 0) return error.InvalidPattern;
+        // The announced id must answer to the identity the handshake
+        // authenticated. Off unless the embedder opts in; see
+        // `auth.CertBinding`.
+        try self.session.enforceCertBinding(self.options.auth_config, hello.peer_id);
+    }
+
+    /// Record the identity the TLS handshake authenticated. Called by
+    /// the driver seam once the handshake completes and before any
+    /// HELLO is accepted, so `validateHelloPolicy` can bind the
+    /// announced id to it. Idempotent.
+    pub fn bindCertIdentity(self: *QuicSession, digest: [32]u8) void {
+        self.session.peer_cert_spki = digest;
     }
 
     fn authenticateHello(self: *QuicSession, hello: control.Hello) !void {

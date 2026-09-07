@@ -338,6 +338,15 @@ const PendingInprocRequest = struct {
         const deadline_ms = self.deadline_ms orelse return false;
         return now_ms >= self.sent_at_ms +| deadline_ms;
     }
+
+    /// The instant this request expires, on `Node.now_us`'s clock.
+    /// Null when the request carries no deadline. `nowMs` truncates
+    /// microseconds, so the deadline is reached at the START of its
+    /// millisecond.
+    fn deadlineUs(self: PendingInprocRequest) ?u64 {
+        const deadline_ms = self.deadline_ms orelse return null;
+        return (self.sent_at_ms +| deadline_ms) *| std.time.us_per_ms;
+    }
 };
 
 /// One outbound QUIC request awaiting its reply, keyed by the
@@ -356,6 +365,15 @@ const PendingQuicRequest = struct {
     fn isExpired(self: PendingQuicRequest, now_ms: u64) bool {
         const deadline_ms = self.deadline_ms orelse return false;
         return now_ms >= self.sent_at_ms +| deadline_ms;
+    }
+
+    /// The instant this request expires, on `Node.now_us`'s clock.
+    /// Null when the request carries no deadline. `nowMs` truncates
+    /// microseconds, so the deadline is reached at the START of its
+    /// millisecond.
+    fn deadlineUs(self: PendingQuicRequest) ?u64 {
+        const deadline_ms = self.deadline_ms orelse return null;
+        return (self.sent_at_ms +| deadline_ms) *| std.time.us_per_ms;
     }
 };
 
@@ -378,6 +396,16 @@ pub const QuicListenOptions = struct {
     /// its reset verifies against the tokens the dead instance
     /// minted, which requires the same key.
     stateless_reset_key: ?[32]u8 = null,
+    /// PEM bundle of CAs that may sign a CLIENT certificate. Setting
+    /// it makes this listener mutual-TLS: every accepted connection
+    /// must present a client certificate that chains to this bundle,
+    /// and `Session.peer_cert_spki` is then populated with the peer's
+    /// authenticated identity. Combine with
+    /// `transport.auth_config.cert_binding` to reject a HELLO that
+    /// announces an id the certificate does not back. Null (the
+    /// default) leaves the listener server-authenticated only. The
+    /// bytes must outlive the listener.
+    client_ca_pem: ?[]const u8 = null,
 };
 
 /// Options for one outbound QUIC client session (`Node.dialQuic`).
@@ -391,6 +419,17 @@ pub const QuicListenOptions = struct {
 pub const QuicDialOptions = struct {
     server_name: []const u8,
     ca_pem: ?[]const u8 = null,
+    /// Client certificate chain (PEM) this dial presents, and its
+    /// private key. Set BOTH or neither. Required to dial a listener
+    /// configured with `QuicListenOptions.client_ca_pem`; it is also
+    /// what gives that listener a `Session.peer_cert_spki` to bind
+    /// the peer's announced id to. The bytes must outlive the dial.
+    client_cert_pem: ?[]const u8 = null,
+    client_key_pem: ?[]const u8 = null,
+    /// How this dial checks the SERVER's certificate identity. Use
+    /// `.none` (with `ca_pem` set) to dial a cluster peer by address
+    /// whose certificate identity is membership, not a hostname.
+    identity_verification: transport.quic_runtime.ServerNameVerification = .server_name,
     transport: transport.quic.QuicOptions = .{},
     bind_literal: []const u8 = transport.quic_udp.default_bind_literal,
     rx_buffer_bytes: usize = transport.quic_runtime.default_rx_buffer_bytes,
@@ -732,6 +771,7 @@ pub const Node = struct {
                     .tls_key_pem = options.tls_key_pem,
                     .transport = options.transport,
                     .stateless_reset_key = stateless_reset_key,
+                    .client_ca_pem = options.client_ca_pem,
                 },
                 .rx_buffer_bytes = options.rx_buffer_bytes,
                 .tx_buffer_bytes = options.tx_buffer_bytes,
@@ -771,6 +811,9 @@ pub const Node = struct {
                 .runtime = .{
                     .server_name = options.server_name,
                     .ca_pem = options.ca_pem,
+                    .client_cert_pem = options.client_cert_pem,
+                    .client_key_pem = options.client_key_pem,
+                    .identity_verification = options.identity_verification,
                     .transport = options.transport,
                 },
                 .rx_buffer_bytes = options.rx_buffer_bytes,
@@ -1784,6 +1827,15 @@ pub const Node = struct {
                 bestTimer(&best, timer.deadline.at_us);
             }
         }
+        // Request deadlines are node-level timers too: an embedder
+        // that sleeps until `nextTimer` must wake to fail an expired
+        // request, not only to service the transport.
+        for (self.inproc_pending.items) |pending| {
+            if (pending.deadlineUs()) |at_us| bestTimer(&best, at_us);
+        }
+        for (self.quic_pending.items) |pending| {
+            if (pending.deadlineUs()) |at_us| bestTimer(&best, at_us);
+        }
         return best;
     }
 
@@ -2002,8 +2054,15 @@ pub const Node = struct {
 
     fn ensureClientReady(_: *Node, client: *QuicClientRuntime) !void {
         if (client.runtime.transport_ready) return;
-        if (!client.client.runtime.connection().handshakeDone()) return;
+        const conn = client.client.runtime.connection();
+        if (!conn.handshakeDone()) return;
         client.runtime.transport_ready = true;
+        // The dial side authenticates the SERVER's certificate; bind
+        // that identity before the peer HELLO is accepted so
+        // `cert_binding` applies symmetrically.
+        if (conn.peerCertSpkiDigest()) |digest| {
+            client.runtime.runtime.session.bindCertIdentity(digest);
+        }
         try client.runtime.runtime.onQuicReady();
     }
 

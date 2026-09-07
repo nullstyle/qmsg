@@ -43,6 +43,11 @@ pub const ParsedEndpoint = struct {
     }
 };
 
+/// Re-export so embedders configure `identity_verification` without
+/// importing quic-zig directly (the public qmsg API keeps
+/// `quic_zig.Connection` off its surface).
+pub const ServerNameVerification = quic_zig.Connection.ServerNameVerification;
+
 pub const ListenerOptions = struct {
     tls_cert_pem: []const u8,
     tls_key_pem: []const u8,
@@ -57,6 +62,16 @@ pub const ListenerOptions = struct {
     /// so a reborn listener's reset verifies against tokens minted
     /// by the instance that died.
     stateless_reset_key: ?[32]u8 = null,
+    /// PEM bundle of CAs that may sign a CLIENT certificate. Setting
+    /// it turns the listener into mutual TLS: a client certificate
+    /// becomes REQUIRED and is chain-validated against this bundle,
+    /// which in turn makes `Connection.peerCertSpkiDigest()` — and so
+    /// `Session.peer_cert_spki` — present on every accepted session.
+    /// Pair it with `AuthConfig.cert_binding` to stop a peer
+    /// announcing an id it cannot prove. Null (the default) keeps the
+    /// listener server-authenticated only. The bytes must outlive the
+    /// listener.
+    client_ca_pem: ?[]const u8 = null,
 };
 
 pub const ClientOptions = struct {
@@ -67,6 +82,22 @@ pub const ClientOptions = struct {
     /// (mirrors quic.Client.Config.insecure_skip_verify). Production
     /// dials pin trust via `ca_pem` instead.
     insecure_skip_verify: bool = false,
+    /// Client certificate chain (PEM) this dial presents, and its
+    /// private key. Set BOTH or neither. Required to dial a listener
+    /// configured with `ListenerOptions.client_ca_pem`, and what
+    /// makes the LISTENER's `Session.peer_cert_spki` present. The
+    /// bytes must outlive the client.
+    client_cert_pem: ?[]const u8 = null,
+    client_key_pem: ?[]const u8 = null,
+    /// How the server's certificate identity is checked.
+    /// `.server_name` (default) verifies SAN/CN against
+    /// `server_name`. `.none` keeps chain validation against
+    /// `ca_pem` mandatory but drops the name check — the posture for
+    /// dialing a private-cluster peer BY ADDRESS, where the
+    /// certificate's meaning is cluster membership rather than a
+    /// hostname. `.none` without `ca_pem` is rejected, so it can
+    /// never silently become no verification at all.
+    identity_verification: quic_zig.Connection.ServerNameVerification = .server_name,
 };
 
 pub const Inbound = struct {
@@ -190,6 +221,7 @@ pub const ListenerRuntime = struct {
             .allocator = allocator,
             .tls_cert_pem = options.tls_cert_pem,
             .tls_key_pem = options.tls_key_pem,
+            .client_ca_pem = options.client_ca_pem,
             .alpn_protocols = options.transport.alpn_protocols,
             .transport_params = transportParamsFromOptions(options.transport),
             .stateless_reset_key = options.stateless_reset_key,
@@ -351,6 +383,9 @@ pub const ClientRuntime = struct {
             .transport_params = transportParamsFromOptions(options.transport),
             .ca_pem = options.ca_pem,
             .insecure_skip_verify = options.insecure_skip_verify,
+            .client_cert_pem = options.client_cert_pem,
+            .client_key_pem = options.client_key_pem,
+            .identity_verification = options.identity_verification,
         }) catch |err| return mapQuicError(err);
         errdefer client.deinit();
 

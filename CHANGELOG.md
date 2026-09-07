@@ -7,6 +7,62 @@ changes.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-06
+
+The peer-identity release. A qmsg listener accepted whatever `peer_id` a
+HELLO announced: the credential check proved the peer held a valid
+token, but nothing tied that token to the peer it claimed to be, so any
+authenticated peer could speak as any other. This release makes the
+identity the TLS handshake actually authenticated available on the
+session, and lets a listener require the announced id to match it.
+Verified on 0.17.0-dev.1786+75044cb04 (macOS).
+
+- **`Session.peer_cert_spki`: the identity the handshake proved.**
+  SHA-256 over the DER SubjectPublicKeyInfo of the peer's leaf
+  certificate, from quic-zig 0.21.0's
+  `Connection.peerCertSpkiDigest()`. Populated on both ends of a QUIC
+  session — the listener reads the client certificate, the dial reads
+  the server's — and null where no peer certificate exists (inproc, or
+  a listener without `client_ca_pem`). `Session.certPeerIdHex()`
+  renders it as the canonical 64-character lowercase hex, which is
+  byte-for-byte the standard `openssl x509 -pubkey | openssl pkey
+  -pubin -outform DER | openssl dgst -sha256` fingerprint, and
+  byte-for-byte qmesh-zig's `PeerId.hex()` — so one identity keys a
+  qmsg session and a qmesh cluster member.
+
+- **`AuthConfig.cert_binding`: make the announced id answer to the
+  certificate.** `.off` (default) preserves today's behavior.
+  `.require_match` rejects a HELLO whose non-empty `peer_id` is not the
+  session's certificate identity, while leaving sessions that have no
+  certificate alone — the mixed-deployment mode. `.required` also
+  demands that every session HAVE a certificate identity, so an inproc
+  session or a listener without `client_ca_pem` fails closed. New
+  errors `PeerIdentityMismatch` and `PeerIdentityRequired`. An empty
+  announcement is not treated as a lie: the certificate identity stands
+  on its own.
+
+- **`QuicListenOptions.client_ca_pem`: mutual TLS on a qmsg listener.**
+  Setting it requires a client certificate chaining to that bundle,
+  which is what makes `peer_cert_spki` present on accepted sessions.
+
+- **`QuicDialOptions.client_cert_pem` / `.client_key_pem` /
+  `.identity_verification`.** A dial can now present its own
+  certificate — without this the new listener option had nothing to
+  verify. `identity_verification = .none` keeps chain validation
+  against `ca_pem` mandatory while dropping the hostname check: the
+  posture for dialing a cluster peer BY ADDRESS, whose certificate
+  means membership rather than a name. `.none` without `ca_pem` is
+  rejected, so it cannot silently degrade to no verification.
+
+- **`Node.nextTimer` no longer overshoots request deadlines.** It
+  folded only listener and client transport timers, so an embedder
+  that slept until the value it returned woke after a pending
+  request's deadline had already passed and failed it late. Inproc and
+  QUIC pending-request deadlines are now folded in.
+
+- **Dependency: quic-zig 0.20.0 → 0.21.0** (the release that exposes
+  peer certificate identity).
+
 ## [0.5.0] - 2026-09-06
 
 The lossy-network release. Three faults that only show once handshakes
