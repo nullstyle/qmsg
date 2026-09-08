@@ -1,6 +1,6 @@
 [tools]
 # Zig master pin verified for this release. quic-zig is now a
-# tarball pin (v0.20.0), whose floor is dev.1683; qmsg is verified
+# tarball pin (v0.21.1), whose floor is dev.1683; qmsg is verified
 # on the consumer's toolchain (mruby-quic's pin) so the published
 # package compiles where it is consumed.
 zig = "0.17.0-dev.1786+75044cb04"
