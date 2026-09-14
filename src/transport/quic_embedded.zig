@@ -267,6 +267,7 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
             if (seat.sess != null) return;
             const sess = try self.owner.driverServerSessionCreate(self.transport_options);
             const rt = Owner.driverSessionRuntime(sess);
+            if (@hasDecl(Owner, "driverBindConnection")) self.owner.driverBindConnection(sess, conn);
             rt.event_delivery = self.delivery == .events;
             // Bind the handshake-authenticated identity BEFORE any
             // HELLO can be accepted, so `AuthConfig.cert_binding` has
@@ -280,9 +281,14 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
         /// control stream (its receiver is pre-armed by id). Call
         /// from on_stream_open.
         pub fn onStreamOpen(self: *Self, seat: *Seat, stream_id: u64, bidi: bool) !void {
-            _ = self;
             const sess = seat.sess orelse return;
             const rt = Owner.driverSessionRuntime(sess);
+            // Ended streams may still wait for HELLO or decoder capacity after
+            // QUIC replenishes its stream credit. Bound these retained records
+            // independently of the driver's currently live receive entries.
+            if (seat.pending_accepts.items.len + seat.pending_control_reads.items.len + seat.control_reads.items.len >=
+                driverSizing(self.transport_options).max_tracked_streams)
+                return error.ExcessiveLoad;
 
             if (!bidi) {
                 // The peer's FIRST uni stream is the HELLO control
@@ -301,8 +307,8 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
                 return;
             }
 
-            if (rt.state() == .ready) {
-                acceptReliable(rt, stream_id);
+            if (rt.state() == .ready and acceptReliable(rt, stream_id)) {
+                return;
             } else {
                 // The peer may open request streams in the same
                 // flight as its HELLO; accept them once the exchange
@@ -320,11 +326,43 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
             stream_id: u64,
             chunk: []const u8,
         ) !void {
+            const sess = seat.sess orelse return;
+            try self.pumpSeat(seat, conn);
+            const limit = Owner.driverSessionRuntime(sess).session.options.max_queued_bytes;
+            var buffered: usize = 0;
+            var it = seat.streams.valueIterator();
+            while (it.next()) |state| buffered +|= state.buf.items.len - state.start;
+            // Legacy drivers acknowledge a whole chunk or none. Refuse this
+            // connection before staging bytes so a retry cannot duplicate a prefix.
+            if (chunk.len > limit -| buffered) {
+                Owner.driverSessionRuntime(sess).beginClosing();
+                conn.close(false, 0x51_04, "receive capacity exhausted");
+                return;
+            }
+            _ = try self.onStreamDataConsumed(seat, conn, stream_id, chunk);
+        }
+
+        pub fn onStreamDataConsumed(self: *Self, seat: *Seat, conn: *quic_zig.Connection, stream_id: u64, chunk: []const u8) !usize {
+            const sess = seat.sess orelse return chunk.len;
+            const rt = Owner.driverSessionRuntime(sess);
+            // Locally initiated request receivers disappear on cancellation.
+            // Drain any already-arrived late bytes without recreating a buffer.
+            if ((stream_id & 2) == 0 and !quic_session_runtime.isPeerBidiStreamId(rt.session.role, stream_id) and !rt.reliable_receivers.contains(stream_id)) return chunk.len;
+            try self.pumpSeat(seat, conn);
+            var buffered: usize = 0;
+            var it = seat.streams.valueIterator();
+            while (it.next()) |state| buffered +|= state.buf.items.len - state.start;
+            const room = rt.session.options.max_queued_bytes -| buffered;
+            const accepted = @min(room, chunk.len);
+            if (accepted == 0) return 0;
             const entry = try seat.streams.getOrPut(seat.allocator, stream_id);
             if (!entry.found_existing) entry.value_ptr.* = .{};
-            try entry.value_ptr.buf.appendSlice(seat.allocator, chunk);
-            entry.value_ptr.delivered += chunk.len;
-            try self.pumpSeat(seat, conn);
+            try entry.value_ptr.buf.appendSlice(seat.allocator, chunk[0..accepted]);
+            entry.value_ptr.delivered += accepted;
+            // After accepting bytes, return their count without fallible work.
+            // The next service pass pumps them; a decoder allocation failure must
+            // never make the QUIC driver retry an already accepted prefix.
+            return accepted;
         }
 
         /// The stream ended (fin) or died (reset/reaped). Call from
@@ -336,35 +374,29 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
             stream_id: u64,
             end: quic_zig.app.StreamEnd,
         ) !void {
-            // A request stream can open and finish before the peer's HELLO has
-            // landed: the HELLO was lost and comes back after the request that
-            // followed it. QUIC has already acknowledged those bytes, so
-            // dropping the pending accept and the buffer here would lose the
-            // request for good. Keep both; pumpSeat accepts the stream once the
-            // session is ready and releases the buffer after it is consumed.
-            if (end == .fin and hasPendingAccept(seat, stream_id)) {
-                if (seat.streams.getPtr(stream_id)) |state| {
-                    state.final_size = state.delivered;
-                    return;
-                }
+            if (@hasDecl(Owner, "driverStreamEnded")) {
+                if (seat.sess) |sess| self.owner.driverStreamEnded(sess, stream_id, end);
+            }
+            // FIN does not cancel its decoder. The last data callback only
+            // staged bytes, and a pending HELLO or inbox pressure can delay
+            // decoding further. Preserve every reader until it observes EOF.
+            if (end == .fin) {
+                const entry = try seat.streams.getOrPut(seat.allocator, stream_id);
+                if (!entry.found_existing) entry.value_ptr.* = .{};
+                entry.value_ptr.final_size = entry.value_ptr.delivered;
+                try self.pumpSeat(seat, conn);
+                return;
             }
             removePendingAccept(seat, stream_id);
             removePendingControlRead(seat, stream_id);
             removeControlRead(seat, stream_id);
-            const state = seat.streams.getPtr(stream_id) orelse return;
-
             switch (end) {
-                .fin => {
-                    state.final_size = state.delivered;
-                    // Final drain: the receivers observe
-                    // read_offset == final_size and complete.
-                    try self.pumpSeat(seat, conn);
-                },
+                .fin => unreachable,
                 .reset, .reaped => {
                     // Drop the affected receiver instead of letting
                     // the next pump surface StreamReset/StreamNotFound
                     // and abort the whole pass.
-                    state.reset = true;
+                    if (seat.streams.getPtr(stream_id)) |state| state.reset = true;
                     if (seat.sess) |sess| {
                         const rt = Owner.driverSessionRuntime(sess);
                         if (rt.reliable_receivers.fetchRemove(stream_id)) |kv| {
@@ -480,10 +512,12 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
             }
 
             if (rt.state() == .ready and seat.pending_accepts.items.len > 0) {
-                for (seat.pending_accepts.items) |stream_id| {
-                    acceptReliable(rt, stream_id);
+                var pending_index: usize = 0;
+                while (pending_index < seat.pending_accepts.items.len) {
+                    if (acceptReliable(rt, seat.pending_accepts.items[pending_index])) {
+                        _ = seat.pending_accepts.orderedRemove(pending_index);
+                    } else pending_index += 1;
                 }
-                seat.pending_accepts.clearRetainingCapacity();
             }
 
             if (rt.state() == .ready and seat.pending_control_reads.items.len > 0) {
@@ -507,8 +541,6 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
                     return;
                 },
             };
-            releaseDrainedEndedStreams(seat, rt);
-
             // Follow-up control streams: decode complete frames and
             // hand them to the owner (registry apply is node-level).
             self.pumpControlReads(seat, &adapter) catch |err| switch (err) {
@@ -518,6 +550,7 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
                     conn.close(false, quic.protocol_error_code, "qmsg control frame error");
                 },
             };
+            releaseDrainedEndedStreams(seat, rt);
         }
 
         fn pumpControlReads(self: *Self, seat: *Seat, adapter: *Adapter) !void {
@@ -530,6 +563,7 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
 
             while (index < seat.control_reads.items.len) {
                 const read = &seat.control_reads.items[index];
+                for (frames.items) |*frame| frame.deinit();
                 frames.clearRetainingCapacity();
                 const result = read.receiver.pump(adapter, &frames) catch |err| switch (err) {
                     // The stream may have been reaped before its end
@@ -557,13 +591,12 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
             }
         }
 
-        fn acceptReliable(rt: *SessionRuntime, stream_id: u64) void {
+        fn acceptReliable(rt: *SessionRuntime, stream_id: u64) bool {
             rt.acceptReliableStream(stream_id) catch |err| switch (err) {
-                error.StreamAlreadyOpen => {},
-                // Session closing or not ready: the stream ends via
-                // reset/teardown paths instead.
-                else => {},
+                error.StreamAlreadyOpen => return true,
+                else => return false,
             };
+            return true;
         }
 
         fn armControlRead(seat: *Seat, rt: *SessionRuntime, stream_id: u64) void {
@@ -625,6 +658,17 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
                 if (state.consumed < final_size) continue;
                 if (rt.reliable_receivers.contains(entry.key_ptr.*)) continue;
                 if (hasPendingAccept(seat, entry.key_ptr.*)) continue;
+                if (rt.control_receiver) |receiver| if (receiver.stream_id == entry.key_ptr.*) continue;
+                var control_pending = false;
+                for (seat.pending_control_reads.items) |id| if (id == entry.key_ptr.*) {
+                    control_pending = true;
+                    break;
+                };
+                for (seat.control_reads.items) |read| if (read.stream_id == entry.key_ptr.*) {
+                    control_pending = true;
+                    break;
+                };
+                if (control_pending) continue;
                 drained.append(seat.allocator, entry.key_ptr.*) catch return;
             }
             for (drained.items) |stream_id| {
@@ -646,4 +690,190 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
             }
         }
     };
+}
+
+const AdmissionTestOwner = struct {
+    pub const DriverSession = *SessionRuntime;
+    controls: usize = 0,
+
+    pub fn driverSessionRuntime(sess: DriverSession) *SessionRuntime {
+        return sess;
+    }
+    pub fn driverServerSessionDestroy(_: *@This(), _: DriverSession) void {}
+    pub fn driverSessionPass(_: *@This(), _: DriverSession, _: *quic_zig.Connection) !void {}
+    pub fn driverControlFramesReceived(self: *@This(), _: DriverSession, frames: []quic_control_frame) !void {
+        for (frames) |frame| switch (frame) {
+            .subscribe => |subscription| {
+                try std.testing.expectEqualStrings("jobs.*", subscription.filter);
+                self.controls += 1;
+            },
+            else => return error.UnexpectedFrame,
+        };
+    }
+};
+
+// Reject decoder allocations only after admission has actually staged bytes.
+// Safe bookkeeping allocations before admission remain permitted.
+const AdmissionAllocator = struct {
+    parent: std.mem.Allocator,
+    seat: ?*EmbeddedSeat(AdmissionTestOwner) = null,
+    reject_buffered: bool = true,
+    rejected: bool = false,
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn reject(self: *@This()) bool {
+        if (!self.reject_buffered) return false;
+        const seat = self.seat orelse return false;
+        const stream = seat.streams.get(0) orelse return false;
+        if (stream.delivered == 0) return false;
+        self.rejected = true;
+        return true;
+    }
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        if (self.reject()) return null;
+        return self.parent.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        if (len > memory.len and self.reject()) return false;
+        return self.parent.rawResize(memory, alignment, len, ret_addr);
+    }
+    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        if (len > memory.len and self.reject()) return null;
+        return self.parent.rawRemap(memory, alignment, len, ret_addr);
+    }
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.parent.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "embedded admission returns consumed bytes before decoder allocation" {
+    const a = std.testing.allocator;
+    var failing: AdmissionAllocator = .{ .parent = a };
+    var runtime = try SessionRuntime.init(failing.allocator(), 1, .server, .{});
+    defer runtime.deinit();
+    runtime.session.state_value = .ready;
+    try runtime.acceptReliableStream(0);
+    var transport = try @import("quic_runtime.zig").ClientRuntime.init(a, "127.0.0.1:4433", .{ .server_name = "localhost" });
+    defer transport.deinit();
+    const Dispatch = EmbeddedDispatch(AdmissionTestOwner);
+    var owner: AdmissionTestOwner = .{};
+    var dispatch = Dispatch.init(a, &owner, .{}, .events);
+    var seat = Dispatch.Seat.init(a);
+    seat.sess = &runtime;
+    failing.seat = &seat;
+    defer dispatch.onDisconnect(&seat);
+    const encoded = try quic_streams.encodeReliableMessage(a, .{ .id = 7, .subject = "echo", .body = "accepted once" }, .{});
+    defer a.free(encoded);
+
+    // Any attempt to allocate after accepting the chunk would fail, so
+    // returning its full length proves the callback does no fallible work
+    // after committing those bytes.
+    try std.testing.expectEqual(encoded.len, try dispatch.onStreamDataConsumed(&seat, transport.connection(), 0, encoded));
+    try std.testing.expect(!failing.rejected);
+    try std.testing.expectEqualStrings(encoded, seat.streams.get(0).?.buf.items);
+    try std.testing.expectEqual(@as(u64, encoded.len), seat.streams.get(0).?.delivered);
+    try std.testing.expectEqual(@as(usize, 0), runtime.reliable_receivers.get(0).?.bytes.items.len);
+    try std.testing.expectError(error.OutOfMemory, dispatch.serviceSeat(&seat, transport.connection()));
+    try std.testing.expect(failing.rejected);
+    try std.testing.expectEqualStrings(encoded, seat.streams.get(0).?.buf.items);
+
+    // Restore decoding capacity, then finish normally. The exact payload is
+    // delivered once without replaying the already accepted transport chunk.
+    failing.reject_buffered = false;
+    try dispatch.onStreamEnd(&seat, transport.connection(), 0, .fin);
+    var received = runtime.recvReliable() orelse return error.MissingMessage;
+    defer received.deinit();
+    try std.testing.expectEqualStrings("accepted once", received.message.body);
+    try std.testing.expect(runtime.recvReliable() == null);
+    try std.testing.expectEqual(@as(usize, 0), seat.streams.count());
+}
+
+test "embedded legacy overflow refuses the whole chunk on only its connection" {
+    const a = std.testing.allocator;
+    const options: quic.QuicOptions = .{ .max_message_size = 4, .max_queued_bytes = 4 };
+    var runtime = try SessionRuntime.init(a, 1, .server, options);
+    defer runtime.deinit();
+    var healthy = try SessionRuntime.init(a, 2, .server, options);
+    defer healthy.deinit();
+    var transport = try @import("quic_runtime.zig").ClientRuntime.init(a, "127.0.0.1:4433", .{ .server_name = "localhost" });
+    defer transport.deinit();
+    var healthy_transport = try @import("quic_runtime.zig").ClientRuntime.init(a, "127.0.0.1:4434", .{ .server_name = "localhost" });
+    defer healthy_transport.deinit();
+    const Dispatch = EmbeddedDispatch(AdmissionTestOwner);
+    var owner: AdmissionTestOwner = .{};
+    var dispatch = Dispatch.init(a, &owner, options, .events);
+    var seat = Dispatch.Seat.init(a);
+    seat.sess = &runtime;
+    defer dispatch.onDisconnect(&seat);
+    var healthy_seat = Dispatch.Seat.init(a);
+    healthy_seat.sess = &healthy;
+    defer dispatch.onDisconnect(&healthy_seat);
+
+    try dispatch.onStreamData(&seat, transport.connection(), 0, "ab");
+    try dispatch.onStreamData(&seat, transport.connection(), 0, "cde");
+    try std.testing.expect(runtime.isClosing());
+    try std.testing.expectEqualStrings("ab", seat.streams.get(0).?.buf.items);
+    try std.testing.expectEqual(@as(u64, 2), seat.streams.get(0).?.delivered);
+    try dispatch.onStreamData(&healthy_seat, healthy_transport.connection(), 0, "xy");
+    try std.testing.expect(!healthy.isClosing());
+    try std.testing.expectEqualStrings("xy", healthy_seat.streams.get(0).?.buf.items);
+}
+
+test "embedded FIN preserves deferred control readers through decoding" {
+    const a = std.testing.allocator;
+    var runtime = try SessionRuntime.init(a, 1, .server, .{});
+    defer runtime.deinit();
+    runtime.session.state_value = .ready;
+    var transport = try @import("quic_runtime.zig").ClientRuntime.init(a, "127.0.0.1:4433", .{ .server_name = "localhost" });
+    defer transport.deinit();
+    const Dispatch = EmbeddedDispatch(AdmissionTestOwner);
+    var owner: AdmissionTestOwner = .{};
+    var dispatch = Dispatch.init(a, &owner, .{}, .events);
+    var seat = Dispatch.Seat.init(a);
+    seat.sess = &runtime;
+    defer dispatch.onDisconnect(&seat);
+    const frames = [_]quic_control_frame{.{ .subscribe = .{ .filter = "jobs.*", .options = 0 } }};
+    const encoded = try quic_streams.encodeControlStream(a, &frames, .{});
+    defer a.free(encoded);
+
+    try dispatch.onStreamOpen(&seat, 6, false);
+    try dispatch.onStreamOpen(&seat, 10, false);
+    try std.testing.expectEqual(encoded.len, try dispatch.onStreamDataConsumed(&seat, transport.connection(), 6, encoded));
+    try std.testing.expectEqual(encoded.len, try dispatch.onStreamDataConsumed(&seat, transport.connection(), 10, encoded));
+    try dispatch.onStreamEnd(&seat, transport.connection(), 6, .fin);
+    try dispatch.onStreamEnd(&seat, transport.connection(), 10, .fin);
+    try std.testing.expectEqual(@as(usize, 2), owner.controls);
+    try std.testing.expectEqual(@as(usize, 0), seat.control_reads.items.len);
+    try std.testing.expectEqual(@as(usize, 0), seat.streams.count());
+    try dispatch.serviceSeat(&seat, transport.connection());
+    try std.testing.expectEqual(@as(usize, 2), owner.controls);
+}
+
+test "embedded pending control FIN records stay bounded before HELLO" {
+    const a = std.testing.allocator;
+    const options: quic.QuicOptions = .{ .initial_max_streams_bidi = 0, .initial_max_streams_uni = 1 };
+    var runtime = try SessionRuntime.init(a, 1, .server, options);
+    defer runtime.deinit();
+    var transport = try @import("quic_runtime.zig").ClientRuntime.init(a, "127.0.0.1:4433", .{ .server_name = "localhost" });
+    defer transport.deinit();
+    const Dispatch = EmbeddedDispatch(AdmissionTestOwner);
+    var owner: AdmissionTestOwner = .{};
+    var dispatch = Dispatch.init(a, &owner, options, .events);
+    var seat = Dispatch.Seat.init(a);
+    seat.sess = &runtime;
+    defer dispatch.onDisconnect(&seat);
+
+    try dispatch.onStreamOpen(&seat, 6, false);
+    try dispatch.onStreamEnd(&seat, transport.connection(), 6, .fin);
+    try std.testing.expectEqual(@as(usize, 1), seat.pending_control_reads.items.len);
+    try std.testing.expectEqual(@as(usize, 1), seat.streams.count());
+    try std.testing.expectError(error.ExcessiveLoad, dispatch.onStreamOpen(&seat, 10, false));
+    try std.testing.expectEqual(@as(usize, 1), seat.pending_control_reads.items.len);
+    try std.testing.expectEqual(@as(usize, 1), seat.streams.count());
 }

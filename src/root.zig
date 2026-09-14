@@ -36,6 +36,7 @@ pub const SocketOptions = socket.SocketOptions;
 pub const Request = socket.Request;
 pub const ErrorReply = socket.ErrorReply;
 pub const ReplyKey = socket.ReplyKey;
+pub const ReplyHandle = message.ReplyHandle;
 pub const QueueOptions = queue.QueueOptions;
 pub const OnFull = queue.OnFull;
 pub const QueueStats = queue.QueueStats;
@@ -63,10 +64,15 @@ pub const RunOnceResult = app.RunOnceResult;
 pub const QuicDispatcher = app.QuicDispatcher;
 pub const QuicDispatchOptions = app.QuicDispatchOptions;
 pub const TlsConfig = app.TlsConfig;
+pub const Node = node.Node;
+pub const NodeOptions = node.NodeOptions;
+pub const SessionStatus = node.SessionStatus;
 pub const NodeEvent = node.Event;
 pub const NodeStats = node.Stats;
 pub const NodeServerDispatch = node.NodeServerDispatch;
 pub const RequestFailure = node.RequestFailure;
+pub const RequestId = node.RequestId;
+pub const RequestTarget = node.RequestTarget;
 pub const classifyRequestError = node.classifyRequestError;
 pub const MessageDropped = node.MessageDropped;
 pub const RequestEvent = node.RequestEvent;
@@ -149,6 +155,7 @@ pub const Error = error{
     UnexpectedFrame,
     VersionMismatch,
     UnsupportedTransport,
+    UnsupportedPattern,
     UnsupportedCredential,
     TooManySessions,
     UnknownKey,

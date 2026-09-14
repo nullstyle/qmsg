@@ -15,6 +15,10 @@ the same Node; inbound QUIC attach on a foreign embedder's listener is
 built — see "Inbound QUIC attach" below and
 [QUIC_EMBED_SEAM.md](QUIC_EMBED_SEAM.md).
 
+`Node` now defaults to canonical events for both transports. The migration
+from transport-specific events and direct inbox consumption is documented in
+[MIGRATION.md](MIGRATION.md), including request budgets and retained replies.
+
 ## The loop
 
 ```zig
@@ -22,12 +26,12 @@ var node = try qmsg.node.Node.init(allocator, .{});
 defer node.deinit();
 
 while (running) {
-    node.tick(now_us) catch {};          // 1. advance the clock
+    try node.tick(now_us);               // 1. advance the clock
     do_embedder_work();                  // 2. your actors, your I/O
     var events: [16]qmsg.node.Event = undefined;
     const count = try node.poll(&events); // 3. pump + drain events
+    defer for (events[0..count]) |*event| event.deinit();
     for (events[0..count]) |*event| {
-        defer event.deinit();
         switch (event.*) { ... }          // 4. route by pattern
     }
 }
@@ -42,9 +46,9 @@ while (running) {
 - **`poll` is the pump.** It first drains node-owned state — expired
   request deadlines, then served requests, request replies, and
   subscription deliveries — into the event queue, then moves up to
-  `events.len` events out. Ordering is FIFO; deadlines are evaluated
-  before replies, so a reply that lands after its deadline classifies
-  as a late drop, not a correlation surprise.
+  `events.len` events out. Reserved request outcomes drain before ordinary
+  events; there is no global FIFO order between those queues. Deadlines use
+  the time most recently passed to `tick`.
 - **Event memory is owned.** `request`, `reply`, and `delivery`
   events carry an owned `Message` plus (for deliveries) a borrowed
   filter slice. `deinit()` each event after handling it; payloads
@@ -72,10 +76,10 @@ All wiring is explicit and order-tolerant where possible:
 | Operation | Bind/dial side | Call |
 | --- | --- | --- |
 | Serve requests | Node binds | `listenInprocRep(&network, "svc", .{})` |
-| Reply to a served request | — | `replyInproc(&request_event, .{ .subject = "", .body })` |
+| Reply to a served request | — | `reply(request_event.msg.reply_handle.?, .{ .subject = "", .body })` |
 | Reply with an error | — | `replyErrorInproc(&request_event, .{ .code, .message })` |
-| Send requests | Node dials | `dialInprocReq(&network, "peers", .{})` → `requestInproc(dial_id, .{...})` |
-| Cancel a request | — | `cancelInprocRequest(dial_id, id)` |
+| Send requests | Node dials | `dialInprocReq(&network, "peers", .{})` → `request(.{ .inproc = dial_id }, .{...})` |
+| Cancel a request | — | `cancelRequest(request_id)` |
 | Receive deliveries | Node dials | `dialInprocSub(&network, "events")` + `subscribeInproc("metrics.*")` |
 | Stop receiving | — | `unsubscribeInproc("metrics.*")` |
 | Publish | Node binds | `listenInprocPub(&network, "feed", .{})` → `publishInproc(pub_id, .{...})` |
@@ -98,9 +102,10 @@ Every request/reply outcome is a poll event or a synchronous error:
 
 - `request` — inbound request: `msg.id` is the correlation id,
   `msg.deadline_ms` the deadline, `msg.subject`/`msg.body` the ask.
-  Reply while the event is alive (`replyInproc` echoes the subject
-  when the reply's subject is empty).
-- `reply` — the peer answered: `msg.id` correlates, `msg.flags.err`
+  Reply through `msg.reply_handle` while the event is alive, or retain the
+  handle for later work. `Node.reply` echoes an empty reply subject.
+- `reply` — the peer answered: `request_id` matches the local ID returned by
+  `Node.request`; `msg.flags.err`
   plus the `qmsg-error-code` / `qmsg-error-message` headers carry the
   peer's error when it answered with one.
 - `request_failed` — terminal, classified:
@@ -108,9 +113,9 @@ Every request/reply outcome is a poll event or a synchronous error:
   | `RequestFailure` | Meaning |
   | --- | --- |
   | `deadline_exceeded` | `deadline_ms` elapsed per the node clock |
-  | `canceled` | `cancelInprocRequest` was called |
-  | `queue_full` | sync-only: peer queue full (see below) |
-  | `peer_closed` | sync-only: peer endpoint closed |
+  | `canceled` | `cancelRequest` was called |
+  | `queue_full` | The reply exceeded available completion bytes; also a synchronous send error |
+  | `peer_closed` | A pending QUIC session closed; also a synchronous closed-endpoint error |
   | `no_route` | sync-only: no peer / unknown dial |
 
 - `delivery` — a publication matched one of the node's filters:
@@ -119,7 +124,9 @@ Every request/reply outcome is a poll event or a synchronous error:
 - `message_dropped` — a message that will never deliver: late reply
   after cancel/deadline, queue-policy drop on a node-owned queue, or
   (QUIC) a malformed/oversized datagram.
-- `connected` / `closed` — endpoint/session lifecycle bookkeeping.
+- `connected` / `closed` — endpoint/session lifecycle bookkeeping. Use
+  `sessionStatus(id).state == .ready` to check QUIC usability after TLS and
+  HELLO, or `findReadySessionSupporting` to find a verified peer session.
 
 ## Backpressure and observability
 
@@ -141,11 +148,15 @@ Backpressure is observable, never hidden:
   `queue_high_water`, `events_dropped` — computed live from node
   counters plus node-owned queue stats. No metrics dependency; fold
   them into whatever exporter the host already runs.
-- **The event queue is bounded.** `NodeOptions.max_events` (default
-  1024) caps queued events; overflow drops the event (freeing its
-  payload), counts `events_dropped`, and counts message-carrying
-  drops in `dropped`. A stopped embedder loses events loudly in the
-  counters rather than growing memory.
+- **Ordinary events and request outcomes have separate bounds.**
+  `max_events` (default 1024) and `max_event_bytes` (default 16 MiB) bound
+  ordinary events. Lossy events count drops; inbound request draining
+  backpressures when space runs out. `max_requests` (default 1024) bounds
+  pending requests plus unread terminal outcomes. Admission reserves outcome
+  capacity, so ordinary event pressure cannot erase a reply or failure.
+  `max_request_bytes` and `max_completion_bytes` default to 16 MiB each.
+  A reply exceeding available completion bytes becomes `.queue_full`.
+  Consume outcomes with `poll` or `takeOutcome` to release reservations.
 
 ## Fault containment
 
@@ -181,11 +192,11 @@ fn onHandshake(app: *App, s: *Driver(App).Session) anyerror!void {
 ```
 
 Embedded sessions are pull-consumed like everything else: inbound
-requests arrive as `quic_request` events (correlation id + the
-request's stream), replies to the node's own outbound requests as
-`quic_reply` events keyed by (session, stream), and datagrams as
-`quic_delivery` events. Answer with `Node.replyQuic` (or
-`replyErrorQuic`) while the request event is alive; publish with
+requests arrive as `request` events, replies to the node's outbound requests
+as `reply` events keyed by local `request_id`, and datagrams as `delivery`
+events. QUIC events also carry `session_id` and optional `stream_id` metadata.
+Answer with `Node.reply(request.msg.reply_handle.?, outgoing)` while the
+event is alive, or retain the handle for asynchronous work; publish with
 `Node.publishQuic`. Credentials verify once at HELLO from the
 `auth_config` carried on the transport options passed to
 `EmbeddedDispatch.init`. Sizing for the embedder's Driver comes from
@@ -200,27 +211,24 @@ is the executable form.
 
 ### Outbound requests over QUIC: outcomes, not just replies
 
-`Node.requestQuic(session_id, outgoing)` sends a request on a QUIC
-session AND records it for terminal-outcome classification — the
-QUIC twin of `requestInproc`. It returns the stream the request
-rides; the `(session_id, stream_id)` pair keys every later surface: a
-`quic_reply` event (or a `recvReliable` pop — the session wrapper
-settles the pending entry for you), or exactly one
-`quic_request_failed` event when the request dies without one:
+`Node.request(.{ .quic = session_id }, outgoing)` sends and tracks a request.
+It returns a local `RequestId`; `reply` and `request_failed` carry that ID.
+An accepted request reserves a terminal outcome until it is consumed. Failures
+include:
 
 - `.deadline_exceeded` — the deadline passed against the node clock
   (`tick`'s `now_us`),
-- `.canceled` — you called `Node.cancelQuicRequest` (which also
+- `.canceled` — you called `Node.cancelRequest` (which also
   RESET/STOP_SENDINGs the stream when the node owns the connection),
-- `.peer_closed` — the session closed or was torn down.
+- `.peer_closed` — the session closed or was torn down,
+- `.queue_full` — an arriving reply could not fit the completion byte budget.
 
-Classification is first-wins and idempotent with a consumer's own
-pending table: whichever side observes an outcome first, the other
-ignores — see
-[QUIC_REQUEST_OUTCOMES.md](QUIC_REQUEST_OUTCOMES.md). Raw
-`queueReliable` sends remain untracked (a plain reliable send is not
-a request); send-path errors from `requestQuic` stay synchronous and
-map through `classifyRequestError` like the inproc ones.
+Classification is first-wins — see
+[QUIC_REQUEST_OUTCOMES.md](QUIC_REQUEST_OUTCOMES.md). Raw `queueReliable`
+sends remain untracked. `requestQuic` still returns a stream ID for compatibility;
+new code uses `Node.request` and its transport-independent local ID. Send-path
+errors remain synchronous. Direct inbox consumption requires explicit legacy
+delivery; it must not compete with the default Node event consumer.
 
 **QUIC pub/sub crosses the process wall.** `Node.subscribeQuic(filter,
 options)` subscribes the NODE on every QUIC session, current and
@@ -248,15 +256,11 @@ Three operational notes, each learned the hard way downstream:
   the handshake completes, requests flow, and subscriptions simply
   do not register — no error, no drop counter. Pattern announcement
   is a contract, not a formality.
-- **Dial-side deliveries are inbox-only by design.** `quic_delivery`
-  events fire for embedded (event-delivery) sessions; datagrams
-  arriving on the node's OWN dial sessions land in the session's
-  `recvDatagram()` inbox and surface nowhere in `poll` — the
-  direct-consumption twin of dial-side replies surfacing through
-  `recvReliable()` rather than `quic_reply` events. Consumers
-  driving dials drain both inboxes themselves. (If qmsg ever emits
-  dial-side `quic_delivery` events, consumers draining by hand can
-  delete their drain — first-wins, one or the other.)
+- **Both dialed and embedded sessions use canonical events by default.**
+  Poll `delivery` for datagrams and `reply` for responses. Do not also drain
+  their session inboxes. Older inbox consumers must select `.delivery =
+  .legacy`; select `.event_format = .legacy_transport` separately if they
+  still expect `quic_*` event names. See [MIGRATION.md](MIGRATION.md).
 - **A publication racing a reborn subscriber's re-sync loses, by
   design.** After a redial heals the mesh, the subscriber's set
   re-emits on its first ready tick; a publication sent before that

@@ -19,6 +19,8 @@ pub const InprocEndpoint = transport.inproc.PatternEndpoint;
 /// ids, encoding, retransmit/write queues, and flow control; it receives this
 /// metadata plus an owned Message and maps it to the appropriate QUIC work.
 pub const QuicSendMeta = struct {
+    /// Local generation: associate with the stream and restore on decoded replies.
+    local_correlation: u64 = 0,
     local_pattern: Pattern,
     peer_pattern: Pattern,
     operation: protocol.Operation,
@@ -43,9 +45,11 @@ pub const QuicAcceptsFn = *const fn (context: *anyopaque, subject: []const u8) b
 /// The driver still owns UDP, QUIC connection/session state, stream ids,
 /// encoding, and write progress.
 pub const QuicPeer = struct {
+    lifetime: ?*message.ReplyHandle.Target = null,
     pattern: Pattern,
     context: *anyopaque,
     send: QuicSendFn,
+    cancel: ?*const fn (*anyopaque, u64) void = null,
     accepts: ?QuicAcceptsFn = null,
 };
 
@@ -56,15 +60,19 @@ pub const QuicPeer = struct {
 /// a `QuicPeer` directly with the exact peer pattern. The driver must outlive
 /// the socket attachment; the socket stores this handle but does not own it.
 pub const QuicSessionDriver = struct {
+    lifetime: ?*message.ReplyHandle.Target = null,
     context: *anyopaque,
     send: QuicSendFn,
+    cancel: ?*const fn (*anyopaque, u64) void = null,
     accepts: ?QuicAcceptsFn = null,
 
     pub fn peer(self: QuicSessionDriver, peer_pattern: Pattern) QuicPeer {
         return .{
             .pattern = peer_pattern,
+            .lifetime = self.lifetime,
             .context = self.context,
             .send = self.send,
+            .cancel = self.cancel,
             .accepts = self.accepts,
         };
     }
@@ -96,6 +104,7 @@ pub const QuicSocketEndpoint = struct {
     context: *anyopaque,
     attach: QuicAttachFn,
     receive: QuicReceiveFn,
+    can_receive: ?*const fn (*anyopaque, usize) bool = null,
 
     pub fn attachDriver(self: QuicSocketEndpoint, driver: QuicSessionDriver) !void {
         try self.attach(self.context, driver);
@@ -106,8 +115,14 @@ pub const QuicSocketEndpoint = struct {
     }
 };
 
+pub const ReplyHandle = message.ReplyHandle;
+
 pub const Request = struct {
     message: message.Message,
+
+    pub fn replyHandle(self: Request) !ReplyHandle {
+        return (self.message.reply_handle orelse return error.InvalidState).retain();
+    }
 
     pub fn id(self: Request) message.MessageId {
         return self.message.id;
@@ -133,6 +148,7 @@ pub const Request = struct {
 /// (they reply later, from just the id they saw in an event) can still
 /// answer correctly.
 pub const ReplyKey = struct {
+    handle: ?ReplyHandle = null,
     id: message.MessageId,
     deadline_ms: ?u64 = null,
     /// Echoed as the reply subject when the outgoing reply leaves the
@@ -327,6 +343,17 @@ pub const ReqSocket = struct {
         try self.dial(.{ .inproc = .{ .network = network, .address = address } });
     }
 
+    /// Adapter entry point for a Node that owns request correlation itself.
+    pub fn sendUntrackedRequest(self: *ReqSocket, outgoing: message.OutgoingMessage) !message.MessageId {
+        return self.sendUntrackedRequestWithToken(outgoing, try self.core.nextCorrelation());
+    }
+
+    pub fn sendUntrackedRequestWithToken(self: *ReqSocket, outgoing: message.OutgoingMessage, token: u64) !message.MessageId {
+        const id = if (outgoing.id == 0) self.core.nextAvailableMessageId() else outgoing.id;
+        try self.core.sendToFirst(.rep, outgoing, .{ .id = id, .local_correlation = token });
+        return id;
+    }
+
     pub fn sendRequest(self: *ReqSocket, outgoing: message.OutgoingMessage) !message.MessageId {
         return self.sendRequestAt(outgoing, nowMs());
     }
@@ -334,10 +361,11 @@ pub const ReqSocket = struct {
     pub fn sendRequestAt(self: *ReqSocket, outgoing: message.OutgoingMessage, sent_at_ms: u64) !message.MessageId {
         _ = self.core.expireInflight(sent_at_ms);
         const id = if (outgoing.id == 0) self.core.nextAvailableMessageId() else outgoing.id;
-        try self.core.addInflight(id, outgoing.deadline_ms, sent_at_ms);
+        const token = try self.core.nextCorrelation();
+        try self.core.addInflight(id, token, outgoing.deadline_ms, sent_at_ms);
         errdefer _ = self.core.removeInflight(id);
 
-        try self.core.sendToFirst(.rep, outgoing, .{ .id = id });
+        try self.core.sendToFirst(.rep, outgoing, .{ .id = id, .local_correlation = token });
         return id;
     }
 
@@ -394,7 +422,7 @@ pub const ReqSocket = struct {
 
     pub fn recvAt(self: *ReqSocket, now_ms: u64) !message.Message {
         var reply = try self.core.recv();
-        self.core.completeInflight(reply.id, now_ms) catch |err| {
+        self.core.completeInflight(reply.id, reply.local_correlation, now_ms) catch |err| {
             reply.deinit();
             return err;
         };
@@ -410,7 +438,7 @@ pub const ReqSocket = struct {
             _ = self.core.expireInflight(now_ms);
             return null;
         };
-        self.core.completeInflight(reply.id, now_ms) catch |err| {
+        self.core.completeInflight(reply.id, reply.local_correlation, now_ms) catch |err| {
             reply.deinit();
             return err;
         };
@@ -504,6 +532,9 @@ pub const RepSocket = struct {
     }
 
     pub fn reply(self: *RepSocket, request_to_answer: Request, outgoing: message.OutgoingMessage) !void {
+        try validateOutgoing(outgoing, self.core.options.max_message_size, if (outgoing.subject.len == 0) request_to_answer.message.subject else null);
+        if (request_to_answer.message.reply_handle) |handle| return handle.reply(outgoing);
+        if (self.core.peers.items.len + self.core.quic_peers.items.len != 1) return error.InvalidState;
         try self.core.sendToFirst(.req, outgoing, .{
             .id = request_to_answer.message.id,
             .deadline_ms = request_to_answer.message.deadline_ms,
@@ -517,6 +548,9 @@ pub const RepSocket = struct {
     /// outgoing reply leaves its subject empty, and the request's
     /// deadline travels back on the reply.
     pub fn replyKey(self: *RepSocket, key: ReplyKey, outgoing: message.OutgoingMessage) !void {
+        try validateOutgoing(outgoing, self.core.options.max_message_size, if (outgoing.subject.len == 0) key.subject else null);
+        if (key.handle) |handle| return handle.reply(outgoing);
+        if (self.core.peers.items.len + self.core.quic_peers.items.len != 1) return error.InvalidState;
         try self.core.sendToFirst(.req, outgoing, .{
             .id = key.id,
             .deadline_ms = key.deadline_ms,
@@ -752,12 +786,14 @@ pub const PullSocket = struct {
 };
 
 const MessageOverrides = struct {
+    local_correlation: u64 = 0,
     id: ?message.MessageId = null,
     deadline_ms: ?u64 = null,
     subject: ?[]const u8 = null,
 };
 
 const InflightRequest = struct {
+    local_correlation: u64,
     id: message.MessageId,
     deadline_ms: ?u64,
     sent_at_ms: u64,
@@ -787,7 +823,9 @@ fn Core(comptime pattern: Pattern) type {
         subscriber_registry: pubsub.Registry,
         inflight: std.ArrayList(InflightRequest) = .empty,
         next_id: message.MessageId = 1,
+        next_correlation: u64 = 1,
         next_peer: usize = 0,
+        reply_target: ?*ReplyHandle.Target = null,
 
         fn init(allocator: std.mem.Allocator, options: Options) !Self {
             if (options.recv_queue.max_messages == 0) return error.InvalidState;
@@ -804,10 +842,16 @@ fn Core(comptime pattern: Pattern) type {
         }
 
         fn deinit(self: *Self) void {
+            for (self.inflight.items) |pending| self.cancelQuicToken(pending.local_correlation);
+            if (self.reply_target) |target| {
+                target.invalidate();
+                target.release();
+            }
             self.inbox.deinit();
             self.local_subscriptions.deinit();
             self.subscriber_registry.deinit();
             self.inflight.deinit(self.allocator);
+            for (self.quic_peers.items) |peer| if (peer.lifetime) |target| target.release();
             self.quic_peers.deinit(self.allocator);
             self.peers.deinit(self.allocator);
             self.* = undefined;
@@ -839,6 +883,7 @@ fn Core(comptime pattern: Pattern) type {
                 .context = @ptrCast(self),
                 .attach = Self.attachQuicEndpointDriver,
                 .receive = Self.receiveQuicEndpointMessage,
+                .can_receive = Self.canReceiveQuicMessage,
             };
         }
 
@@ -860,6 +905,7 @@ fn Core(comptime pattern: Pattern) type {
             if (!pattern.canSendTo(peer.pattern)) return error.InvalidPattern;
             if (self.hasQuicPeer(peer)) return;
             try self.quic_peers.append(self.allocator, peer);
+            if (peer.lifetime) |target| target.refs += 1;
         }
 
         fn attachQuicEndpointDriver(context: *anyopaque, driver: QuicSessionDriver) anyerror!void {
@@ -870,6 +916,12 @@ fn Core(comptime pattern: Pattern) type {
         fn receiveQuicMessage(self: *Self, msg: message.Message) !void {
             if (!quicAttachmentSupported(pattern)) return error.UnsupportedTransport;
             try Self.enqueue(self, msg);
+        }
+
+        fn canReceiveQuicMessage(context: *anyopaque, bytes: usize) bool {
+            const self: *Self = @ptrCast(@alignCast(context));
+            return self.inbox.len() < self.options.recv_queue.max_messages and
+                bytes <= self.options.recv_queue.max_bytes -| self.inbox.bytes();
         }
 
         fn receiveQuicEndpointMessage(context: *anyopaque, msg: message.Message) anyerror!void {
@@ -908,7 +960,13 @@ fn Core(comptime pattern: Pattern) type {
                 const effective_subject = overrides.subject orelse outgoing.subject;
                 if (!peer.accepts(peer.context, effective_subject)) continue;
 
-                const msg = try cloneOutgoing(self.allocator, outgoing, overrides);
+                var msg = try cloneOutgoing(self.allocator, outgoing, overrides);
+                if (comptime pattern == .req) {
+                    self.attachReplyHandle(&msg) catch |err| {
+                        msg.deinit();
+                        return err;
+                    };
+                }
                 try deliver(peer, msg);
                 return;
             }
@@ -1070,7 +1128,7 @@ fn Core(comptime pattern: Pattern) type {
             }
         }
 
-        fn addInflight(self: *Self, id: message.MessageId, deadline_ms: ?u64, sent_at_ms: u64) !void {
+        fn addInflight(self: *Self, id: message.MessageId, token: u64, deadline_ms: ?u64, sent_at_ms: u64) !void {
             if (pattern != .req) return error.InvalidPattern;
             if (id == 0) return error.InvalidState;
             _ = self.expireInflight(sent_at_ms);
@@ -1079,6 +1137,7 @@ fn Core(comptime pattern: Pattern) type {
                 if (existing.id == id) return error.DuplicateInflightRequest;
             }
             try self.inflight.append(self.allocator, .{
+                .local_correlation = token,
                 .id = id,
                 .deadline_ms = deadline_ms,
                 .sent_at_ms = sent_at_ms,
@@ -1090,16 +1149,17 @@ fn Core(comptime pattern: Pattern) type {
             for (self.inflight.items, 0..) |existing, index| {
                 if (existing.id == id) {
                     _ = self.inflight.orderedRemove(index);
+                    self.cancelQuicToken(existing.local_correlation);
                     return true;
                 }
             }
             return false;
         }
 
-        fn completeInflight(self: *Self, id: message.MessageId, now_ms: u64) !void {
+        fn completeInflight(self: *Self, id: message.MessageId, token: u64, now_ms: u64) !void {
             if (pattern != .req) return error.InvalidPattern;
             for (self.inflight.items, 0..) |existing, index| {
-                if (existing.id == id) {
+                if (existing.id == id and (token == 0 or token == existing.local_correlation)) {
                     _ = self.inflight.orderedRemove(index);
                     if (existing.isExpired(now_ms)) return error.DeadlineExceeded;
                     return;
@@ -1115,7 +1175,8 @@ fn Core(comptime pattern: Pattern) type {
             var index: usize = 0;
             while (index < self.inflight.items.len) {
                 if (self.inflight.items[index].isExpired(now_ms)) {
-                    _ = self.inflight.orderedRemove(index);
+                    const pending = self.inflight.orderedRemove(index);
+                    self.cancelQuicToken(pending.local_correlation);
                     expired += 1;
                     continue;
                 }
@@ -1131,6 +1192,16 @@ fn Core(comptime pattern: Pattern) type {
 
         fn pubsubId(self: *Self) pubsub.PeerId {
             return @intFromPtr(self);
+        }
+
+        fn cancelQuicToken(self: *Self, token: u64) void {
+            for (self.quic_peers.items) |peer| if (peer.cancel) |cancel| cancel(peer.context, token);
+        }
+
+        fn nextCorrelation(self: *Self) !u64 {
+            const token = self.next_correlation;
+            self.next_correlation = std.math.add(u64, token, 1) catch return error.TooManyInflightRequests;
+            return token;
         }
 
         fn nextMessageId(self: *Self) message.MessageId {
@@ -1168,6 +1239,20 @@ fn Core(comptime pattern: Pattern) type {
                 if (existing.pattern == peer.pattern and existing.context == peer.context) return true;
             }
             return false;
+        }
+
+        fn attachReplyHandle(self: *Self, msg: *message.Message) !void {
+            if (self.reply_target == null) self.reply_target = try ReplyHandle.Target.create(self.allocator, self, sendReply);
+            msg.reply_handle = try ReplyHandle.init(self.reply_target.?, msg.local_correlation, msg.outgoing());
+        }
+
+        fn sendReply(context: *anyopaque, token: u64, outgoing: message.OutgoingMessage) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            try validateOutgoing(outgoing, self.options.max_message_size, null);
+            var owned = try message.Message.init(self.allocator, outgoing);
+            owned.local_correlation = token;
+            errdefer owned.deinit();
+            try Self.enqueue(context, owned);
         }
 
         fn enqueue(context: *anyopaque, msg: message.Message) anyerror!void {
@@ -1261,6 +1346,7 @@ fn deliver(peer: InprocEndpoint, msg: message.Message) !void {
 fn deliverQuic(local_pattern: Pattern, peer: QuicPeer, msg: message.Message) !void {
     var owned = msg;
     const meta: QuicSendMeta = .{
+        .local_correlation = owned.local_correlation,
         .local_pattern = local_pattern,
         .peer_pattern = peer.pattern,
         .operation = quicOperation(local_pattern),
@@ -1322,7 +1408,7 @@ fn cloneOutgoing(
     const deadline_ms = outgoing.deadline_ms orelse overrides.deadline_ms;
     const id = overrides.id orelse outgoing.id;
 
-    return message.Message.init(allocator, .{
+    var msg = try message.Message.init(allocator, .{
         .subject = effective_subject,
         .id = id,
         .flags = outgoing.flags,
@@ -1330,6 +1416,8 @@ fn cloneOutgoing(
         .headers = outgoing.headers,
         .body = outgoing.body,
     });
+    msg.local_correlation = overrides.local_correlation;
+    return msg;
 }
 
 pub fn deinitMessage(msg: *message.Message) void {
@@ -2337,4 +2425,92 @@ fn expectNoRequest(maybe: ?Request) !void {
     var unexpected = maybe orelse return;
     defer unexpected.deinit();
     return error.TestUnexpectedResult;
+}
+
+test "reply handles preserve the requester with colliding message IDs" {
+    const a = std.testing.allocator;
+    var network = transport.inproc.Network.init(a);
+    defer network.deinit();
+    var rep = try Socket(.rep).init(a, .{});
+    defer rep.deinit();
+    var first = try Socket(.req).init(a, .{});
+    defer first.deinit();
+    var second = try Socket(.req).init(a, .{});
+    defer second.deinit();
+    try rep.listenInproc(&network, "return-route");
+    try first.dialInproc(&network, "return-route");
+    try second.dialInproc(&network, "return-route");
+    try std.testing.expectEqual(try first.sendRequest(.{ .subject = "echo" }), try second.sendRequest(.{ .subject = "echo" }));
+    var one = try rep.recv();
+    defer one.deinit();
+    var two = try rep.recv();
+    var handle = try two.replyHandle();
+    defer handle.deinit();
+    two.deinit(); // deferred reply owns no request payload
+    try handle.reply(.{ .subject = "", .body = "second" });
+    try std.testing.expect((try first.tryRecv()) == null);
+    var response = try second.recv();
+    defer response.deinit();
+    try std.testing.expectEqualStrings("second", response.body);
+    try std.testing.expectError(error.InvalidState, handle.reply(.{ .subject = "", .body = "again" }));
+}
+
+test "retained reply handle fails safely after requester teardown" {
+    const a = std.testing.allocator;
+    var network = transport.inproc.Network.init(a);
+    defer network.deinit();
+    var rep = try Socket(.rep).init(a, .{});
+    defer rep.deinit();
+    var req = try Socket(.req).init(a, .{});
+    try rep.listenInproc(&network, "stale-route");
+    try req.dialInproc(&network, "stale-route");
+    _ = try req.sendRequest(.{ .subject = "echo" });
+    var request = try rep.recv();
+    defer request.deinit();
+    var handle = try request.replyHandle();
+    defer handle.deinit();
+    req.deinit();
+    try std.testing.expectError(error.EndpointClosed, handle.reply(.{ .subject = "", .body = "late" }));
+}
+
+test "reply handles preserve both reply sender and receiver message limits" {
+    const allocator = std.testing.allocator;
+    var req = try ReqSocket.init(allocator, .{ .max_message_size = 128, .recv_queue = .{ .max_bytes = 4096 } });
+    defer req.deinit();
+    var rep = try RepSocket.init(allocator, .{ .max_message_size = 128 });
+    defer rep.deinit();
+    try req.connectInproc(rep.inprocEndpoint());
+    _ = try req.sendRequest(.{ .subject = "echo" });
+    var request = try rep.recv();
+    defer request.deinit();
+    const large: [1024]u8 = @splat('x');
+    try std.testing.expectError(error.MessageTooLarge, rep.reply(request, .{ .subject = "", .body = &large }));
+    try std.testing.expectError(error.MessageTooLarge, request.message.reply_handle.?.reply(.{ .subject = "", .body = &large }));
+    try rep.reply(request, .{ .subject = "", .body = "fits" });
+    var reply = try req.recv();
+    defer reply.deinit();
+    try std.testing.expectEqualStrings("fits", reply.body);
+}
+
+test "socket inproc generations reject a canceled reply after ID reuse" {
+    const allocator = std.testing.allocator;
+    var req = try ReqSocket.init(allocator, .{});
+    defer req.deinit();
+    var rep = try RepSocket.init(allocator, .{});
+    defer rep.deinit();
+    try req.connectInproc(rep.inprocEndpoint());
+    _ = try req.sendRequestAt(.{ .subject = "echo", .id = 42 }, 1);
+    var old = try rep.recv();
+    defer old.deinit();
+    try std.testing.expect(req.cancelRequest(42));
+    _ = try req.sendRequestAt(.{ .subject = "echo", .id = 42 }, 2);
+    var fresh = try rep.recv();
+    defer fresh.deinit();
+    try rep.reply(old, .{ .subject = "", .body = "old" });
+    try std.testing.expectError(error.UnexpectedFrame, req.recvAt(3));
+    try std.testing.expectEqual(@as(usize, 1), req.inflightCount());
+    try rep.reply(fresh, .{ .subject = "", .body = "fresh" });
+    var reply = try req.recvAt(3);
+    defer reply.deinit();
+    try std.testing.expectEqualStrings("fresh", reply.body);
 }

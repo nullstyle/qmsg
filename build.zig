@@ -4,32 +4,6 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // .optimize is deliberately NOT forwarded: dependency builds on
-    // this toolchain reject an `optimize` option (quic-zig's build
-    // errors with `invalid option: optimize` before any module is
-    // requested), which made qmsg itself unbuildable as a dependency
-    // of a consumer that forwards optimize here. Consumers forward
-    // .optimize to qmsg; qmsg forwards only .target onward.
-    // `.optimize` IS forwarded to quic (and quic forwards it to boringssl):
-    // quic v0.19.0 declares both options — capnp-zig already forwards
-    // `.optimize` to the same pin — and aligning the option set exactly is
-    // what lets a consumer link qmsg and capnp-zig (both on quic v0.19.0)
-    // in one binary: the build system only deduplicates the shared quic
-    // module when every parent configures it identically. The historical
-    // note below no longer applies to this pin.
-    //
-    // (Earlier versions of this comment said quic's build rejected an
-    // `optimize` option; that was true of an older quic build.zig and was
-    // the reason qmsg forwarded only `.target`. Consumers forward
-    // `.optimize` to qmsg; qmsg forwards `.target`, `.optimize`, and the
-    // sanitize-c policy onward.)
-    //
-    // `.@"sanitize-c" = "trap"` mirrors capnp-zig's setting for the same
-    // quic pin: BoringSSL's C/C++ objects are linked as static archives
-    // into Zig binaries, so ReleaseSafe links fail on Linux/lld without
-    // either a UBSan runtime or trap-based checks (`trap` keeps the checks
-    // and needs no runtime). It also keeps this dependency's option map
-    // identical to capnp-zig's, preserving the shared-module dedup above.
     const paseto_dep = b.dependency("paseto", .{
         .target = target,
     });

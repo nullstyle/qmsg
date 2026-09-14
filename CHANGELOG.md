@@ -7,6 +7,28 @@ changes.
 
 ## [Unreleased]
 
+- Accepted QUIC sessions now receive replies to their own initiated requests.
+  Server drivers register those local bidirectional receive streams with bounded
+  tracking capacity. The released-QUIC fallback also avoids rediscovering an
+  already consumed request while its reply half remains open. A real two-node
+  regression covers simultaneous requests in both directions.
+- Standalone `Node` now defaults to canonical events for inproc and QUIC.
+  `request`, `cancelRequest`, and `reply` use a local `RequestId` and retained
+  reply handles. Older transport-specific events and direct inbox consumers
+  have explicit compatibility options; see [MIGRATION.md](docs/MIGRATION.md).
+- Accepted requests reserve bounded terminal outcomes until `poll` or
+  `takeOutcome` consumes them. Separate count and byte budgets cover pending
+  requests, replies, and ordinary events. Reply routing survives request-body
+  release and invalidates safely on endpoint teardown; cancellation and stream
+  termination settle pending requests.
+- `sessionStatus` and `findReadySessionSupporting` expose verified readiness
+  and peer capabilities. Dials can require `expected_peer_spki` and HELLO
+  `required_peer_patterns`. Configured message authorization runs before Node,
+  socket, and App consumption without a handler-side opt-in.
+- Dialed QUIC sessions use the common `quic.app.ConnectionDriver` when the
+  imported QUIC module provides it; the pinned released dependency retains a
+  compatible fallback. Embedded examples and guides use the canonical API.
+
 ## [0.7.0] - 2026-09-06
 
 The two-node release. Nothing in this repository had ever run two

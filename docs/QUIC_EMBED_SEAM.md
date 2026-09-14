@@ -1,9 +1,11 @@
 # QUIC inbound embed seam (Phase C)
 
-**Status: BUILT as of v0.1.4** — `transport.quic_embedded.EmbeddedDispatch`,
+**Status: implemented; originally shipped in v0.1.4.** The current canonical
+event and authorization changes are described in [MIGRATION.md](MIGRATION.md).
+`transport.quic_embedded.EmbeddedDispatch`,
 with [examples/embedded_quic_attach.zig](../examples/embedded_quic_attach.zig)
 as the executable contract and a hermetic foreign-driver end-to-end
-test (request event → `replyQuic` → reply received; datagram
+test (request event → `Node.reply` → reply received; datagram
 delivery event; will-close teardown ride-along). The design below is
 the record of what was built and why; the consumer (mruby-quic)
 reviewed and approved it with these decisions:
@@ -13,9 +15,9 @@ reviewed and approved it with these decisions:
   delegate wholly to the dispatch, everything else is the embedder's.
 - **Q2 — PULL model** (emphatic): embedded sessions are
   `event_delivery` — inbound messages surface through `Node.poll`
-  events (`quic_request`, `quic_reply`, `quic_delivery`), the same
+  events (`request`, `reply`, `request_failed`, `delivery`), the same
   registry as the inproc embedded surface; `runOnce` never touches
-  them. Replies correlate by (session, stream).
+  them. Replies correlate by local `RequestId`, with session/stream metadata.
 - **Q3 — AuthConfig once at init**: credentials ride the transport
   options' `auth_config` into `EmbeddedDispatch.init` and verify once
   at HELLO acceptance.
@@ -156,14 +158,17 @@ Three layers, in order, fail-closed:
    registry, challenge binding, replay hooks). A rejected credential
    closes the qmsg session (`beginClosing`) — it must never reach
    dispatch. The resulting `Authorization` caches on the Session.
-3. **Per-message authorization** — dispatch-time enforcement via
-   `Context.requireRouteAccess()`: pattern, subject (`SubjectPolicy`
-   filters), datagram permission, message size, against the cached
-   `Authorization`. This is the embedder's handler-side gate and it
-   is already the enforcement point on every dispatch path.
+3. **Per-message authorization** — qmsg automatically checks pattern,
+   subject (`SubjectPolicy` filters), datagram permission, and message size
+   against cached session policy before delivery to Node events, socket
+   consumers, or App handlers. Decoded messages supplied directly to App
+   dispatch are checked there as well. `Context.requireRouteAccess()` remains
+   an optional explicit authenticated-only check; configured policy enforcement
+   does not depend on a handler remembering to call it.
 
 Rule of thumb: credentials verify once at HELLO; policy checks run
-per message; nothing authorizes at the socket layer.
+per message, before application consumption. Anonymous sessions remain usable
+only when session configuration permits them.
 
 ## Coexistence of the two hook sets
 

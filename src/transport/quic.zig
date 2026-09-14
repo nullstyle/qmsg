@@ -226,7 +226,11 @@ pub const QuicOptions = struct {
     peer_id: []const u8 = "qmsg",
     role_flags: u64 = 0,
     supported_patterns: u64 = control.PatternBits.all,
+    /// Capabilities the peer must announce; a mismatch rejects HELLO.
+    required_peer_patterns: u64 = 0,
     max_message_size: usize = 1024 * 1024,
+    max_queued_messages: usize = 256,
+    max_queued_bytes: usize = 16 * 1024 * 1024,
     max_header_bytes: usize = 16 * 1024,
     max_header_count: usize = 32,
     datagram_enabled: bool = false,
@@ -518,6 +522,7 @@ pub const QuicSession = struct {
         self.peer_hello_received = true;
 
         self.session.peer_id = self.peer_id.?;
+        self.session.peer_supported_patterns = hello.supported_patterns;
         self.session.peer_heartbeat_interval_ms = hello.heartbeat_interval_ms;
         self.session.datagram_enabled = self.options.datagram_enabled and hello.datagram_enabled;
         self.session.max_message_size = @min(self.options.max_message_size, hello.max_message_size);
@@ -528,6 +533,7 @@ pub const QuicSession = struct {
         if (hello.wire_version != control.default_wire_version) return error.VersionMismatch;
         if (hello.peer_id.len == 0) return error.PeerIdTooLarge;
         if (hello.supported_patterns == 0) return error.InvalidPattern;
+        if ((hello.supported_patterns & self.options.required_peer_patterns) != self.options.required_peer_patterns) return error.UnsupportedPattern;
         if ((hello.supported_patterns & ~control.PatternBits.all) != 0) return error.InvalidPattern;
         if ((hello.supported_patterns & self.options.supported_patterns) == 0) return error.InvalidPattern;
         // The announced id must answer to the identity the handshake
@@ -1285,4 +1291,18 @@ test "request correlation requires same stream and message id" {
         .subject = "user.get",
         .id = 0,
     }));
+}
+
+test "HELLO rejects a missing required pattern despite another compatible pattern" {
+    const allocator = std.testing.allocator;
+    var sess = try QuicSession.init(allocator, 1, .client, .{
+        .supported_patterns = control.PatternBits.req | control.PatternBits.sub,
+        .required_peer_patterns = control.PatternBits.rep,
+    });
+    defer sess.deinit();
+    try sess.onQuicReady();
+    const bytes = try encodeHelloControlStream(allocator, .{ .supported_patterns = control.PatternBits.pub_ });
+    defer allocator.free(bytes);
+    try std.testing.expectError(error.UnsupportedPattern, sess.acceptPeerControl(bytes));
+    try std.testing.expectEqual(State.quic_ready, sess.state());
 }

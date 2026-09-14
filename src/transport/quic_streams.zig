@@ -92,11 +92,11 @@ pub const QuicConnectionAdapter = struct {
     }
 
     pub fn streamReceiveStatus(self: *QuicConnectionAdapter, stream_id: u64) ?ReceiveStatus {
-        const stream = self.conn.stream(stream_id) orelse return null;
+        const state = self.conn.streamRecvState(stream_id) orelse return null;
         return .{
-            .reset = stream.recv.reset != null,
-            .final_size = stream.recv.final_size,
-            .read_offset = stream.recv.read_offset,
+            .reset = state.reset_seen,
+            .final_size = state.final_size,
+            .read_offset = state.read_offset,
         };
     }
 };
@@ -203,15 +203,16 @@ pub const ControlStreamReceiver = struct {
         defer self.allocator.free(scratch);
 
         while (true) {
-            const n = try transport.streamRead(self.stream_id, scratch);
+            const room = @min(scratch.len, self.options.max_buffered_bytes - self.bytes.items.len);
+            if (room == 0) {
+                if (try transport.streamRead(self.stream_id, scratch[0..1]) != 0) return error.FrameTooLarge;
+                break;
+            }
+            try self.bytes.ensureUnusedCapacity(self.allocator, room);
+            const n = try transport.streamRead(self.stream_id, scratch[0..room]);
             if (n == 0) break;
             result.bytes_read += n;
-            if (n > self.options.max_buffered_bytes or
-                self.bytes.items.len > self.options.max_buffered_bytes - n)
-            {
-                return error.FrameTooLarge;
-            }
-            try self.bytes.appendSlice(self.allocator, scratch[0..n]);
+            self.bytes.appendSliceAssumeCapacity(scratch[0..n]);
         }
 
         result.frames_read = try self.parseAvailable(out);
@@ -235,6 +236,13 @@ pub const ControlStreamReceiver = struct {
     }
 
     fn parseAvailable(self: *ControlStreamReceiver, out: *std.ArrayList(control.Frame)) !usize {
+        const initial_len = out.items.len;
+        const initial_type_seen = self.stream_type_seen;
+        errdefer {
+            for (out.items[initial_len..]) |*frame| frame.deinit();
+            out.shrinkRetainingCapacity(initial_len);
+            self.stream_type_seen = initial_type_seen;
+        }
         var consumed: usize = 0;
         var frames_read: usize = 0;
 
@@ -367,20 +375,24 @@ pub const ReliableMessageReceiver = struct {
         try self.checkStatus(transport);
         var scratch: [4096]u8 = undefined;
         while (true) {
-            const n = try transport.streamRead(self.stream_id, &scratch);
-            if (n == 0) break;
-            if (n > self.codec_options.max_message_size or
-                self.bytes.items.len > self.codec_options.max_message_size - n)
-            {
-                return error.MessageTooLarge;
+            const room = @min(scratch.len, self.codec_options.max_message_size - self.bytes.items.len);
+            if (room == 0) {
+                if (try transport.streamRead(self.stream_id, scratch[0..1]) != 0) return error.MessageTooLarge;
+                break;
             }
-            try self.bytes.appendSlice(self.allocator, scratch[0..n]);
+            // Reserve before consuming transport bytes. Allocation failure leaves
+            // the read offset unchanged and the same chunk safely retryable.
+            try self.bytes.ensureUnusedCapacity(self.allocator, room);
+            const n = try transport.streamRead(self.stream_id, scratch[0..room]);
+            if (n == 0) break;
+            self.bytes.appendSliceAssumeCapacity(scratch[0..n]);
         }
 
         if (!try self.streamComplete(transport)) return null;
 
+        const decoded = try decodeReliableMessage(self.allocator, self.bytes.items, self.codec_options);
         self.decoded = true;
-        return try decodeReliableMessage(self.allocator, self.bytes.items, self.codec_options);
+        return decoded;
     }
 
     fn checkStatus(self: *ReliableMessageReceiver, transport: anytype) !void {
@@ -876,4 +888,65 @@ test "request correlation rejects mismatched reply metadata" {
 
     reply.id = 100;
     try std.testing.expectError(error.UnexpectedFrame, correlation.expectReply(4, reply));
+}
+
+test "reliable decoder allocation failures preserve bytes and retry state" {
+    const allocator = std.testing.allocator;
+    const encoded = try encodeReliableMessage(allocator, .{ .subject = "retry", .id = 9, .body = "exactly once" }, .{});
+    defer allocator.free(encoded);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var io: FakeStream = .{ .allocator = allocator, .incoming = encoded, .readable_len = encoded.len };
+    defer io.deinit();
+    var receiver = ReliableMessageReceiver.init(failing.allocator(), 0, .{});
+    defer receiver.deinit();
+    try std.testing.expectError(error.OutOfMemory, receiver.pump(&io));
+    try std.testing.expectEqual(@as(usize, 0), io.read_offset);
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expect((try receiver.pump(&io)) == null);
+    try std.testing.expectEqual(encoded.len, io.read_offset);
+    io.final_size = encoded.len;
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, receiver.pump(&io));
+    try std.testing.expect(!receiver.decoded);
+    try std.testing.expectEqualSlices(u8, encoded, receiver.bytes.items);
+    failing.fail_index = std.math.maxInt(usize);
+    var msg = (try receiver.pump(&io)).?;
+    defer msg.deinit();
+    try std.testing.expectEqualStrings("exactly once", msg.body);
+    try std.testing.expectEqual(@as(u64, 9), msg.id);
+    try std.testing.expectEqual(encoded.len, io.read_offset);
+}
+
+test "control decode allocation failure rolls back an entire output batch" {
+    const allocator = std.testing.allocator;
+    const frames = [_]control.Frame{
+        .{ .subscribe = .{ .filter = "first" } },
+        .{ .subscribe = .{ .filter = "second" } },
+    };
+    const encoded = try encodeControlStream(allocator, &frames, .{});
+    defer allocator.free(encoded);
+    for (0..3) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        var receiver = ControlStreamReceiver.init(failing.allocator(), 2, .{});
+        defer receiver.deinit();
+        try receiver.bytes.appendSlice(allocator, encoded);
+        var output: std.ArrayList(control.Frame) = .empty;
+        defer {
+            for (output.items) |*frame| frame.deinit();
+            output.deinit(allocator);
+        }
+        try output.ensureTotalCapacity(allocator, 2);
+        _ = receiver.parseAvailable(&output) catch |err| retry: {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 0), output.items.len);
+            try std.testing.expectEqualSlices(u8, encoded, receiver.bytes.items);
+            try std.testing.expect(!receiver.stream_type_seen);
+            failing.fail_index = std.math.maxInt(usize);
+            break :retry try receiver.parseAvailable(&output);
+        };
+        try std.testing.expectEqual(@as(usize, 2), output.items.len);
+        try std.testing.expectEqualStrings("first", output.items[0].subscribe.filter);
+        try std.testing.expectEqualStrings("second", output.items[1].subscribe.filter);
+        try std.testing.expectEqual(@as(usize, 0), receiver.bytes.items.len);
+    }
 }

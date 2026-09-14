@@ -38,8 +38,81 @@ pub const OutgoingMessage = struct {
     body: []const u8 = &.{},
 };
 
+/// Local return capability. Never serialized. Retain a copy for a deferred reply;
+/// invalidation makes replies to closed/replaced endpoints fail safely.
+pub const ReplyHandle = struct {
+    state: *State,
+
+    pub const Target = struct {
+        allocator: std.mem.Allocator,
+        refs: usize = 1,
+        context: ?*anyopaque,
+        send: *const fn (*anyopaque, u64, OutgoingMessage) anyerror!void,
+
+        pub fn create(allocator: std.mem.Allocator, context: *anyopaque, send: *const fn (*anyopaque, u64, OutgoingMessage) anyerror!void) !*Target {
+            const target = try allocator.create(Target);
+            target.* = .{ .allocator = allocator, .context = context, .send = send };
+            return target;
+        }
+        pub fn invalidate(self: *Target) void {
+            self.context = null;
+        }
+        pub fn release(self: *Target) void {
+            self.refs -= 1;
+            if (self.refs == 0) self.allocator.destroy(self);
+        }
+    };
+    const State = struct {
+        target: *Target,
+        refs: usize = 1,
+        route: u64,
+        id: MessageId,
+        deadline_ms: ?u64,
+        subject: []u8,
+        completed: bool = false,
+    };
+
+    pub fn init(target: *Target, route: u64, request: OutgoingMessage) !ReplyHandle {
+        const state = try target.allocator.create(State);
+        errdefer target.allocator.destroy(state);
+        const subject = try target.allocator.dupe(u8, request.subject);
+        target.refs += 1;
+        state.* = .{ .target = target, .route = route, .id = request.id, .deadline_ms = request.deadline_ms, .subject = subject };
+        return .{ .state = state };
+    }
+    pub fn retain(self: ReplyHandle) ReplyHandle {
+        self.state.refs += 1;
+        return self;
+    }
+    pub fn deinit(self: *ReplyHandle) void {
+        const state = self.state;
+        state.refs -= 1;
+        if (state.refs == 0) {
+            const target = state.target;
+            target.allocator.free(state.subject);
+            target.allocator.destroy(state);
+            target.release();
+        }
+        self.* = undefined;
+    }
+    pub fn reply(self: ReplyHandle, outgoing: OutgoingMessage) !void {
+        const state = self.state;
+        const context = state.target.context orelse return error.EndpointClosed;
+        if (state.completed) return error.InvalidState;
+        var effective = outgoing;
+        effective.id = state.id;
+        if (effective.subject.len == 0) effective.subject = state.subject;
+        if (effective.deadline_ms == null) effective.deadline_ms = state.deadline_ms;
+        try state.target.send(context, state.route, effective);
+        if (effective.flags.final) state.completed = true;
+    }
+};
+
 pub const Message = struct {
     allocator: std.mem.Allocator,
+    reply_handle: ?ReplyHandle = null,
+    /// Local inproc request generation; never serialized or copied to an outgoing frame.
+    local_correlation: u64 = 0,
     subject: []u8,
     id: MessageId = 0,
     flags: Flags = .{},
@@ -93,7 +166,7 @@ pub const Message = struct {
     }
 
     pub fn clone(self: Message, allocator: std.mem.Allocator) !Message {
-        return init(allocator, .{
+        var copy = try init(allocator, .{
             .subject = self.subject,
             .id = self.id,
             .flags = self.flags,
@@ -101,6 +174,9 @@ pub const Message = struct {
             .headers = self.headers,
             .body = self.body,
         });
+        copy.local_correlation = self.local_correlation;
+        if (self.reply_handle) |handle| copy.reply_handle = handle.retain();
+        return copy;
     }
 
     pub fn outgoing(self: Message) OutgoingMessage {
@@ -115,6 +191,7 @@ pub const Message = struct {
     }
 
     pub fn deinit(self: *Message) void {
+        if (self.reply_handle) |*handle| handle.deinit();
         for (self.headers) |header| {
             freeConst(self.allocator, header.name);
             freeConst(self.allocator, header.value);

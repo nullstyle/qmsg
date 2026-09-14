@@ -247,6 +247,65 @@ test "two independent nodes complete a request across real UDP" {
     return error.ReplyTimeout;
 }
 
+test "accepted QUIC sessions originate requests and receive replies on their own streams" {
+    var pair: Pair = undefined;
+    pair.setUp(std.testing.allocator, .{}) catch |err| return skipIfNoUdp(err);
+    defer pair.tearDown();
+    // Exercise the same canonical pull interface on both endpoints. Calling
+    // runOnce through Pair.step cannot consume these requests in event mode.
+    pair.server.node.options.delivery = .events;
+    pair.client.node.options.delivery = .events;
+    try pair.driveUntilReady();
+    const accepted = pair.serverRuntime() orelse return error.SessionMissing;
+    const server_session = accepted.id();
+
+    // Two consecutive server-originated streams verify registration and reuse,
+    // while an ordinary client request exercises both directions together.
+    for (0..2) |round| {
+        const outbound = try pair.server.node.request(.{ .quic = server_session }, .{
+            .subject = "client.work",
+            .body = "request from accepted connection",
+            .id = @intCast(101 + round),
+            .deadline_ms = 1000,
+        });
+        const reverse = try pair.client.node.request(.{ .quic = pair.client_session }, .{
+            .subject = "server.work",
+            .body = "simultaneous reverse request",
+            .id = @intCast(201 + round),
+            .deadline_ms = 1000,
+        });
+        var got_outbound = false;
+        var got_reverse = false;
+        for (0..2000) |_| {
+            try pair.step();
+            for ([_]*node_mod.Node{ &pair.server.node, &pair.client.node }, 0..) |node, side| {
+                var events: [16]node_mod.Event = undefined;
+                const count = try node.poll(&events);
+                defer for (events[0..count]) |*event| event.deinit();
+                for (events[0..count]) |event| switch (event) {
+                    .request => |request| {
+                        try node.reply(request.msg.reply_handle orelse return error.ReplyHandleMissing, .{
+                            .subject = "",
+                            .body = request.msg.body,
+                        });
+                    },
+                    .reply => |reply| {
+                        try std.testing.expectEqual(if (side == 0) outbound else reverse, reply.request_id);
+                        try std.testing.expectEqual(@as(?u64, if (side == 0) server_session else pair.client_session), reply.session_id);
+                        try std.testing.expectEqualStrings(if (side == 0) "request from accepted connection" else "simultaneous reverse request", reply.msg.body);
+                        if (side == 0) got_outbound = true else got_reverse = true;
+                    },
+                    .request_failed => return error.RequestFailed,
+                    else => {},
+                };
+            }
+            if (got_outbound and got_reverse) break;
+        }
+        try std.testing.expect(got_outbound);
+        try std.testing.expect(got_reverse);
+    }
+}
+
 test "each node learns the other's certificate identity" {
     const allocator = std.testing.allocator;
     var pair: Pair = undefined;

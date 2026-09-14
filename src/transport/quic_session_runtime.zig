@@ -282,12 +282,10 @@ pub const QuicSessionRuntime = struct {
         try self.ensureReadyForApplicationData();
 
         const stream_id = try self.stream_ids.nextBidi();
+        if (!outgoing.flags.no_reply) try self.acceptReliableStream(stream_id);
+        errdefer self.abortReliable(stream_id);
         try self.queueReliableOnStream(stream_id, outgoing, .{});
 
-        self.acceptReliableStream(stream_id) catch |err| switch (err) {
-            error.StreamAlreadyOpen => {},
-            else => return err,
-        };
         return stream_id;
     }
 
@@ -303,6 +301,8 @@ pub const QuicSessionRuntime = struct {
     ) !void {
         try self.ensureReadyForApplicationData();
         if (self.reliable_senders.contains(stream_id)) return error.StreamAlreadyOpen;
+        const limits = self.session.options;
+        if (self.reliable_senders.count() >= limits.max_queued_messages) return error.QueueFull;
 
         var sender = try quic_streams.ReliableMessageSender.init(
             self.allocator,
@@ -313,6 +313,7 @@ pub const QuicSessionRuntime = struct {
         );
         errdefer sender.deinit();
 
+        if (sender.bytes.len > limits.max_queued_bytes or self.queuedSendBytes() > limits.max_queued_bytes - sender.bytes.len) return error.QueueFull;
         try self.reliable_senders.put(stream_id, sender);
     }
 
@@ -327,6 +328,12 @@ pub const QuicSessionRuntime = struct {
     pub fn acceptReliableStream(self: *QuicSessionRuntime, stream_id: u64) !void {
         try self.ensureReadyForApplicationData();
         if (self.reliable_receivers.contains(stream_id)) return error.StreamAlreadyOpen;
+        const limits = self.session.options;
+        if (self.reliable_receivers.count() + self.inbox.items.len >= limits.max_queued_messages) return error.QueueFull;
+        // Reserve a full message for every active decoder; fragmented streams
+        // cannot each consume the entire session byte budget independently.
+        const reserved = std.math.mul(usize, self.reliable_receivers.count() + 1, limits.max_message_size) catch return error.QueueFull;
+        if (reserved > limits.max_queued_bytes or self.inboxBytes() > limits.max_queued_bytes - reserved) return error.QueueFull;
 
         const receiver = quic_streams.ReliableMessageReceiver.init(
             self.allocator,
@@ -334,6 +341,40 @@ pub const QuicSessionRuntime = struct {
             self.envelope_codec,
         );
         try self.reliable_receivers.put(stream_id, receiver);
+    }
+
+    /// End a local request and release every retained stream/message resource.
+    pub fn abortReliable(self: *QuicSessionRuntime, stream_id: u64) void {
+        if (self.reliable_senders.fetchRemove(stream_id)) |entry| {
+            var owned = entry.value;
+            owned.deinit();
+        }
+        if (self.reliable_receivers.fetchRemove(stream_id)) |entry| {
+            var owned = entry.value;
+            owned.deinit();
+        }
+        var index: usize = 0;
+        while (index < self.inbox.items.len) {
+            if (self.inbox.items[index].stream_id != stream_id) {
+                index += 1;
+                continue;
+            }
+            var owned = self.inbox.orderedRemove(index);
+            owned.deinit();
+        }
+    }
+
+    fn queuedSendBytes(self: *QuicSessionRuntime) usize {
+        var total: usize = 0;
+        var it = self.reliable_senders.valueIterator();
+        while (it.next()) |sender| total += sender.bytes.len;
+        return total;
+    }
+
+    fn inboxBytes(self: *QuicSessionRuntime) usize {
+        var total: usize = 0;
+        for (self.inbox.items) |received| total += @import("../queue.zig").messageByteSize(received.message);
+        return total;
     }
 
     pub fn queueSubscribe(
@@ -444,12 +485,20 @@ pub const QuicSessionRuntime = struct {
             const stream_id = entry.key_ptr.*;
             if (!isPeerBidiStreamId(self.session.role, stream_id)) continue;
             if (self.reliable_receivers.contains(stream_id)) continue;
+            // A decoded peer request remains a QUIC stream until its reply
+            // half finishes. Do not rediscover its already-consumed receive
+            // half and create a second decoder for the same FIN/empty input.
+            // The transport's cursor supplies bounded lifecycle state; no
+            // ever-growing application set of completed IDs is necessary.
+            const receive = conn.streamRecvState(stream_id) orelse continue;
+            if (receive.terminal) continue;
             try stream_ids.append(self.allocator, stream_id);
         }
 
         for (stream_ids.items) |stream_id| {
             self.acceptReliableStream(stream_id) catch |err| switch (err) {
                 error.StreamAlreadyOpen => continue,
+                error.QueueFull => break,
                 else => return err,
             };
             accepted += 1;
@@ -654,55 +703,38 @@ pub const QuicSessionRuntime = struct {
     fn pumpReliableSenders(self: *QuicSessionRuntime, transport: anytype) !usize {
         var complete_ids: std.ArrayList(u64) = .empty;
         defer complete_ids.deinit(self.allocator);
-
+        try complete_ids.ensureTotalCapacity(self.allocator, self.reliable_senders.count());
+        defer dropCompleted(&self.reliable_senders, complete_ids.items);
         var senders = self.reliable_senders.iterator();
         while (senders.next()) |entry| {
-            const progress = entry.value_ptr.pump(transport) catch |err| {
-                // Same discipline as the receivers: a finished sender
-                // left stranded by an error would re-FIN its (possibly
-                // reaped) stream on the next pump.
-                dropCompleted(&self.reliable_senders, complete_ids.items);
-                return err;
-            };
-            if (progress == .complete) {
-                try complete_ids.append(self.allocator, entry.key_ptr.*);
-            }
+            if (try entry.value_ptr.pump(transport) == .complete) complete_ids.appendAssumeCapacity(entry.key_ptr.*);
         }
-
-        dropCompleted(&self.reliable_senders, complete_ids.items);
         return complete_ids.items.len;
     }
 
     fn pumpReliableReceivers(self: *QuicSessionRuntime, transport: anytype) !usize {
         var complete_ids: std.ArrayList(u64) = .empty;
         defer complete_ids.deinit(self.allocator);
+        try complete_ids.ensureTotalCapacity(self.allocator, self.reliable_receivers.count());
+        defer dropCompleted(&self.reliable_receivers, complete_ids.items);
 
         var received_count: usize = 0;
         var receivers = self.reliable_receivers.iterator();
         while (receivers.next()) |entry| {
-            const received_opt = entry.value_ptr.pump(transport) catch |err| {
-                // Finish the removal pass for receivers that already
-                // completed earlier in this iteration: an error must
-                // not strand a decoded receiver (its message is in the
-                // inbox; the next pump would fail on the stale
-                // `decoded` flag instead of the real cause).
-                dropCompleted(&self.reliable_receivers, complete_ids.items);
-                return err;
-            };
-            const received = received_opt orelse continue;
-            errdefer {
-                var cleanup = received;
-                cleanup.deinit();
-            }
-            try self.inbox.append(self.allocator, .{
+            const limits = self.session.options;
+            if (self.inbox.items.len >= limits.max_queued_messages or
+                self.inboxBytes() +| limits.max_message_size > limits.max_queued_bytes) break;
+            // Commit space before decoding. Nothing fallible follows ownership
+            // transfer from the receiver, so an OOM retry cannot lose a message.
+            try self.inbox.ensureUnusedCapacity(self.allocator, 1);
+            const received = (try entry.value_ptr.pump(transport)) orelse continue;
+            self.inbox.appendAssumeCapacity(.{
                 .stream_id = entry.key_ptr.*,
                 .message = received,
             });
-            try complete_ids.append(self.allocator, entry.key_ptr.*);
+            complete_ids.appendAssumeCapacity(entry.key_ptr.*);
             received_count += 1;
         }
-
-        dropCompleted(&self.reliable_receivers, complete_ids.items);
         return received_count;
     }
 };

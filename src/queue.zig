@@ -87,6 +87,10 @@ pub const Queue = struct {
         }
     }
 
+    pub fn peek(self: *const Queue) ?Message {
+        return if (self.count == 0) null else self.entries[self.head];
+    }
+
     /// Enqueue an owned message.
     ///
     /// On `.enqueued`, `.dropped_oldest`, and `.dropped_newest`, the queue has
@@ -221,6 +225,7 @@ pub fn cloneOwnedMessage(allocator: std.mem.Allocator, source: Message) std.mem.
         .allocator = allocator,
         .subject = try allocator.dupe(u8, source.subject),
         .id = source.id,
+        .local_correlation = source.local_correlation,
         .flags = source.flags,
         .deadline_ms = source.deadline_ms,
         .headers = &.{},
@@ -257,11 +262,42 @@ pub fn cloneOwnedMessage(allocator: std.mem.Allocator, source: Message) std.mem.
         initialized_headers += 1;
     }
 
+    if (source.reply_handle) |handle| cloned.reply_handle = handle.retain();
     return cloned;
 }
 
 pub fn deinitOwnedMessage(msg: *Message) void {
     msg.deinit();
+}
+
+test "queue cloning retains a deferred reply route after the source is freed" {
+    const Sink = struct {
+        replies: usize = 0,
+        fn send(context: *anyopaque, route: u64, outgoing: message.OutgoingMessage) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expectEqual(@as(u64, 99), route);
+            try std.testing.expectEqual(@as(u64, 41), outgoing.id);
+            try std.testing.expectEqualStrings("echo", outgoing.subject);
+            try std.testing.expectEqualStrings("answer", outgoing.body);
+            self.replies += 1;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var sink: Sink = .{};
+    const target = try message.ReplyHandle.Target.create(allocator, &sink, Sink.send);
+    defer target.release();
+    defer target.invalidate();
+    var cloned = blk: {
+        var source = try Message.init(allocator, .{ .subject = "echo", .id = 41, .body = "request" });
+        defer source.deinit();
+        source.local_correlation = 77;
+        source.reply_handle = try message.ReplyHandle.init(target, 99, source.outgoing());
+        break :blk try cloneOwnedMessage(allocator, source);
+    };
+    defer cloned.deinit();
+    try std.testing.expectEqual(@as(u64, 77), cloned.local_correlation);
+    try cloned.reply_handle.?.reply(.{ .subject = "", .body = "answer" });
+    try std.testing.expectEqual(@as(usize, 1), sink.replies);
 }
 
 test {

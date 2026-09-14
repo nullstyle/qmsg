@@ -5,6 +5,10 @@ consumer's request (swarm item 2: "make the process wall transparent
 to SUBSCRIBE and publish"). This is ROADMAP phase 5's "automatic
 live-session emission," plus its two companions.
 
+The current Node defaults use canonical `delivery` events on both dialed and
+embedded sessions. See [MIGRATION.md](MIGRATION.md) for compatibility options
+when upgrading an older direct-inbox consumer.
+
 ## What exists (surveyed, not rebuilt)
 
 - `protocol/pubsub.Registry` — peer-keyed subscription registry;
@@ -20,7 +24,7 @@ live-session emission," plus its two companions.
 - `QuicSessionRuntime.queueDatagram` / `datagram_outbox` — pumped
   for dial clients in `tick` and for embedded sessions through
   `driverSessionPass`.
-- Inbound datagrams already surface as `quic_delivery` events.
+- Inbound datagrams surface as `delivery` events by default.
 
 What was missing: nothing wires these to session lifecycle.
 
@@ -71,10 +75,11 @@ fan-out set.
 - Both ends announce `pub_ | sub` and `datagram_enabled` in their
   transport options; a session negotiated without the bits silently
   carries no pub/sub (no error, no drop).
-- Dial-side deliveries are inbox-only (`recvDatagram`), mirroring
-  dial-side replies (`recvReliable`); `quic_delivery` events are the
-  embedded-session surface. A publication racing a reborn
-  subscriber's re-sync is a lost datagram by design.
+- Dialed and embedded sessions produce `delivery` events under the default
+  Node settings. Direct `recvDatagram` / `recvReliable` consumers require
+  `.delivery = .legacy` and must not compete with event consumption.
+  A publication racing a reborn subscriber's re-sync is a lost datagram by
+  design.
 - Datagram-first; reliable-stream publication is future work.
 - Replay/update machinery stays unwired (live-only subscriptions).
 - No subscription-changed event; the registry stays invisible to
@@ -89,7 +94,7 @@ fan-out set.
 ## Acceptance
 
 - Live two-node: dial-side `subscribeQuic`, listener-side
-  `publishQuicSubscribed`, delivery as `quic_delivery`; kill /
+  `publishQuicSubscribed`, delivery as `delivery`; kill /
   same-key reborn / redial; delivery resumes with NO new subscribe
   call (the redial re-emission contract — tested hardest).
 - Slow subscriber: bounded outbox sheds and counts instead of

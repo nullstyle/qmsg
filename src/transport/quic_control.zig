@@ -44,6 +44,10 @@ pub const State = struct {
     default_queue: queue.QueueOptions = .{},
     outgoing: std.ArrayList(control.Frame) = .empty,
     queue_epoch: u64 = 0,
+    max_queued_frames: usize = 256,
+    /// Admission charge includes copied filter bytes and fixed frame metadata.
+    max_queued_bytes: usize = 256 * 1024,
+    queued_bytes: usize = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -92,12 +96,17 @@ pub const State = struct {
         return self.outgoing.items.len;
     }
 
+    pub fn queuedByteCount(self: State) usize {
+        return self.queued_bytes;
+    }
+
     pub fn clearQueuedFrames(self: *State) void {
         const had_frames = self.outgoing.items.len != 0;
         for (self.outgoing.items) |*frame| {
             frame.deinit();
         }
         self.outgoing.clearRetainingCapacity();
+        self.queued_bytes = 0;
         if (had_frames) self.bumpQueueEpoch();
     }
 
@@ -158,9 +167,14 @@ pub const State = struct {
 
     fn emit(context: *anyopaque, frame: control.Frame) anyerror!void {
         const self: *State = @ptrCast(@alignCast(context));
+        const bytes = try queuedFrameBytes(frame);
+        // Reject before cloning or retaining anything from the borrowed frame.
+        if (self.outgoing.items.len >= self.max_queued_frames or
+            bytes > self.max_queued_bytes -| self.queued_bytes) return error.QueueFull;
         var owned = try cloneQueuedFrame(self.allocator, frame);
         errdefer owned.deinit();
         try self.outgoing.append(self.allocator, owned);
+        self.queued_bytes += bytes;
     }
 
     fn clearQueuedFramePrefix(self: *State, frame_count: usize, queue_epoch: u64) void {
@@ -170,6 +184,7 @@ pub const State = struct {
         if (count == 0) return;
 
         for (self.outgoing.items[0..count]) |*frame| {
+            self.queued_bytes -= queuedFrameBytes(frame.*) catch unreachable;
             frame.deinit();
         }
 
@@ -187,6 +202,16 @@ pub const State = struct {
         self.queue_epoch +%= 1;
     }
 };
+
+fn queuedFrameBytes(frame: control.Frame) !usize {
+    const filter_len = switch (frame) {
+        .subscribe => |value| value.filter.len,
+        .unsubscribe => |value| value.filter.len,
+        .credit => |value| value.subject_filter.len,
+        else => return error.UnexpectedFrame,
+    };
+    return std.math.add(usize, @sizeOf(control.Frame), filter_len) catch error.QueueFull;
+}
 
 pub const FlushSender = struct {
     state: *State,
@@ -355,7 +380,9 @@ test "flush sender clears queued prefix only after completion" {
     var flush = try state.initFlushSender(quic_streams.localControlStreamId(.client), .{}, .{});
     defer flush.deinit();
 
+    const original_bytes = state.queuedByteCount();
     try state.queueUnsubscribe("jobs.resize");
+    const appended_bytes = state.queuedByteCount() - original_bytes;
 
     var io: FlushTestStream = .{
         .allocator = allocator,
@@ -372,11 +399,57 @@ test "flush sender clears queued prefix only after completion" {
 
     try std.testing.expect(io.finished);
     try std.testing.expectEqual(@as(usize, 1), state.queuedFrameCount());
+    try std.testing.expectEqual(appended_bytes, state.queuedByteCount());
     try std.testing.expectEqual(control.Tag.unsubscribe, std.meta.activeTag(state.queuedFrames()[0]));
     try std.testing.expectEqualStrings("jobs.resize", state.queuedFrames()[0].unsubscribe.filter);
 
     try std.testing.expectEqual(quic_streams.WriteProgress.complete, try flush.pump(&io));
     try std.testing.expectEqual(@as(usize, 1), state.queuedFrameCount());
+}
+
+test "control queue bounds reject without ownership transfer and flushing restores capacity" {
+    const allocator = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var registry = pubsub.Registry.init(allocator);
+    defer registry.deinit();
+    var ledger = pushpull.CreditLedger.init(allocator);
+    defer ledger.deinit();
+    var state = State.init(failing.allocator(), &registry, &ledger, .{});
+    defer state.deinit();
+    state.max_queued_frames = 1;
+    var borrowed = "jobs.old".*;
+    try state.queueSubscribe(&borrowed, .{});
+    const charged = state.queuedByteCount();
+    try std.testing.expect(charged > borrowed.len);
+
+    // Both limits reject before attempting to allocate a clone. The caller
+    // still owns the rejected input, while the first frame remains intact.
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.QueueFull, state.queueUnsubscribe(&borrowed));
+    state.max_queued_frames = 2;
+    state.max_queued_bytes = charged;
+    try std.testing.expectError(error.QueueFull, state.queueCredit(&borrowed, .{ .messages = 1, .bytes = 1 }));
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), state.queuedFrameCount());
+    try std.testing.expectEqual(charged, state.queuedByteCount());
+    @memset(&borrowed, 'x');
+    try std.testing.expectEqualStrings("jobs.old", state.queuedFrames()[0].subscribe.filter);
+
+    failing.fail_index = std.math.maxInt(usize);
+    var flush = try state.initFlushSender(quic_streams.localControlStreamId(.client), .{}, .{});
+    defer flush.deinit();
+    var io: FlushTestStream = .{ .allocator = allocator, .write_limit = 0 };
+    defer io.deinit();
+    try std.testing.expectEqual(quic_streams.WriteProgress.pending, try flush.pump(&io));
+    try std.testing.expectEqual(charged, state.queuedByteCount());
+    io.write_limit = std.math.maxInt(usize);
+    try std.testing.expectEqual(quic_streams.WriteProgress.complete, try flush.pump(&io));
+    try std.testing.expectEqual(@as(usize, 0), state.queuedFrameCount());
+    try std.testing.expectEqual(@as(usize, 0), state.queuedByteCount());
+    try state.queueSubscribe("jobs.new", .{});
+    try std.testing.expectEqual(charged, state.queuedByteCount());
+    state.clearQueuedFrames();
+    try std.testing.expectEqual(@as(usize, 0), state.queuedByteCount());
 }
 
 test "failed flush sender init preserves queued frames" {

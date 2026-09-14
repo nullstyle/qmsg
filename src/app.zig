@@ -245,9 +245,11 @@ pub const App = struct {
     publish_hook: ?EmitHandler = null,
 
     pub fn init(allocator: std.mem.Allocator, options: AppOptions) !App {
+        var node_options = options.node;
+        node_options.delivery = .legacy;
         return .{
             .allocator = allocator,
-            .node = try node.Node.init(allocator, options.node),
+            .node = try node.Node.init(allocator, node_options),
             .error_policy = options.error_policy,
             .rep_routes = subject.Router(MessageHandler).init(allocator),
             .pull_routes = subject.Router(MessageHandler).init(allocator),
@@ -475,6 +477,17 @@ pub const App = struct {
             .publish_hook = options.publish_hook orelse self.publish_hook,
         };
 
+        if (options.session) |sess| {
+            sess.admit(.{
+                .pattern = if (kind.pattern()) |pattern| authPattern(pattern) else null,
+                .subject = owned.subject,
+                .datagram = kind == .datagram,
+                .message_size = messageSize(owned),
+            }) catch |err| {
+                owned.deinit();
+                return err;
+            };
+        }
         try route.handler(&ctx, owned);
         return result;
     }
@@ -1051,6 +1064,7 @@ test "App QUIC dispatcher writes replies and publications through hooks" {
     var sess = session.Session{
         .id = 25,
         .transport = .quic,
+        .datagram_enabled = true,
         .user_data = @ptrCast(&recorder),
     };
 
@@ -1543,4 +1557,26 @@ test "App default inproc rep error policy returns message error replies" {
     try std.testing.expect(reply.flags.err);
     try std.testing.expectEqualStrings("user.get", reply.subject);
     try std.testing.expectEqualStrings("AuthenticationRequired", reply.body);
+}
+
+test "App enforces session policy before an ungated handler" {
+    const Handler = struct {
+        fn run(_: *Context, incoming: message.Message) !void {
+            var owned = incoming;
+            owned.deinit();
+            return error.HandlerMustNotRun;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var application = try App.init(allocator, .{});
+    defer application.deinit();
+    try application.rep("private.>", Handler.run);
+    var restricted: session.Session = .{
+        .id = 1,
+        .transport = .inproc,
+        .auth_state = .authenticated,
+        .authorization = .{ .subject = "peer", .issuer = "test", .allowed_patterns = .{ .rep = true }, .allowed_subjects = .deny_all },
+    };
+    const incoming = try message.Message.init(allocator, .{ .subject = "private.work", .body = "must not dispatch" });
+    try std.testing.expectError(error.Unauthorized, application.dispatchRep(incoming, .{ .session = &restricted }));
 }

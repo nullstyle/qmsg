@@ -34,8 +34,10 @@ const max_drive_steps = 20_000;
 //   QMSG_RUN_LIVE_UDP=1 ./zig-out/bin/quic-node-localhost
 //
 // This is still a low-level example: it queues one reliable message directly
-// on the current QUIC session runtime while higher-level socket convenience
-// APIs settle.
+// on the current QUIC session runtime. App.init selects legacy inbox delivery
+// for App.runOnce; the client reply is deliberately consumed from that inbox.
+// A standalone Node defaults to canonical poll events instead; see
+// embedded_quic_attach.zig and docs/MIGRATION.md for that interface.
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

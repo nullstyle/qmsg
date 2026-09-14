@@ -11,10 +11,10 @@
 //! embedder's own connection state.
 //!
 //! Inbound messages are PULL-consumed — they surface through
-//! `Node.poll` events (`quic_request`, `quic_reply`,
-//! `quic_delivery`), the same registry the inproc embedded surface
+//! `Node.poll` events (`request`, `reply`, `request_failed`,
+//! `delivery`), the same registry the inproc embedded surface
 //! uses — never through push dispatch. Replies go back with
-//! `Node.replyQuic` while the request event is alive.
+//! `Node.reply` using the request message's reply handle.
 //!
 //! This example is hermetic (one process, an in-memory packet
 //! shuttle, a virtual clock, no sockets). It is the loop an embedder
@@ -183,6 +183,7 @@ fn drive(
     }
     try listener.tick(now_us);
     try client.tick(now_us);
+    try embedder.node.tick(now_us);
     _ = allocator;
 }
 
@@ -265,7 +266,7 @@ pub fn main(init: std.process.Init) !void {
     if (client_sess.state() != .ready or !server_ready) return error.ConnectionLost;
 
     // Outbound request + datagram from the requesting side.
-    _ = try client_sess.queueReliable(.{
+    const request_id = try node.request(.{ .quic = client_sess.id() }, .{
         .subject = "user.get",
         .id = 42,
         .deadline_ms = 2_000,
@@ -290,39 +291,36 @@ pub fn main(init: std.process.Init) !void {
 
         var events: [8]Event = undefined;
         const count = try node.poll(&events);
+        // Own the whole batch even if handling one event fails.
+        defer for (events[0..count]) |*event| event.deinit();
         for (events[0..count]) |*event| {
-            defer event.deinit();
             switch (event.*) {
-                .quic_request => |*ev| {
-                    std.debug.print("quic_request {s} ({s}) id={d} stream={d}\n", .{
-                        ev.msg.subject, ev.msg.body, ev.msg.id, ev.stream_id,
+                .request => |*ev| {
+                    std.debug.print("request {s} ({s}) id={d} stream={d}\n", .{
+                        ev.msg.subject, ev.msg.body, ev.msg.id, ev.stream_id.?,
                     });
-                    try node.replyQuic(ev, .{ .subject = "", .body = "user-42" });
+                    try node.reply(ev.msg.reply_handle orelse return error.MissingReplyHandle, .{
+                        .subject = "",
+                        .body = "user-42",
+                    });
                     got_request = true;
                 },
-                .quic_delivery => |*ev| {
-                    std.debug.print("quic_delivery {s} ({s})\n", .{ ev.msg.subject, ev.msg.body });
+                .delivery => |*ev| {
+                    std.debug.print("delivery {s} ({s})\n", .{ ev.msg.subject, ev.msg.body });
                     got_delivery = true;
                 },
-                .quic_reply => |*ev| {
-                    std.debug.print("quic_reply id={d} stream={d} ({s})\n", .{
-                        ev.msg.id, ev.stream_id, ev.msg.body,
+                .reply => |*ev| {
+                    if (ev.request_id != request_id) return error.UnexpectedReply;
+                    std.debug.print("reply request={d} stream={d} ({s})\n", .{
+                        ev.request_id, ev.stream_id.?, ev.msg.body,
                     });
                     got_reply = true;
                 },
+                .request_failed => return error.RequestFailed,
                 .message_dropped => |ev| {
                     std.debug.print("message_dropped {d} bytes\n", .{ev.bytes});
                 },
                 else => {},
-            }
-        }
-
-        if (!got_reply) {
-            if (client_sess.runtime.recvReliable()) |received| {
-                var got = received;
-                defer got.deinit();
-                std.debug.print("requester got reply id={d} ({s})\n", .{ got.message.id, got.message.body });
-                got_reply = true;
             }
         }
     }

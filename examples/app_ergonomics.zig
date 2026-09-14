@@ -55,8 +55,6 @@ fn getUser(ctx: *qmsg.Context, msg: qmsg.Message) !void {
     var owned = msg;
     defer owned.deinit();
 
-    try ctx.requireRouteAccess();
-
     try ctx.reply(.{
         .subject = "",
         .headers = &.{

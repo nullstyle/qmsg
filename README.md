@@ -11,9 +11,8 @@ message protocol over QUIC streams and datagrams.
 
 ## Status
 
-This repository is now a real Zig package skeleton, not only a design folder.
-The public root module exports the core names that the first implementation
-tranches are building around:
+The package provides messaging over inproc and QUIC, bounded request outcomes,
+and embedded or App-driven consumption. The public root module exports:
 
 - `Message`, `OutgoingMessage`, `Header`, `Flags`, and `MessageId`;
 - `SubjectFilter` and `SubjectRouter`;
@@ -46,24 +45,33 @@ tranches are building around:
   qmsg sessions ride connections on the embedder's own listener and
   `quic.app.Driver`, routed by ALPN, with inbound requests/replies/
   deliveries flowing through the same `poll` events and replies via
-  `replyQuic`.
+  `Node.reply` through the request message's reply handle.
 
 The inproc socket examples build and run against the current public API. The
 App facade can now serve inproc REP routes through `runOnce`, and can prepare
 QUIC listener/session runtime plumbing. QUIC has a pinned released
-`quic-zig` dependency (URL+hash tarball, v0.19.0), option wrappers, transport-parameter
+`quic-zig` dependency (URL+hash tarball, v0.21.1), option wrappers, transport-parameter
 mapping, socket-free runtime wrappers around `quic_zig.Server`/`Client`,
 Node-embeddable UDP socket owners, per-session QUIC drivers, socket QUIC
 attachment callbacks, App dispatch for already-decoded QUIC messages,
 incremental control/reliable stream pumps, cancellation/error mapping,
 compact DATAGRAM envelope helpers, and hermetic tests that drive quic-zig
 handshake, qmsg HELLO, and reliable req/rep over QUIC streams. Wiring these
-pieces into `Node.listenQuic`/`dialQuic` runtime loops has started: `Node`
+pieces into `Node.listenQuic`/`dialQuic` runtime loops is implemented: `Node`
 owns UDP listener/client sockets, per-session drivers, socket attachment
 helpers, tick-driven reliable stream pumping, and decoded datagram dispatch
 queues. An opt-in Node/App localhost example exercises the live UDP loop by
 queuing a reliable message directly on the current session runtime. Public
 `Socket.listen(.quic)`/`dial(.quic)` convenience APIs remain future work.
+
+Standalone `Node` defaults to canonical events for both transports. Use
+`request(.{ .inproc = dial_id }, outgoing)` or
+`request(.{ .quic = session_id }, outgoing)` and correlate the returned
+`RequestId` with `reply` / `request_failed` events. Accepted requests reserve
+terminal-outcome capacity separately from ordinary events. Configured message
+authorization runs before application delivery. See
+[docs/MIGRATION.md](docs/MIGRATION.md) for ownership, limits, verified peer
+readiness, and explicit compatibility options for older inbox consumers.
 
 ## Package Use
 
@@ -183,20 +191,20 @@ or a hidden runtime. The embedder drives `tick(now_us)` and
 outcome from events alone:
 
 ```zig
-node.tick(now_us) catch {};
+try node.tick(now_us);
 var events: [16]qmsg.node.Event = undefined;
 const count = try node.poll(&events);
+defer for (events[0..count]) |*event| event.deinit();
 for (events[0..count]) |*event| {
-    defer event.deinit();
     switch (event.*) {
-        .request => |*ev| try node.replyInproc(ev, .{ .subject = "", .body = "ok" }),
-        .reply, .request_failed, .delivery, .message_dropped, .connected, .closed => {},
+        .request => |ev| try node.reply(ev.msg.reply_handle.?, .{ .subject = "", .body = "ok" }),
+        else => {},
     }
 }
 ```
 
 Backpressure is observable (synchronous send errors plus a bounded
-event queue with drop counters) and `node.stats()` returns plain
+event queue with drop counters and separately reserved terminal outcomes) and `node.stats()` returns plain
 fields. The full contract — wiring, event semantics, error
 classification, ownership — is
 [docs/EMBEDDING.md](docs/EMBEDDING.md), and
@@ -274,6 +282,9 @@ The live localhost smoke uses `App.listenQuic`, `Node.dialQuic`, and the
 Node-owned UDP tick loop. It is opt-in because some CI/sandboxed environments
 do not permit UDP binds. When enabled, it queues one reliable message directly
 on the session runtime and lets `App.runOnce` dispatch the server-side request.
+`App.init` selects inbox delivery for that dispatcher; this low-level example
+consumes its client reply directly. Standalone Nodes use canonical poll events
+by default, as shown in `embedded-quic-attach`.
 
 ```sh
 QMSG_RUN_LIVE_UDP=1 ./zig-out/bin/quic-node-localhost
@@ -299,7 +310,7 @@ direct `.quic` endpoints.
 - Patterns are compile-time selected where practical, e.g. `Socket(.req)`.
 - Blocking/simple loop first, embeddable poll/tick API underneath.
 - Pluggable transports, but QUIC is the reference transport.
-- PASETO/PASERK auth targets `paseto-zig` release `0.3.0`; qmsg owns only
+- PASETO/PASERK auth targets `paseto-zig` release `0.4.0`; qmsg owns only
   session policy, key lookup, replay hooks, and subject/pattern authorization.
 
 ## Authentication Surface
@@ -316,7 +327,7 @@ const auth = qmsg.AuthConfig{
 
 `Authorization` is session state exposed to handlers after credentials have
 been validated. `qmsg.PasetoAuth` uses
-[`paseto-zig` `0.3.0`](https://github.com/nullstyle/paseto-zig/releases/tag/0.3.0)
+[`paseto-zig` `0.4.0`](https://github.com/nullstyle/paseto-zig/releases/tag/0.4.0)
 for typed PASERK IDs and bounded fail-closed v4.public token verification,
 while the rest of core keeps auth interfaces transport-independent.
 See [examples/auth_paseto.zig](examples/auth_paseto.zig) for the current

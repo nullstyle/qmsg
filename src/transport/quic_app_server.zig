@@ -78,20 +78,25 @@ pub fn ServerDispatch(comptime Owner: type) type {
                 .owner = owner,
                 .transport_options = transport_options,
             };
+            var hooks: D.Hooks = .{
+                .on_handshake = onHandshake,
+                .on_stream_open = onStreamOpen,
+                .on_stream_end = onStreamEnd,
+                .on_datagram = onDatagram,
+                .on_disconnect = onDisconnect,
+            };
+            if (comptime @hasField(D.Hooks, "on_stream_data_consumed")) {
+                hooks.on_stream_data_consumed = onStreamDataConsumed;
+            } else hooks.on_stream_data = onStreamData;
             self.driver = try D.init(.{
                 .allocator = allocator,
                 .app = &self.app,
-                .hooks = .{
-                    .on_handshake = onHandshake,
-                    .on_stream_open = onStreamOpen,
-                    .on_stream_data = onStreamData,
-                    .on_stream_end = onStreamEnd,
-                    .on_datagram = onDatagram,
-                    .on_disconnect = onDisconnect,
-                },
+                .hooks = hooks,
                 // Sized to what the listener advertises, so a
                 // conforming peer can never overflow the table.
-                .max_tracked_streams = quic_embedded.driverSizing(transport_options).max_tracked_streams,
+                // Include locally originated request streams as well as the
+                // peer stream credit advertised by this listener.
+                .max_tracked_streams = try std.math.add(usize, quic_embedded.driverSizing(transport_options).max_tracked_streams, transport_options.max_queued_messages),
                 .datagram_buf_bytes = quic_embedded.driverSizing(transport_options).datagram_buf_bytes,
             });
         }
@@ -104,8 +109,7 @@ pub fn ServerDispatch(comptime Owner: type) type {
         /// Wire the Driver's will-close hook into `server`, so
         /// sessions tear down (exactly once) from `Server.reap`.
         pub fn attach(self: *Self, server: *quic_zig.Server) void {
-            server.on_connection_will_close = D.willCloseHook;
-            server.on_connection_will_close_user_data = &self.driver;
+            self.driver.attach(server);
         }
 
         /// One full service pass: the Driver drains events, pumps
@@ -122,6 +126,32 @@ pub fn ServerDispatch(comptime Owner: type) type {
                 var dispatch = self.embedded();
                 dispatch.heartbeat_now_us = self.heartbeat_now_us;
                 try dispatch.serviceSeat(&ds.app.seat.?, slot.conn);
+                // A server can originate requests on an accepted connection.
+                // QUIC does not emit peer stream-open events for those local
+                // streams, so the driver otherwise never reads their replies.
+                // Register after serviceSeat has opened the reserved wire IDs,
+                // and before the owner can tick/reap the connection.
+                self.trackLocalReceivers(ds) catch |err| switch (err) {
+                    error.ExcessiveLoad => slot.conn.close(true, quic_zig.Connection.transport_error_excessive_load, "stream tracking capacity"),
+                    else => return err,
+                };
+            }
+        }
+
+        fn trackLocalReceivers(self: *Self, ds: *D.Session) !void {
+            const sess = ds.app.seat.?.sess orelse return;
+            const runtime = Owner.driverSessionRuntime(sess);
+            var ids = runtime.reliable_receivers.keyIterator();
+            while (ids.next()) |id| {
+                if ((id.* & 3) != 1 or ds.conn.streamRecvState(id.*) == null or ds.table.get(id.*) != null) continue;
+                // Driver's public StreamTable supports the released QUIC
+                // version as well as ConnectionDriver-era releases. The
+                // wrapper owns StreamState, so it initializes that state
+                // and delegates the same open hook as peer-opened streams.
+                const entry = ds.table.track(id.*) orelse return error.ExcessiveLoad;
+                entry.bidi = true;
+                entry.state = .{};
+                try onStreamOpen(&self.app, ds, entry, true);
             }
         }
 
@@ -160,6 +190,12 @@ pub fn ServerDispatch(comptime Owner: type) type {
             if (s.app.seat == null) return;
             var dispatch = embeddedFor(app);
             try dispatch.onStreamData(&s.app.seat.?, s.conn, e.id, chunk);
+        }
+
+        fn onStreamDataConsumed(app: *App, s: *D.Session, e: *D.StreamEntry, chunk: []const u8) anyerror!usize {
+            if (s.app.seat == null) return chunk.len;
+            var dispatch = embeddedFor(app);
+            return dispatch.onStreamDataConsumed(&s.app.seat.?, s.conn, e.id, chunk);
         }
 
         fn onStreamEnd(app: *App, s: *D.Session, e: *D.StreamEntry, end: quic_zig.app.StreamEnd) anyerror!void {

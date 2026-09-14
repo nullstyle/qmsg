@@ -10,8 +10,8 @@
 //!     so the embedder deinits each one after handling it;
 //!   - the allocator — one allocator for the node and everything it
 //!     queues; event payloads come back to that allocator on deinit;
-//!   - backpressure — send-path pressure (`requestInproc`,
-//!     `publishInproc`, `replyInproc`) is synchronous and observable,
+//!   - backpressure — send-path pressure (`request`,
+//!     `publishInproc`, `reply`) is synchronous and observable,
 //!     and `stats()` renders counters as plain fields.
 //!
 //! The "peers" in this example are plain qmsg sockets in the same
@@ -97,13 +97,13 @@ pub fn main(init: std.process.Init) !void {
     try node.dialInprocSub(&network, "events");
 
     // Request: outbound req transport to a served peer; replies (or
-    // classified failures) arrive as events keyed by correlation id.
+    // classified failures) arrive as events keyed by local RequestId.
     const dial_id = try node.dialInprocReq(&network, "peers", .{});
 
     // Seed the loop: one inbound request, one matching and one
     // non-matching publication, two outbound requests (one answered,
     // one left to die past its deadline), one publication of our own.
-    const asked_id = try peer_req.sendRequest(.{
+    _ = try peer_req.sendRequest(.{
         .subject = "user.get",
         .body = "42",
         .deadline_ms = 1_000,
@@ -112,12 +112,12 @@ pub fn main(init: std.process.Init) !void {
     try peer_pub.publish(.{ .subject = "jobs.noise", .body = "filtered" });
 
     try node.tick(0);
-    const echo_id = try node.requestInproc(dial_id, .{
+    const echo_id = try node.request(.{ .inproc = dial_id }, .{
         .subject = "echo.hi",
         .body = "hi",
         .deadline_ms = 1_000,
     });
-    const timeout_id = try node.requestInproc(dial_id, .{
+    const timeout_id = try node.request(.{ .inproc = dial_id }, .{
         .subject = "time.now",
         .body = "",
         .deadline_ms = 25,
@@ -134,9 +134,10 @@ pub fn main(init: std.process.Init) !void {
 
         var events: [16]Event = undefined;
         const count = try node.poll(&events);
+        // Free every returned event even if a handler fails partway through.
+        defer for (events[0..count]) |*event| event.deinit();
         for (events[0..count]) |*event| {
-            defer event.deinit();
-            try handleEvent(&node, dial_id, event, asked_id, echo_id, timeout_id, &done);
+            try handleEvent(&node, event, echo_id, timeout_id, &done);
         }
 
         if (allDone(done)) break;
@@ -156,17 +157,18 @@ pub fn main(init: std.process.Init) !void {
 /// and their classified failures, deliveries with the matched filter.
 fn handleEvent(
     node: *Node,
-    dial_id: qmsg.InprocDialId,
     event: *Event,
-    asked_id: qmsg.MessageId,
-    echo_id: qmsg.MessageId,
-    timeout_id: qmsg.MessageId,
+    echo_id: qmsg.RequestId,
+    timeout_id: qmsg.RequestId,
     done: *u8,
 ) !void {
     switch (event.*) {
         .request => |*ev| {
             std.debug.print("served {s} ({s}) id={d}\n", .{ ev.msg.subject, ev.msg.body, ev.msg.id });
-            try node.replyInproc(ev, .{ .subject = "", .body = "user-42" });
+            try node.reply(ev.msg.reply_handle orelse return error.MissingReplyHandle, .{
+                .subject = "",
+                .body = "user-42",
+            });
             markDone(done, .served_request);
         },
         .reply => |*ev| {
@@ -175,11 +177,11 @@ fn handleEvent(
             } else {
                 std.debug.print("reply id={d} ({s})\n", .{ ev.msg.id, ev.msg.body });
             }
-            if (ev.dial_id == dial_id and ev.msg.id == echo_id) markDone(done, .received_reply);
+            if (ev.request_id == echo_id) markDone(done, .received_reply);
         },
         .request_failed => |ev| {
-            std.debug.print("request id={d} failed: {s}\n", .{ ev.id, @tagName(ev.failure) });
-            if (ev.dial_id == dial_id and ev.id == timeout_id) markDone(done, .deadline_failed);
+            std.debug.print("request id={d} failed: {s}\n", .{ ev.request_id, @tagName(ev.failure) });
+            if (ev.request_id == timeout_id) markDone(done, .deadline_failed);
         },
         .delivery => |*ev| {
             std.debug.print("delivery {s} ({s}) via filter {s}\n", .{ ev.msg.subject, ev.msg.body, ev.filter });
@@ -190,7 +192,6 @@ fn handleEvent(
         },
         .quic_request, .quic_reply, .quic_delivery, .quic_request_failed, .connected, .closed => {},
     }
-    _ = asked_id;
 }
 
 /// One unit of progress per external peer per iteration, so the loop

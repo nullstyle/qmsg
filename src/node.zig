@@ -31,6 +31,13 @@ pub const NodeOptions = struct {
     /// `message_dropped` and count in `Stats.dropped`. Slow
     /// consumers shed; fan-out never blocks.
     quic_datagram_outbox_max: usize = 64,
+    /// Terminal outcomes consume the same reservation as pending requests.
+    max_requests: usize = 1024,
+    max_request_bytes: usize = 16 * 1024 * 1024,
+    max_completion_bytes: usize = 16 * 1024 * 1024,
+    max_event_bytes: usize = 16 * 1024 * 1024,
+    delivery: enum { events, legacy } = .events,
+    event_format: enum { canonical, legacy_transport } = .canonical,
     io: std.Io = std.Io.Threaded.global_single_threaded.io(),
 };
 
@@ -74,7 +81,8 @@ pub const MessageDropped = struct {
 /// `msg` is owned by the event. Reply through `Node.replyInproc`
 /// (or `replyErrorInproc`) while the event is alive, then `deinit`.
 pub const RequestEvent = struct {
-    endpoint_id: InprocRepId,
+    endpoint_id: InprocRepId = 0,
+    stream_id: ?u64 = null,
     session_id: session.SessionId,
     /// `msg.id` is the reply correlation id; `msg.deadline_ms` the
     /// request deadline.
@@ -92,7 +100,10 @@ pub const RequestEvent = struct {
 /// request was sent under. Peer error replies carry `flags.err` and
 /// the `qmsg-error-code` / `qmsg-error-message` headers.
 pub const ReplyEvent = struct {
-    dial_id: InprocDialId,
+    request_id: RequestId = 0,
+    session_id: ?QuicSessionId = null,
+    stream_id: ?u64 = null,
+    dial_id: InprocDialId = 0,
     msg: message.Message,
 
     pub fn deinit(self: *ReplyEvent) void {
@@ -104,7 +115,10 @@ pub const ReplyEvent = struct {
 /// Terminal outcome for one of the node's outbound requests: no
 /// reply event will follow this id.
 pub const RequestFailedEvent = struct {
-    dial_id: InprocDialId,
+    request_id: RequestId = 0,
+    session_id: ?QuicSessionId = null,
+    stream_id: ?u64 = null,
+    dial_id: InprocDialId = 0,
     id: message.MessageId,
     failure: RequestFailure,
 };
@@ -117,7 +131,8 @@ pub const RequestFailedEvent = struct {
 /// is unsubscribed or the node deinits. Copy it if retention is
 /// needed.
 pub const DeliveryEvent = struct {
-    filter: []const u8,
+    session_id: ?QuicSessionId = null,
+    filter: []const u8 = "",
     msg: message.Message,
 
     pub fn deinit(self: *DeliveryEvent) void {
@@ -147,6 +162,7 @@ pub const QuicRequestEvent = struct {
 /// pending table is keyed on. Peer error replies carry `flags.err`
 /// and the `qmsg-error-code` / `qmsg-error-message` headers.
 pub const QuicReplyEvent = struct {
+    request_id: RequestId = 0,
     session_id: QuicSessionId,
     stream_id: u64,
     msg: message.Message,
@@ -174,6 +190,7 @@ pub const QuicDeliveryEvent = struct {
 /// idempotent with a consumer's own pending table — whichever side
 /// observes an outcome first, the other ignores.
 pub const QuicRequestFailedEvent = struct {
+    request_id: RequestId = 0,
     session_id: QuicSessionId,
     stream_id: u64,
     id: message.MessageId,
@@ -326,54 +343,29 @@ const InprocSubEndpoint = struct {
     }
 };
 
-/// One outbound request awaiting a reply event. Deadlines are
-/// evaluated against the node clock (`tick`'s `now_us`).
-const PendingInprocRequest = struct {
-    dial_id: InprocDialId,
+pub const RequestId = u64;
+pub const RequestTarget = union(enum) { inproc: InprocDialId, quic: QuicSessionId };
+
+/// One semantic request record regardless of transport. Socket adapters used by
+/// Node send untracked; this table alone owns correlation, deadlines and budgets.
+const PendingRequest = struct {
+    kind: enum { inproc, quic },
+    request_id: RequestId,
+    dial_id: InprocDialId = 0,
+    session_id: QuicSessionId = 0,
+    stream_id: u64 = 0,
     id: message.MessageId,
     deadline_ms: ?u64,
     sent_at_ms: u64,
+    bytes: usize,
 
-    fn isExpired(self: PendingInprocRequest, now_ms: u64) bool {
-        const deadline_ms = self.deadline_ms orelse return false;
-        return now_ms >= self.sent_at_ms +| deadline_ms;
+    fn isExpired(self: PendingRequest, now_ms: u64) bool {
+        const timeout = self.deadline_ms orelse return false;
+        return now_ms >= self.sent_at_ms +| timeout;
     }
-
-    /// The instant this request expires, on `Node.now_us`'s clock.
-    /// Null when the request carries no deadline. `nowMs` truncates
-    /// microseconds, so the deadline is reached at the START of its
-    /// millisecond.
-    fn deadlineUs(self: PendingInprocRequest) ?u64 {
-        const deadline_ms = self.deadline_ms orelse return null;
-        return (self.sent_at_ms +| deadline_ms) *| std.time.us_per_ms;
-    }
-};
-
-/// One outbound QUIC request awaiting its reply, keyed by the
-/// `(session_id, stream_id)` pair the reply event carries — the same
-/// key a consumer's correlation table uses. Outcomes are
-/// first-classification-wins: whichever of the reply surfacing, the
-/// deadline, an explicit cancel, or the session dying is observed
-/// first settles the entry; later observations are no-ops.
-const PendingQuicRequest = struct {
-    session_id: QuicSessionId,
-    stream_id: u64,
-    id: message.MessageId,
-    deadline_ms: ?u64,
-    sent_at_ms: u64,
-
-    fn isExpired(self: PendingQuicRequest, now_ms: u64) bool {
-        const deadline_ms = self.deadline_ms orelse return false;
-        return now_ms >= self.sent_at_ms +| deadline_ms;
-    }
-
-    /// The instant this request expires, on `Node.now_us`'s clock.
-    /// Null when the request carries no deadline. `nowMs` truncates
-    /// microseconds, so the deadline is reached at the START of its
-    /// millisecond.
-    fn deadlineUs(self: PendingQuicRequest) ?u64 {
-        const deadline_ms = self.deadline_ms orelse return null;
-        return (self.sent_at_ms +| deadline_ms) *| std.time.us_per_ms;
+    fn deadlineUs(self: PendingRequest) ?u64 {
+        const timeout = self.deadline_ms orelse return null;
+        return (self.sent_at_ms +| timeout) *| std.time.us_per_ms;
     }
 };
 
@@ -417,6 +409,8 @@ pub const QuicListenOptions = struct {
 /// peer this client will not accept replies, which the peer's policy
 /// may enforce.
 pub const QuicDialOptions = struct {
+    /// Require the authenticated server key to match the intended peer.
+    expected_peer_spki: ?[32]u8 = null,
     server_name: []const u8,
     ca_pem: ?[]const u8 = null,
     /// Client certificate chain (PEM) this dial presents, and its
@@ -435,6 +429,13 @@ pub const QuicDialOptions = struct {
     rx_buffer_bytes: usize = transport.quic_runtime.default_rx_buffer_bytes,
     tx_buffer_bytes: usize = transport.quic_runtime.default_tx_buffer_bytes,
     receive_timeout: std.Io.Timeout = transport.quic_udp.default_receive_timeout,
+};
+
+pub const SessionStatus = struct {
+    pub const State = enum { connecting, ready, closing };
+    state: State,
+    peer_cert_spki: ?[32]u8,
+    supported_patterns: u64,
 };
 
 pub const QuicSessionOptions = struct {
@@ -473,6 +474,7 @@ pub const QuicListenerRuntime = struct {
 pub const NodeServerDispatch = transport.quic_app_server.ServerDispatch(Node);
 
 pub const QuicClientRuntime = struct {
+    dispatch: ?transport.quic_app_client.ClientDispatch(Node) = null,
     client: transport.quic_udp.Client,
     runtime: *QuicSessionRuntime,
 
@@ -481,6 +483,9 @@ pub const QuicClientRuntime = struct {
     }
 
     fn deinit(self: *QuicClientRuntime) void {
+        if (comptime transport.quic_app_client.available) {
+            if (self.dispatch) |*dispatch| dispatch.deinit();
+        }
         self.client.deinit();
         self.* = undefined;
     }
@@ -488,12 +493,16 @@ pub const QuicClientRuntime = struct {
 
 pub const QuicSessionRuntime = struct {
     runtime: transport.quic_session_runtime.QuicSessionRuntime,
+    reply_target: ?*message.ReplyHandle.Target = null,
+    socket_requests: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// The node that owns this session, for pending-request
     /// bookkeeping (`recvReliable` settles the request a popped
     /// reply completes). Sessions only exist through node creation
     /// paths, so the pointer is always set.
     node: *Node,
     transport_ready: bool = false,
+    expected_peer_spki: ?[32]u8 = null,
+    connection: ?*transport.quic_runtime.Connection = null,
     /// True when the listener-side Driver owns this session's
     /// lifecycle (created on handshake, destroyed via will-close).
     driver_owned: bool = false,
@@ -508,6 +517,7 @@ pub const QuicSessionRuntime = struct {
     /// True once the node's full subscription set has been queued
     /// for this session (per redial-generation session).
     subscriptions_synced: bool = false,
+    subscriptions_queued: ?protocol.pubsub.SubscriptionSet = null,
 
     pub fn id(self: QuicSessionRuntime) QuicSessionId {
         return self.runtime.id();
@@ -540,14 +550,33 @@ pub const QuicSessionRuntime = struct {
         try self.runtime.replyReliableOnStream(stream_id, outgoing);
     }
 
+    fn attachReplyHandle(self: *QuicSessionRuntime, msg: *message.Message, stream_id: u64) !void {
+        if (msg.reply_handle != null) return;
+        if (self.reply_target == null) self.reply_target = try message.ReplyHandle.Target.create(self.runtime.allocator, self, sendReply);
+        msg.reply_handle = try message.ReplyHandle.init(self.reply_target.?, stream_id, msg.outgoing());
+    }
+
+    fn sendReply(context: *anyopaque, stream_id: u64, outgoing: message.OutgoingMessage) anyerror!void {
+        const self: *QuicSessionRuntime = @ptrCast(@alignCast(context));
+        try self.replyReliableOnStream(stream_id, outgoing);
+    }
+
     pub fn socketDriver(self: *QuicSessionRuntime) socket.QuicSessionDriver {
         return .{
-            .context = @ptrCast(self),
+            .lifetime = self.reply_target.?,
+            .context = @ptrCast(self.reply_target.?),
             .send = sendSocketMessage,
+            .cancel = cancelSocketRequest,
         };
     }
 
     pub fn queueDatagram(self: *QuicSessionRuntime, outgoing: message.OutgoingMessage) !void {
+        const limits = self.runtime.session.options;
+        if (self.datagram_outbox.items.len >= @min(self.node.options.quic_datagram_outbox_max, limits.max_queued_messages)) return error.QueueFull;
+        var bytes: usize = outgoing.subject.len + outgoing.body.len;
+        for (outgoing.headers) |header| bytes += header.name.len + header.value.len;
+        for (self.datagram_outbox.items) |msg| bytes +|= queue.messageByteSize(msg);
+        if (bytes > limits.max_queued_bytes) return error.QueueFull;
         _ = try transport.quic_datagram.encodedSize(outgoing, datagramCodecOptions(self.runtime.session.options));
         var owned = try message.Message.init(self.runtime.allocator, outgoing);
         errdefer owned.deinit();
@@ -599,6 +628,11 @@ pub const QuicSessionRuntime = struct {
     }
 
     fn deinit(self: *QuicSessionRuntime) void {
+        self.socket_requests.deinit(self.runtime.allocator);
+        if (self.reply_target) |target| {
+            target.invalidate();
+            target.release();
+        }
         for (self.datagram_outbox.items) |*msg| {
             msg.deinit();
         }
@@ -611,6 +645,7 @@ pub const QuicSessionRuntime = struct {
         // After the runtime: a pending flush sender references the
         // control state's queued frames until it completes.
         if (self.control_state) |*ctrl| ctrl.deinit();
+        if (self.subscriptions_queued) |*queued| queued.deinit();
         self.* = undefined;
     }
 };
@@ -628,8 +663,10 @@ pub const Node = struct {
     inproc_dials: std.ArrayList(*InprocDial) = .empty,
     inproc_pubs: std.ArrayList(*InprocPubEndpoint) = .empty,
     inproc_sub: ?*InprocSubEndpoint = null,
-    inproc_pending: std.ArrayList(PendingInprocRequest) = .empty,
-    quic_pending: std.ArrayList(PendingQuicRequest) = .empty,
+    requests: std.ArrayList(PendingRequest) = .empty,
+    completions: std.ArrayList(Event) = .empty,
+    request_bytes: usize = 0,
+    next_request_id: RequestId = 1,
     /// QUIC pub/sub state (docs/QUIC_PUBSUB.md): the registry of
     /// what PEERS want from us (peer id = session id), the node's
     /// own outbound subscription set (what WE want from peers), and
@@ -650,6 +687,12 @@ pub const Node = struct {
             .allocator = allocator,
             .options = options,
         };
+        try self.events.ensureTotalCapacity(allocator, options.max_events);
+        errdefer self.events.deinit(allocator);
+        try self.requests.ensureTotalCapacity(allocator, options.max_requests);
+        errdefer self.requests.deinit(allocator);
+        try self.completions.ensureTotalCapacity(allocator, options.max_requests);
+        errdefer self.completions.deinit(allocator);
         self.quic_registry = protocol.pubsub.Registry.init(allocator);
         self.quic_subscriptions = protocol.pubsub.SubscriptionSet.init(
             allocator,
@@ -682,8 +725,9 @@ pub const Node = struct {
         }
         self.quic_sessions.deinit(self.allocator);
         self.quic_socket_attachments.deinit(self.allocator);
-        self.inproc_pending.deinit(self.allocator);
-        self.quic_pending.deinit(self.allocator);
+        self.requests.deinit(self.allocator);
+        for (self.completions.items) |*event| event.deinit();
+        self.completions.deinit(self.allocator);
         self.quic_registry.deinit();
         self.quic_subscriptions.deinit();
         self.quic_credit_ledger.deinit();
@@ -797,6 +841,7 @@ pub const Node = struct {
         if (self.quic_sessions.items.len >= self.options.max_sessions) return error.TooManySessions;
 
         const runtime = try self.createQuicSession(.client, options.transport, null);
+        runtime.expected_peer_spki = options.expected_peer_spki;
         var owns_runtime = true;
         errdefer if (owns_runtime) self.destroyQuicSession(runtime);
 
@@ -841,6 +886,33 @@ pub const Node = struct {
         return null;
     }
 
+    /// Allocation/dialing is not readiness: ready requires verified TLS and HELLO.
+    pub fn sessionStatus(self: *Node, id: QuicSessionId) ?SessionStatus {
+        const runtime = self.quicSession(id) orelse return null;
+        return .{
+            .state = if (runtime.runtime.isClosingOrClosed()) .closing else if (runtime.state() == .ready) .ready else .connecting,
+            .peer_cert_spki = runtime.appSession().peer_cert_spki,
+            .supported_patterns = runtime.appSession().peer_supported_patterns,
+        };
+    }
+
+    pub fn findReadySession(self: *Node, peer_spki: [32]u8) ?QuicSessionId {
+        return self.findReadySessionSupporting(peer_spki, 0);
+    }
+
+    /// Deterministically reuse a verified session that supports every required bit.
+    pub fn findReadySessionSupporting(self: *Node, peer_spki: [32]u8, required_patterns: u64) ?QuicSessionId {
+        var best: ?QuicSessionId = null;
+        for (self.quic_sessions.items) |runtime| {
+            const status = self.sessionStatus(runtime.id()).?;
+            if (status.state != .ready or (status.supported_patterns & required_patterns) != required_patterns) continue;
+            const actual = status.peer_cert_spki orelse continue;
+            if (!std.mem.eql(u8, &actual, &peer_spki)) continue;
+            if (best == null or runtime.id() < best.?) best = runtime.id();
+        }
+        return best;
+    }
+
     pub fn attachQuicSocket(self: *Node, id: QuicSessionId, endpoint: socket.QuicSocketEndpoint) !void {
         const runtime = self.quicSession(id) orelse return error.EndpointNotFound;
         if (!quicSocketAttachmentSupported(endpoint.pattern)) return error.UnsupportedTransport;
@@ -863,6 +935,12 @@ pub const Node = struct {
     }
 
     pub fn closeQuicSession(self: *Node, id: QuicSessionId) !void {
+        const runtime = self.quicSession(id) orelse return error.EndpointNotFound;
+        runtime.runtime.beginClosing();
+        if (runtime.driver_owned) {
+            if (runtime.connection) |conn| conn.close(false, 0, "application closed session");
+            return;
+        }
         for (self.quic_clients.items, 0..) |client, index| {
             if (client.id() != id) continue;
             _ = self.quic_clients.orderedRemove(index);
@@ -870,25 +948,28 @@ pub const Node = struct {
             self.allocator.destroy(client);
             break;
         }
+        // Cleanup precedes best-effort lifecycle notification. A full queue or
+        // allocation failure cannot leave a dangling connection/session behind.
+        self.destroyQuicSession(runtime);
+    }
 
-        for (self.quic_sessions.items, 0..) |runtime, index| {
-            if (runtime.id() != id) continue;
-
-            // Driver-owned (listener-side) sessions are destroyed by
-            // the will-close teardown when their connection reaps;
-            // freeing them here would leave the Driver's ConnState
-            // dangling and double-free on disconnect.
-            if (runtime.driver_owned) return error.InvalidState;
-
-            runtime.runtime.session.close();
-            try self.emit(.{ .closed = id });
-            _ = self.quic_sessions.orderedRemove(index);
-            self.removeSocketSessionRefs(id);
-            runtime.deinit();
-            self.allocator.destroy(runtime);
-            return;
+    fn failSessionRequests(self: *Node, session_id: QuicSessionId) void {
+        var index: usize = 0;
+        while (index < self.requests.items.len) {
+            const pending = self.requests.items[index];
+            if (pending.kind != .quic or pending.session_id != session_id) {
+                index += 1;
+                continue;
+            }
+            _ = self.removeRequest(index);
+            self.emitCompletion(.{ .quic_request_failed = .{
+                .request_id = pending.request_id,
+                .session_id = session_id,
+                .stream_id = pending.stream_id,
+                .id = pending.id,
+                .failure = .peer_closed,
+            } }) catch {};
         }
-        return error.EndpointNotFound;
     }
 
     pub fn listenInprocRep(
@@ -993,6 +1074,89 @@ pub const Node = struct {
     /// `error.EndpointClosed` (peer closed), `error.NoPeer`. Map them
     /// through `classifyRequestError` for the shared failure
     /// vocabulary.
+    fn admitRequest(self: *Node, outgoing: message.OutgoingMessage) !struct { id: RequestId, bytes: usize } {
+        if (self.requests.items.len + self.completions.items.len >= self.options.max_requests) return error.TooManyInflightRequests;
+        const bytes = outgoingMessageBytes(outgoing);
+        if (bytes > self.options.max_request_bytes or self.request_bytes > self.options.max_request_bytes - bytes) return error.QueueFull;
+        const id = self.next_request_id;
+        self.next_request_id = std.math.add(u64, id, 1) catch return error.TooManyInflightRequests;
+        return .{ .id = id, .bytes = bytes };
+    }
+
+    fn removeRequest(self: *Node, index: usize) PendingRequest {
+        const pending = self.requests.orderedRemove(index);
+        self.request_bytes -= pending.bytes;
+        return pending;
+    }
+
+    fn pendingCount(self: *Node, kind: @FieldType(PendingRequest, "kind")) usize {
+        var n: usize = 0;
+        for (self.requests.items) |pending| if (pending.kind == kind) {
+            n += 1;
+        };
+        return n;
+    }
+
+    /// The canonical send operation returns an opaque local ID, independent of
+    /// wire message IDs and stream IDs. Completion events carry request_id.
+    pub fn request(self: *Node, target: RequestTarget, outgoing: message.OutgoingMessage) !RequestId {
+        switch (target) {
+            .inproc => |id| _ = try self.requestInproc(id, outgoing),
+            .quic => |id| _ = try self.requestQuic(id, outgoing),
+        }
+        return self.requests.items[self.requests.items.len - 1].request_id;
+    }
+
+    pub fn cancelRequest(self: *Node, id: RequestId) !bool {
+        for (self.requests.items) |pending| {
+            if (pending.request_id != id) continue;
+            return switch (pending.kind) {
+                .inproc => self.cancelInprocRequest(pending.dial_id, pending.id),
+                .quic => self.cancelQuicRequest(pending.session_id, pending.stream_id),
+            };
+        }
+        return false;
+    }
+
+    /// Results remain reserved until poll/takeOutcome consumes them, even when
+    /// the ordinary event queue is full. No second allocation on completion.
+    fn emitCompletion(self: *Node, event: Event) !void {
+        std.debug.assert(self.completions.items.len < self.options.max_requests);
+        var effective = event;
+        if (eventMessage(event)) |msg| {
+            var bytes = queue.messageByteSize(msg);
+            for (self.completions.items) |queued| if (eventMessage(queued)) |body| {
+                bytes +|= queue.messageByteSize(body);
+            };
+            if (bytes > self.options.max_completion_bytes) {
+                effective = switch (event) {
+                    .reply => |ev| .{ .request_failed = .{ .request_id = ev.request_id, .dial_id = ev.dial_id, .session_id = ev.session_id, .stream_id = ev.stream_id, .id = ev.msg.id, .failure = .queue_full } },
+                    .quic_reply => |ev| .{ .quic_request_failed = .{ .request_id = ev.request_id, .session_id = ev.session_id, .stream_id = ev.stream_id, .id = ev.msg.id, .failure = .queue_full } },
+                    else => unreachable,
+                };
+                var owned = event;
+                owned.deinit();
+                self.counters.dropped += 1;
+            }
+        }
+        self.completions.appendAssumeCapacity(effective);
+        if (eventCarriesMessage(effective)) self.counters.recv += 1;
+    }
+
+    pub fn takeOutcome(self: *Node, id: RequestId) ?Event {
+        for (self.completions.items, 0..) |event, index| {
+            const event_id = switch (event) {
+                .reply => |ev| ev.request_id,
+                .quic_reply => |ev| ev.request_id,
+                .request_failed => |ev| ev.request_id,
+                .quic_request_failed => |ev| ev.request_id,
+                else => 0,
+            };
+            if (event_id == id) return self.canonicalEvent(self.completions.orderedRemove(index));
+        }
+        return null;
+    }
+
     pub fn requestInproc(
         self: *Node,
         dial_id: InprocDialId,
@@ -1007,15 +1171,23 @@ pub const Node = struct {
         try self.expireInprocPending(self.nowMs());
 
         const now_ms = self.nowMs();
-        const id = try req_dial.socket.sendRequestAt(outgoing, now_ms);
-        errdefer _ = req_dial.socket.cancelRequest(id);
-
-        try self.inproc_pending.append(self.allocator, .{
+        const admitted = try self.admitRequest(outgoing);
+        var effective = outgoing;
+        if (effective.id == 0) effective.id = admitted.id;
+        for (self.requests.items) |pending| {
+            if (pending.kind == .inproc and pending.dial_id == dial_id and pending.id == effective.id) return error.DuplicateInflightRequest;
+        }
+        const id = try req_dial.socket.sendUntrackedRequestWithToken(effective, admitted.id);
+        self.requests.appendAssumeCapacity(.{
+            .kind = .inproc,
+            .request_id = admitted.id,
+            .bytes = admitted.bytes,
             .dial_id = dial_id,
             .id = id,
             .deadline_ms = outgoing.deadline_ms,
             .sent_at_ms = now_ms,
         });
+        self.request_bytes += admitted.bytes;
         self.counters.sent += 1;
         return id;
     }
@@ -1024,14 +1196,16 @@ pub const Node = struct {
     /// with `.canceled` so the correlating consumer learns the
     /// outcome; a reply arriving later is dropped and counted.
     pub fn cancelInprocRequest(self: *Node, dial_id: InprocDialId, id: message.MessageId) !bool {
-        for (self.inproc_pending.items, 0..) |pending, index| {
+        for (self.requests.items, 0..) |pending, index| {
+            if (pending.kind != .inproc) continue;
             if (pending.dial_id != dial_id or pending.id != id) continue;
 
-            _ = self.inproc_pending.orderedRemove(index);
+            _ = self.removeRequest(index);
             if (self.inprocDial(dial_id)) |req_dial| {
                 _ = req_dial.socket.cancelRequest(id);
             }
-            try self.emit(.{ .request_failed = .{
+            try self.emitCompletion(.{ .request_failed = .{
+                .request_id = pending.request_id,
                 .dial_id = dial_id,
                 .id = id,
                 .failure = .canceled,
@@ -1044,16 +1218,23 @@ pub const Node = struct {
     /// Replies to a request surfaced as a `request` event, while the
     /// event is still alive (its subject is echoed when the outgoing
     /// reply leaves the subject empty).
+    /// Reply using a retained local capability, independent of request payload lifetime.
+    pub fn reply(self: *Node, handle: message.ReplyHandle, outgoing: message.OutgoingMessage) !void {
+        try handle.reply(outgoing);
+        self.counters.sent += 1;
+    }
+
     pub fn replyInproc(
         self: *Node,
-        request: *const RequestEvent,
+        incoming_request: *const RequestEvent,
         outgoing: message.OutgoingMessage,
     ) !void {
-        const endpoint = self.inprocRepEndpoint(request.endpoint_id) orelse return error.EndpointNotFound;
+        if (incoming_request.msg.reply_handle) |handle| return self.reply(handle, outgoing);
+        const endpoint = self.inprocRepEndpoint(incoming_request.endpoint_id) orelse return error.EndpointNotFound;
         try endpoint.socket.replyKey(.{
-            .id = request.msg.id,
-            .deadline_ms = request.msg.deadline_ms,
-            .subject = request.msg.subject,
+            .id = incoming_request.msg.id,
+            .deadline_ms = incoming_request.msg.deadline_ms,
+            .subject = incoming_request.msg.subject,
         }, outgoing);
         self.counters.sent += 1;
     }
@@ -1063,14 +1244,21 @@ pub const Node = struct {
     /// `qmsg-error-code` / `qmsg-error-message` headers.
     pub fn replyErrorInproc(
         self: *Node,
-        request: *const RequestEvent,
+        incoming_request: *const RequestEvent,
         app_error: socket.ErrorReply,
     ) !void {
-        const endpoint = self.inprocRepEndpoint(request.endpoint_id) orelse return error.EndpointNotFound;
+        if (incoming_request.msg.reply_handle) |handle| {
+            const headers = [_]message.Header{
+                .{ .name = socket.ErrorReply.code_header, .value = app_error.code },
+                .{ .name = socket.ErrorReply.message_header, .value = app_error.message },
+            };
+            return self.reply(handle, .{ .subject = app_error.subject, .flags = .{ .err = true }, .headers = &headers, .body = app_error.message });
+        }
+        const endpoint = self.inprocRepEndpoint(incoming_request.endpoint_id) orelse return error.EndpointNotFound;
         try endpoint.socket.replyErrorKey(.{
-            .id = request.msg.id,
-            .deadline_ms = request.msg.deadline_ms,
-            .subject = request.msg.subject,
+            .id = incoming_request.msg.id,
+            .deadline_ms = incoming_request.msg.deadline_ms,
+            .subject = incoming_request.msg.subject,
         }, app_error);
         self.counters.sent += 1;
     }
@@ -1199,7 +1387,21 @@ pub const Node = struct {
         try self.expireInprocPending(self.nowMs());
 
         for (self.inproc_rep_endpoints.items) |endpoint| {
-            while (try endpoint.socket.tryRecv()) |received| {
+            while (endpoint.socket.core.inbox.peek()) |head| {
+                const bytes = queue.messageByteSize(head);
+                const oversized = bytes > self.options.max_event_bytes;
+                if (!oversized and (self.events.items.len >= self.options.max_events or !self.eventBytesFit(bytes))) break;
+                var received = (try endpoint.socket.tryRecv()) orelse break;
+                if (oversized) {
+                    self.rejectRequest(received.message, error.MessageTooLarge);
+                    received.deinit();
+                    continue;
+                }
+                endpoint.session.admit(.{ .pattern = .rep, .subject = received.message.subject, .message_size = bytes }) catch |err| {
+                    self.rejectRequest(received.message, err);
+                    received.deinit();
+                    continue;
+                };
                 try self.emit(.{ .request = .{
                     .endpoint_id = endpoint.id,
                     .session_id = endpoint.session.id,
@@ -1232,6 +1434,15 @@ pub const Node = struct {
         }
     }
 
+    fn rejectRequest(self: *Node, incoming: message.Message, err: anyerror) void {
+        self.counters.dropped += 1;
+        if (incoming.flags.no_reply) return;
+        const handle = incoming.reply_handle orelse return;
+        const code = @errorName(err);
+        const headers = [_]message.Header{.{ .name = socket.ErrorReply.code_header, .value = code }};
+        handle.reply(.{ .subject = "", .flags = .{ .err = true }, .headers = &headers, .body = code }) catch {};
+    }
+
     /// Drains attached embedded QUIC sessions into the event queue
     /// (the pull model): inbound requests on peer-initiated streams,
     /// replies on the session's own request streams, and datagram
@@ -1240,16 +1451,31 @@ pub const Node = struct {
     /// calls); this only drains what has arrived.
     fn pumpEmbeddedQuic(self: *Node) !void {
         for (self.quic_sessions.items) |runtime| {
-            if (!runtime.runtime.event_delivery) continue;
+            if (!runtime.runtime.event_delivery and self.options.delivery != .events) continue;
+            if (self.quicSocketAttachment(runtime.id()) != null) continue;
 
             while (runtime.runtime.peekReliableStreamId()) |stream_id| {
                 const is_request = transport.quic_session_runtime.isPeerBidiStreamId(
                     runtime.runtime.session.role,
                     stream_id,
                 );
+                const incoming_bytes = queue.messageByteSize(runtime.runtime.inbox.items[0].message);
+                const oversized = incoming_bytes > self.options.max_event_bytes;
+                if (is_request and !oversized and (self.events.items.len >= self.options.max_events or !self.eventBytesFit(incoming_bytes))) break;
+                if (is_request) try runtime.attachReplyHandle(&runtime.runtime.inbox.items[0].message, stream_id);
                 var received = runtime.runtime.recvReliable() orelse break;
-                const incoming = received.takeMessage();
+                var incoming = received.takeMessage();
                 if (is_request) {
+                    if (oversized) {
+                        self.rejectRequest(incoming, error.MessageTooLarge);
+                        incoming.deinit();
+                        continue;
+                    }
+                    runtime.appSession().admit(.{ .pattern = .rep, .subject = incoming.subject, .message_size = queue.messageByteSize(incoming) }) catch |err| {
+                        self.rejectRequest(incoming, err);
+                        incoming.deinit();
+                        continue;
+                    };
                     try self.emit(.{ .quic_request = .{
                         .session_id = runtime.id(),
                         .stream_id = stream_id,
@@ -1259,12 +1485,16 @@ pub const Node = struct {
                     // A reply completes its pending request (if the
                     // consumer registered one): first classification
                     // wins, and the reply is the outcome.
-                    _ = self.settleQuicRequest(runtime.id(), stream_id);
-                    try self.emit(.{ .quic_reply = .{
-                        .session_id = runtime.id(),
-                        .stream_id = stream_id,
-                        .msg = incoming,
-                    } });
+                    if (self.takeQuicPending(runtime.id(), stream_id)) |pending| {
+                        try self.emitCompletion(.{ .quic_reply = .{
+                            .request_id = pending.request_id,
+                            .session_id = runtime.id(),
+                            .stream_id = stream_id,
+                            .msg = incoming,
+                        } });
+                    } else {
+                        try self.emit(.{ .quic_reply = .{ .session_id = runtime.id(), .stream_id = stream_id, .msg = incoming } });
+                    }
                 }
             }
 
@@ -1285,17 +1515,22 @@ pub const Node = struct {
     /// the request's deadline travels back on the reply.
     pub fn replyQuic(
         self: *Node,
-        request: *const QuicRequestEvent,
+        incoming_request: *const QuicRequestEvent,
         outgoing: message.OutgoingMessage,
     ) !void {
-        const runtime = self.quicSession(request.session_id) orelse return error.EndpointNotFound;
+        if (incoming_request.msg.reply_handle) |handle| {
+            try handle.reply(outgoing);
+            self.counters.sent += 1;
+            return;
+        }
+        const runtime = self.quicSession(incoming_request.session_id) orelse return error.EndpointNotFound;
 
         var effective = outgoing;
-        if (effective.subject.len == 0) effective.subject = request.msg.subject;
-        if (effective.id == 0) effective.id = request.msg.id;
-        if (effective.deadline_ms == null) effective.deadline_ms = request.msg.deadline_ms;
+        if (effective.subject.len == 0) effective.subject = incoming_request.msg.subject;
+        if (effective.id == 0) effective.id = incoming_request.msg.id;
+        if (effective.deadline_ms == null) effective.deadline_ms = incoming_request.msg.deadline_ms;
 
-        try runtime.replyReliableOnStream(request.stream_id, effective);
+        try runtime.replyReliableOnStream(incoming_request.stream_id, effective);
         self.counters.sent += 1;
     }
 
@@ -1304,23 +1539,23 @@ pub const Node = struct {
     /// `qmsg-error-code` / `qmsg-error-message` headers.
     pub fn replyErrorQuic(
         self: *Node,
-        request: *const QuicRequestEvent,
+        incoming_request: *const QuicRequestEvent,
         app_error: socket.ErrorReply,
     ) !void {
-        const runtime = self.quicSession(request.session_id) orelse return error.EndpointNotFound;
+        const runtime = self.quicSession(incoming_request.session_id) orelse return error.EndpointNotFound;
 
         const headers = [_]message.Header{
             .{ .name = socket.ErrorReply.code_header, .value = app_error.code },
             .{ .name = socket.ErrorReply.message_header, .value = app_error.message },
         };
         var effective_subject = app_error.subject;
-        if (effective_subject.len == 0) effective_subject = request.msg.subject;
+        if (effective_subject.len == 0) effective_subject = incoming_request.msg.subject;
 
-        try runtime.replyReliableOnStream(request.stream_id, .{
+        try runtime.replyReliableOnStream(incoming_request.stream_id, .{
             .subject = effective_subject,
-            .id = request.msg.id,
+            .id = incoming_request.msg.id,
             .flags = .{ .err = true, .final = true },
-            .deadline_ms = request.msg.deadline_ms,
+            .deadline_ms = incoming_request.msg.deadline_ms,
             .headers = &headers,
             .body = app_error.message,
         });
@@ -1353,25 +1588,45 @@ pub const Node = struct {
         filter: []const u8,
         options: queue.QueueOptions,
     ) !void {
-        if (!try self.quic_subscriptions.add(filter)) return; // duplicate
-
-        for (self.quic_sessions.items) |runtime| {
-            if (!runtime.subscriptions_synced) continue; // full set comes at sync
-            const state = &(runtime.control_state orelse continue);
-            state.queueSubscribe(filter, options) catch continue;
-        }
+        if (!try self.quic_subscriptions.addWithOptions(filter, options)) return;
+        for (self.quic_sessions.items) |runtime| runtime.subscriptions_synced = self.reconcileSubscriptions(runtime);
     }
 
-    /// Removes a `subscribeQuic` subscription: the filter leaves the
-    /// node set and UNSUBSCRIBE is queued for every synced session.
+    /// Updates the desired set. Failed control admission is retried by tick.
     pub fn unsubscribeQuic(self: *Node, filter: []const u8) void {
         if (!self.quic_subscriptions.remove(filter)) return;
+        for (self.quic_sessions.items) |runtime| runtime.subscriptions_synced = self.reconcileSubscriptions(runtime);
+    }
 
-        for (self.quic_sessions.items) |runtime| {
-            if (!runtime.subscriptions_synced) continue;
-            const state = &(runtime.control_state orelse continue);
-            state.queueUnsubscribe(filter) catch continue;
+    fn reconcileSubscriptions(self: *Node, runtime: *QuicSessionRuntime) bool {
+        if (runtime.state() != .ready) return false;
+        const state = &(runtime.control_state orelse return false);
+        const queued = &(runtime.subscriptions_queued orelse return false);
+        var index: usize = 0;
+        while (index < queued.entries.items.len) {
+            const filter = queued.entries.items[index].filter.text;
+            if (self.quic_subscriptions.contains(filter)) {
+                index += 1;
+                continue;
+            }
+            state.queueUnsubscribe(filter) catch return false;
+            _ = queued.remove(filter);
         }
+        for (self.quic_subscriptions.entries.items) |desired| {
+            if (queued.optionsFor(desired.filter.text)) |old| {
+                if (std.meta.eql(old, desired.queue_options)) continue;
+                state.queueSubscribe(desired.filter.text, desired.queue_options) catch return false;
+                _ = queued.addWithOptions(desired.filter.text, desired.queue_options) catch unreachable;
+            } else {
+                // Allocate the snapshot first; enqueue can then commit atomically.
+                _ = queued.addWithOptions(desired.filter.text, desired.queue_options) catch return false;
+                state.queueSubscribe(desired.filter.text, desired.queue_options) catch {
+                    _ = queued.remove(desired.filter.text);
+                    return false;
+                };
+            }
+        }
+        return true;
     }
 
     /// Publishes one datagram to every QUIC session whose registry
@@ -1393,6 +1648,10 @@ pub const Node = struct {
         for (matches.items) |match| {
             const runtime = self.quicSession(@intCast(match.peer_id)) orelse continue;
             if (runtime.runtime.state() != .ready) continue;
+            runtime.appSession().admit(.{ .pattern = .sub, .subject = outgoing.subject, .datagram = true, .message_size = outgoingMessageBytes(outgoing) }) catch {
+                self.counters.dropped += 1;
+                continue;
+            };
 
             if (!runtime.runtime.appSession().datagram_enabled) {
                 self.counters.dropped += 1;
@@ -1403,7 +1662,7 @@ pub const Node = struct {
                 continue;
             }
 
-            if (!self.roomForQuicDatagram(runtime)) {
+            if (!self.roomForQuicDatagram(runtime, outgoingMessageBytes(outgoing))) {
                 self.counters.dropped += 1;
                 self.emit(.{ .message_dropped = .{
                     .session_id = runtime.id(),
@@ -1413,12 +1672,13 @@ pub const Node = struct {
             }
 
             runtime.queueDatagram(outgoing) catch |err| switch (err) {
-                error.MessageTooLarge => {
+                error.MessageTooLarge, error.QueueFull => {
                     self.counters.dropped += 1;
                     self.emit(.{ .message_dropped = .{
                         .session_id = runtime.id(),
                         .bytes = outgoing.body.len,
                     } }) catch {};
+                    continue;
                 },
                 else => return err,
             };
@@ -1431,22 +1691,22 @@ pub const Node = struct {
     /// Makes room per the subscriber's queue policy at the outbox
     /// bound: drop-newest reports no room (the publication sheds),
     /// drop-oldest sheds the oldest queued datagram to make it.
-    fn roomForQuicDatagram(self: *Node, runtime: *QuicSessionRuntime) bool {
-        if (runtime.datagram_outbox.items.len < self.options.quic_datagram_outbox_max) {
-            return true;
+    fn roomForQuicDatagram(self: *Node, runtime: *QuicSessionRuntime, incoming_bytes: usize) bool {
+        const options = self.quic_registry.peerQueueOptions(quicRegistryPeer(runtime.id())) orelse return false;
+        const limits = runtime.runtime.session.options;
+        const max_count = @min(options.max_messages, @min(self.options.quic_datagram_outbox_max, limits.max_queued_messages));
+        const max_bytes = @min(options.max_bytes, limits.max_queued_bytes);
+        if (incoming_bytes > max_bytes or max_count == 0) return false;
+        var bytes = incoming_bytes;
+        for (runtime.datagram_outbox.items) |msg| bytes +|= queue.messageByteSize(msg);
+        while (runtime.datagram_outbox.items.len >= max_count or bytes > max_bytes) {
+            if (options.on_full != .drop_oldest or runtime.datagram_outbox.items.len == 0) return false;
+            var shed = runtime.datagram_outbox.orderedRemove(0);
+            bytes -= queue.messageByteSize(shed);
+            self.counters.dropped += 1;
+            shed.deinit();
         }
-
-        const options = self.quic_registry.peerQueueOptions(
-            quicRegistryPeer(runtime.id()),
-        ) orelse return false;
-        switch (options.on_full) {
-            .drop_newest => return false,
-            else => {
-                var shed = runtime.datagram_outbox.orderedRemove(0);
-                shed.deinit();
-                return true;
-            },
-        }
+        return true;
     }
 
     /// Tick-driven control sync (docs/QUIC_PUBSUB.md): every ready
@@ -1460,13 +1720,8 @@ pub const Node = struct {
             var state = &(runtime.control_state orelse continue);
             if (runtime.runtime.state() != .ready) continue;
 
-            if (!runtime.subscriptions_synced) {
-                for (self.quic_subscriptions.entries.items) |*entry| {
-                    state.queueSubscribe(entry.filter.text, peerQueueDefaults) catch continue;
-                }
-                runtime.subscriptions_synced = true;
-                state = &(runtime.control_state orelse continue);
-            }
+            runtime.subscriptions_synced = self.reconcileSubscriptions(runtime);
+            state = &(runtime.control_state orelse continue);
 
             if (state.queuedFrameCount() == 0) continue;
             if (runtime.runtime.hasControlFlushSender()) continue;
@@ -1500,14 +1755,19 @@ pub const Node = struct {
         // settled classifies before a new request joins the table.
         try self.sweepQuicPending(self.nowMs());
 
+        const admitted = try self.admitRequest(outgoing);
         const stream_id = try runtime.queueReliable(outgoing);
-        try self.quic_pending.append(self.allocator, .{
+        self.requests.appendAssumeCapacity(.{
+            .kind = .quic,
+            .request_id = admitted.id,
+            .bytes = admitted.bytes,
             .session_id = session_id,
             .stream_id = stream_id,
             .id = outgoing.id,
             .deadline_ms = outgoing.deadline_ms,
             .sent_at_ms = self.nowMs(),
         });
+        self.request_bytes += admitted.bytes;
         self.counters.sent += 1;
         return stream_id;
     }
@@ -1527,6 +1787,7 @@ pub const Node = struct {
     ) !bool {
         const pending = self.takeQuicPending(session_id, stream_id) orelse return false;
 
+        if (self.quicSession(session_id)) |runtime| runtime.runtime.abortReliable(stream_id);
         if (self.quicClientConnection(session_id)) |conn| {
             const plan = transport.quic_cancel.cancelPlan(
                 stream_id,
@@ -1536,7 +1797,8 @@ pub const Node = struct {
             _ = transport.quic_cancel.applyCancelPlan(conn, plan, .{}) catch {};
         }
 
-        try self.emit(.{ .quic_request_failed = .{
+        try self.emitCompletion(.{ .quic_request_failed = .{
+            .request_id = pending.request_id,
             .session_id = session_id,
             .stream_id = stream_id,
             .id = pending.id,
@@ -1566,10 +1828,11 @@ pub const Node = struct {
         self: *Node,
         session_id: QuicSessionId,
         stream_id: u64,
-    ) ?PendingQuicRequest {
-        for (self.quic_pending.items, 0..) |pending, index| {
+    ) ?PendingRequest {
+        for (self.requests.items, 0..) |pending, index| {
+            if (pending.kind != .quic) continue;
             if (pending.session_id != session_id or pending.stream_id != stream_id) continue;
-            return self.quic_pending.orderedRemove(index);
+            return self.removeRequest(index);
         }
         return null;
     }
@@ -1579,6 +1842,7 @@ pub const Node = struct {
     /// connections the node does not own — no cancel plan can be
     /// applied there.
     fn quicClientConnection(self: *Node, session_id: QuicSessionId) ?*transport.quic_runtime.Connection {
+        if (self.quicSession(session_id)) |runtime| if (runtime.connection) |conn| return conn;
         for (self.quic_clients.items) |client| {
             if (client.id() != session_id) continue;
             return client.client.runtime.connection();
@@ -1595,15 +1859,20 @@ pub const Node = struct {
     /// before each `requestQuic` append.
     fn sweepQuicPending(self: *Node, now_ms: u64) !void {
         var index: usize = 0;
-        while (index < self.quic_pending.items.len) {
-            const pending = self.quic_pending.items[index];
+        while (index < self.requests.items.len) {
+            const pending = self.requests.items[index];
+            if (pending.kind != .quic) {
+                index += 1;
+                continue;
+            }
 
             const runtime = self.quicSession(pending.session_id);
             const dead = runtime == null or
                 runtime.?.runtime.isClosingOrClosed();
             if (dead) {
-                _ = self.quic_pending.orderedRemove(index);
-                try self.emit(.{ .quic_request_failed = .{
+                _ = self.removeRequest(index);
+                try self.emitCompletion(.{ .quic_request_failed = .{
+                    .request_id = pending.request_id,
                     .session_id = pending.session_id,
                     .stream_id = pending.stream_id,
                     .id = pending.id,
@@ -1613,15 +1882,22 @@ pub const Node = struct {
             }
 
             if (runtime.?.runtime.inboxHasStream(pending.stream_id)) {
-                // The reply arrived; the consumer just has not popped
-                // it yet. Settled — no event.
-                _ = self.quic_pending.orderedRemove(index);
+                if (runtime.?.runtime.event_delivery or self.options.delivery == .events) {
+                    index += 1; // poll owns outcome transfer and keeps its reservation
+                } else {
+                    _ = self.removeRequest(index); // explicit legacy inbox consumer
+                }
                 continue;
             }
 
             if (pending.isExpired(now_ms)) {
-                _ = self.quic_pending.orderedRemove(index);
-                try self.emit(.{ .quic_request_failed = .{
+                runtime.?.runtime.abortReliable(pending.stream_id);
+                if (self.quicClientConnection(pending.session_id)) |conn| {
+                    _ = transport.quic_cancel.applyCancelPlan(conn, transport.quic_cancel.cancelPlan(pending.stream_id, .explicit, .bidirectional), .{}) catch {};
+                }
+                _ = self.removeRequest(index);
+                try self.emitCompletion(.{ .quic_request_failed = .{
+                    .request_id = pending.request_id,
                     .session_id = pending.session_id,
                     .stream_id = pending.stream_id,
                     .id = pending.id,
@@ -1639,12 +1915,13 @@ pub const Node = struct {
     /// counted, and surfaced as `message_dropped`.
     fn completeInprocReply(self: *Node, req_dial: *InprocDial, msg_in: message.Message) !void {
         var msg = msg_in;
-        for (self.inproc_pending.items, 0..) |pending, index| {
-            if (pending.dial_id != req_dial.id or pending.id != msg.id) continue;
+        for (self.requests.items, 0..) |pending, index| {
+            if (pending.kind != .inproc) continue;
+            if (pending.dial_id != req_dial.id or pending.id != msg.id or pending.request_id != msg.local_correlation) continue;
 
-            _ = self.inproc_pending.orderedRemove(index);
+            _ = self.removeRequest(index);
             _ = req_dial.socket.cancelRequest(msg.id);
-            try self.emit(.{ .reply = .{ .dial_id = req_dial.id, .msg = msg } });
+            try self.emitCompletion(.{ .reply = .{ .request_id = pending.request_id, .dial_id = req_dial.id, .msg = msg } });
             return;
         }
 
@@ -1656,18 +1933,23 @@ pub const Node = struct {
 
     fn expireInprocPending(self: *Node, now_ms: u64) !void {
         var index: usize = 0;
-        while (index < self.inproc_pending.items.len) {
-            const pending = self.inproc_pending.items[index];
+        while (index < self.requests.items.len) {
+            const pending = self.requests.items[index];
+            if (pending.kind != .inproc) {
+                index += 1;
+                continue;
+            }
             if (!pending.isExpired(now_ms)) {
                 index += 1;
                 continue;
             }
 
-            _ = self.inproc_pending.orderedRemove(index);
+            _ = self.removeRequest(index);
             if (self.inprocDial(pending.dial_id)) |req_dial| {
                 _ = req_dial.socket.cancelRequest(pending.id);
             }
-            try self.emit(.{ .request_failed = .{
+            try self.emitCompletion(.{ .request_failed = .{
+                .request_id = pending.request_id,
                 .dial_id = pending.dial_id,
                 .id = pending.id,
                 .failure = .deadline_exceeded,
@@ -1676,7 +1958,7 @@ pub const Node = struct {
     }
 
     pub fn runOnce(self: *Node, dispatcher: anytype) !RunOnceResult {
-        if (comptime dispatcherHas(@TypeOf(dispatcher), "dispatchInprocRep")) {
+        if (self.options.delivery == .legacy) if (comptime dispatcherHas(@TypeOf(dispatcher), "dispatchInprocRep")) {
             for (self.inproc_rep_endpoints.items) |endpoint| {
                 if (try dispatcher.dispatchInprocRep(endpoint)) {
                     return .{
@@ -1685,15 +1967,14 @@ pub const Node = struct {
                     };
                 }
             }
-        }
+        };
 
         for (self.quic_sessions.items) |runtime| {
             // Embedded attach sessions are pull-consumed: their
             // inbound messages surface through `poll` events, never
             // through a dispatcher.
-            if (runtime.runtime.event_delivery) continue;
-
             const attachment = self.quicSocketAttachment(runtime.id());
+            if (attachment == null and (runtime.runtime.event_delivery or self.options.delivery == .events)) continue;
             const can_dispatch_reliable = comptime dispatcherHas(@TypeOf(dispatcher), "dispatchQuicReliable");
             if (attachment == null and !can_dispatch_reliable) continue;
 
@@ -1711,11 +1992,33 @@ pub const Node = struct {
                 )) continue;
             }
 
+            const pending_stream = runtime.runtime.peekReliableStreamId() orelse continue;
+            if (attachment) |endpoint| if (endpoint.can_receive) |can_receive| {
+                if (!can_receive(endpoint.context, queue.messageByteSize(runtime.runtime.inbox.items[0].message))) continue;
+            };
+            if (transport.quic_session_runtime.isPeerBidiStreamId(runtime.runtime.session.role, pending_stream)) {
+                try runtime.attachReplyHandle(&runtime.runtime.inbox.items[0].message, pending_stream);
+            }
             var received = runtime.runtime.recvReliable() orelse continue;
             const stream_id = received.stream_id;
             var incoming = received.takeMessage();
+            if (transport.quic_session_runtime.isPeerBidiStreamId(runtime.runtime.session.role, stream_id)) {
+                runtime.appSession().admit(.{ .pattern = .rep, .subject = incoming.subject, .message_size = queue.messageByteSize(incoming) }) catch |err| {
+                    self.rejectRequest(incoming, err);
+                    incoming.deinit();
+                    continue;
+                };
+            }
 
             if (attachment) |endpoint| {
+                if (endpoint.pattern == .req) {
+                    const token = runtime.socket_requests.fetchRemove(stream_id) orelse {
+                        incoming.deinit();
+                        self.counters.dropped += 1;
+                        continue;
+                    };
+                    incoming.local_correlation = token.value;
+                }
                 endpoint.receive(endpoint.context, incoming) catch |err| {
                     incoming.deinit();
                     return err;
@@ -1730,8 +2033,8 @@ pub const Node = struct {
                 var result = try dispatcher.dispatchQuicReliable(.rep, incoming, runtime.appSession());
                 defer result.deinit();
 
-                for (result.replies.items) |reply| {
-                    try runtime.replyReliableOnStream(stream_id, reply.outgoing());
+                for (result.replies.items) |response| {
+                    try runtime.replyReliableOnStream(stream_id, response.outgoing());
                 }
 
                 if (comptime @hasField(@TypeOf(result), "publications")) {
@@ -1751,9 +2054,8 @@ pub const Node = struct {
         }
 
         for (self.quic_sessions.items) |runtime| {
-            if (runtime.runtime.event_delivery) continue;
-
             const attachment = self.quicSocketAttachment(runtime.id());
+            if (attachment == null and (runtime.runtime.event_delivery or self.options.delivery == .events)) continue;
             const can_dispatch_datagram = comptime dispatcherHas(@TypeOf(dispatcher), "dispatchQuicDatagram");
             if (attachment == null and !can_dispatch_datagram) continue;
 
@@ -1805,14 +2107,25 @@ pub const Node = struct {
         try self.pumpInproc();
         try self.pumpEmbeddedQuic();
 
-        const count = @min(out.len, self.events.items.len);
-        for (out[0..count], 0..) |*slot, index| {
-            slot.* = self.events.items[index];
+        var count: usize = 0;
+        while (count < out.len and self.completions.items.len > 0) : (count += 1) {
+            out[count] = self.canonicalEvent(self.completions.orderedRemove(0));
         }
-        for (0..count) |_| {
-            _ = self.events.orderedRemove(0);
+        while (count < out.len and self.events.items.len > 0) : (count += 1) {
+            out[count] = self.canonicalEvent(self.events.orderedRemove(0));
         }
         return count;
+    }
+
+    fn canonicalEvent(self: *Node, event: Event) Event {
+        if (self.options.event_format == .legacy_transport) return event;
+        return switch (event) {
+            .quic_request => |ev| .{ .request = .{ .session_id = ev.session_id, .stream_id = ev.stream_id, .msg = ev.msg } },
+            .quic_reply => |ev| .{ .reply = .{ .request_id = ev.request_id, .session_id = ev.session_id, .stream_id = ev.stream_id, .msg = ev.msg } },
+            .quic_request_failed => |ev| .{ .request_failed = .{ .request_id = ev.request_id, .session_id = ev.session_id, .stream_id = ev.stream_id, .id = ev.id, .failure = ev.failure } },
+            .quic_delivery => |ev| .{ .delivery = .{ .session_id = ev.session_id, .msg = ev.msg } },
+            else => event,
+        };
     }
 
     pub fn nextTimer(self: *const Node) ?u64 {
@@ -1830,10 +2143,7 @@ pub const Node = struct {
         // Request deadlines are node-level timers too: an embedder
         // that sleeps until `nextTimer` must wake to fail an expired
         // request, not only to service the transport.
-        for (self.inproc_pending.items) |pending| {
-            if (pending.deadlineUs()) |at_us| bestTimer(&best, at_us);
-        }
-        for (self.quic_pending.items) |pending| {
+        for (self.requests.items) |pending| {
             if (pending.deadlineUs()) |at_us| bestTimer(&best, at_us);
         }
         return best;
@@ -1844,7 +2154,8 @@ pub const Node = struct {
     /// (freeing any payload it owns, counting message drops and
     /// `Stats.events_dropped`) instead of growing without limit.
     pub fn emit(self: *Node, event: Event) !void {
-        if (self.events.items.len >= self.options.max_events) {
+        const bytes = if (eventMessage(event)) |msg| queue.messageByteSize(msg) else 0;
+        if (self.events.items.len >= self.options.max_events or !self.eventBytesFit(bytes)) {
             self.counters.events_dropped += 1;
             if (eventCarriesMessage(event)) self.counters.dropped += 1;
             var dropped = event;
@@ -1860,8 +2171,16 @@ pub const Node = struct {
         if (eventCarriesMessage(event)) self.counters.recv += 1;
     }
 
+    fn eventBytesFit(self: *Node, incoming: usize) bool {
+        var bytes = incoming;
+        for (self.events.items) |event| if (eventMessage(event)) |msg| {
+            bytes +|= queue.messageByteSize(msg);
+        };
+        return bytes <= self.options.max_event_bytes;
+    }
+
     pub fn eventCount(self: *const Node) usize {
-        return self.events.items.len;
+        return self.events.items.len + self.completions.items.len;
     }
 
     // ---- ServerDispatch owner contract (quic.app.Driver hooks) ----
@@ -1928,6 +2247,23 @@ pub const Node = struct {
         self.destroyQuicSession(sess);
     }
 
+    pub fn driverStreamEnded(self: *Node, sess: DriverSession, stream_id: u64, end: @import("quic").app.StreamEnd) void {
+        if (end == .fin) return;
+        const pending = self.takeQuicPending(sess.id(), stream_id) orelse return;
+        sess.runtime.abortReliable(stream_id);
+        self.emitCompletion(.{ .quic_request_failed = .{
+            .request_id = pending.request_id,
+            .session_id = sess.id(),
+            .stream_id = stream_id,
+            .id = pending.id,
+            .failure = .peer_closed,
+        } }) catch {};
+    }
+
+    pub fn driverBindConnection(_: *Node, sess: DriverSession, conn: *transport.quic_runtime.Connection) void {
+        sess.connection = conn;
+    }
+
     pub fn driverSessionPass(
         self: *Node,
         sess: DriverSession,
@@ -1943,6 +2279,18 @@ pub const Node = struct {
         received: transport.quic_datagram.ReceivedDatagram,
     ) !void {
         var owned = received;
+        sess.appSession().admit(.{ .subject = owned.message.subject, .datagram = true, .message_size = queue.messageByteSize(owned.message) }) catch {
+            owned.deinit();
+            self.counters.dropped += 1;
+            return;
+        };
+        var bytes: usize = queue.messageByteSize(owned.message);
+        for (sess.datagram_inbox.items) |queued| bytes +|= queue.messageByteSize(queued.message);
+        if (sess.datagram_inbox.items.len >= sess.runtime.session.options.max_queued_messages or bytes > sess.runtime.session.options.max_queued_bytes) {
+            owned.deinit();
+            self.counters.dropped += 1;
+            return;
+        }
         errdefer owned.deinit();
         try sess.datagram_inbox.append(self.allocator, owned);
     }
@@ -1965,6 +2313,13 @@ pub const Node = struct {
         frames: []@import("control.zig").Frame,
     ) !void {
         _ = self;
+        if (sess.appSession().authorization != null) {
+            for (frames) |frame| switch (frame) {
+                .subscribe => try sess.appSession().requirePattern(.sub),
+                .credit => try sess.appSession().requirePattern(.pull),
+                else => {},
+            };
+        }
         const state = &(sess.control_state orelse return);
         _ = try state.applyReceivedFrames(quicRegistryPeer(sess.id()), frames);
     }
@@ -2001,6 +2356,10 @@ pub const Node = struct {
             // window: late and certain beats early and guessed.
             if (client.client.runtime.connection().isClosed()) continue;
             try self.ensureClientReady(client);
+            if (client.runtime.runtime.isClosingOrClosed()) {
+                try drainQuicEndpoint(&client.client, now_us);
+                continue;
+            }
             try self.pumpClientSession(client);
             // Liveness sweep: dial sessions heartbeat on the node clock.
             // Errors are classified by the sweep itself (timeout begins
@@ -2056,6 +2415,15 @@ pub const Node = struct {
         if (client.runtime.transport_ready) return;
         const conn = client.client.runtime.connection();
         if (!conn.handshakeDone()) return;
+        client.runtime.connection = conn;
+        if (client.runtime.expected_peer_spki) |expected| {
+            const actual = conn.peerCertSpkiDigest();
+            if (actual == null or !std.mem.eql(u8, &expected, &actual.?)) {
+                client.runtime.runtime.beginClosing();
+                conn.close(false, 0x51_03, "peer identity mismatch");
+                return;
+            }
+        }
         client.runtime.transport_ready = true;
         // The dial side authenticates the SERVER's certificate; bind
         // that identity before the peer HELLO is accepted so
@@ -2069,7 +2437,18 @@ pub const Node = struct {
     fn pumpClientSession(self: *Node, client: *QuicClientRuntime) !void {
         if (!client.runtime.transport_ready) return;
         const conn = client.client.runtime.connection();
-        try self.pumpQuicSessionConnection(client.runtime, conn);
+        if (comptime transport.quic_app_client.available) {
+            if (client.dispatch == null) {
+                client.dispatch = @as(transport.quic_app_client.ClientDispatch(Node), undefined);
+                client.dispatch.?.init(self.allocator, self, client.runtime, conn) catch |err| {
+                    client.dispatch = null;
+                    return err;
+                };
+            }
+            try client.dispatch.?.service(self.now_us);
+        } else {
+            try self.pumpQuicSessionConnection(client.runtime, conn);
+        }
     }
 
     fn pumpQuicSessionConnection(
@@ -2097,7 +2476,7 @@ pub const Node = struct {
         if (!runtime.runtime.appSession().datagram_enabled) return;
 
         while (true) {
-            var received = transport.quic_datagram.receiveDatagram(conn, self.allocator, .{
+            const received = transport.quic_datagram.receiveDatagram(conn, self.allocator, .{
                 .codec = datagramCodecOptions(runtime.runtime.session.options),
             }) catch |err| switch (err) {
                 error.MalformedFrame => {
@@ -2116,8 +2495,7 @@ pub const Node = struct {
                 },
                 else => return err,
             } orelse return;
-            errdefer received.deinit();
-            try runtime.datagram_inbox.append(self.allocator, received);
+            try self.driverDatagramReceived(runtime, received);
         }
     }
 
@@ -2141,6 +2519,7 @@ pub const Node = struct {
                 role,
                 options,
             ),
+            .subscriptions_queued = protocol.pubsub.SubscriptionSet.init(self.allocator, self.options.max_quic_subscriptions),
             .control_state = transport.quic_control.State.init(
                 self.allocator,
                 &self.quic_registry,
@@ -2150,15 +2529,17 @@ pub const Node = struct {
         };
         errdefer if (owns_runtime) runtime.deinit();
         runtime.runtime.appSession().user_data = user_data;
+        runtime.reply_target = try message.ReplyHandle.Target.create(self.allocator, runtime, QuicSessionRuntime.sendReply);
 
         try self.quic_sessions.append(self.allocator, runtime);
         owns_runtime = false;
-        try self.emit(.{ .connected = runtime.id() });
+        self.emit(.{ .connected = runtime.id() }) catch {};
         return runtime;
     }
 
     fn destroyQuicSession(self: *Node, runtime: *QuicSessionRuntime) void {
-        self.emit(.{ .closed = runtime.id() }) catch {};
+        const id = runtime.id();
+        self.failSessionRequests(id);
         // A dying subscriber must not linger in the fan-out set.
         _ = self.quic_registry.removePeer(quicRegistryPeer(runtime.id()));
         for (self.quic_sessions.items, 0..) |candidate, index| {
@@ -2169,6 +2550,7 @@ pub const Node = struct {
         self.removeSocketSessionRefs(runtime.id());
         runtime.deinit();
         self.allocator.destroy(runtime);
+        self.emit(.{ .closed = id }) catch {};
     }
 
     fn removeSocketSessionRefs(self: *Node, id: QuicSessionId) void {
@@ -2210,6 +2592,18 @@ fn quicRegistryPeer(id: QuicSessionId) protocol.pubsub.PeerId {
 
 const peerQueueDefaults: queue.QueueOptions = .{};
 
+fn eventMessage(event: Event) ?message.Message {
+    return switch (event) {
+        .request => |ev| ev.msg,
+        .reply => |ev| ev.msg,
+        .delivery => |ev| ev.msg,
+        .quic_request => |ev| ev.msg,
+        .quic_reply => |ev| ev.msg,
+        .quic_delivery => |ev| ev.msg,
+        else => null,
+    };
+}
+
 fn eventCarriesMessage(event: Event) bool {
     return switch (event) {
         .request, .reply, .delivery, .quic_request, .quic_reply, .quic_delivery => true,
@@ -2219,12 +2613,36 @@ fn eventCarriesMessage(event: Event) bool {
 
 fn sendSocketMessage(context: *anyopaque, msg: message.Message, meta: socket.QuicSendMeta) anyerror!void {
     var owned = msg;
-    defer owned.deinit();
 
-    const runtime: *QuicSessionRuntime = @ptrCast(@alignCast(context));
+    const target: *message.ReplyHandle.Target = @ptrCast(@alignCast(context));
+    const runtime: *QuicSessionRuntime = @ptrCast(@alignCast(target.context orelse return error.EndpointClosed));
     switch (meta.delivery) {
-        .reliable => _ = try runtime.queueReliable(owned.outgoing()),
+        .reliable => {
+            if (meta.operation == .request) try runtime.socket_requests.ensureUnusedCapacity(runtime.runtime.allocator, 1);
+            var outgoing = owned.outgoing();
+            if (meta.operation != .request) outgoing.flags.no_reply = true;
+            const stream_id = try runtime.queueReliable(outgoing);
+            if (meta.operation == .request) runtime.socket_requests.putAssumeCapacity(stream_id, meta.local_correlation);
+        },
         .unreliable => try runtime.queueDatagram(owned.outgoing()),
+    }
+    owned.deinit();
+}
+
+fn cancelSocketRequest(context: *anyopaque, token: u64) void {
+    const target: *message.ReplyHandle.Target = @ptrCast(@alignCast(context));
+    const runtime: *QuicSessionRuntime = @ptrCast(@alignCast(target.context orelse return));
+    var requests = runtime.socket_requests.iterator();
+    while (requests.next()) |entry| {
+        if (entry.value_ptr.* != token) continue;
+        const stream_id = entry.key_ptr.*;
+        _ = runtime.socket_requests.remove(stream_id);
+        runtime.runtime.abortReliable(stream_id);
+        if (runtime.connection) |conn| {
+            const plan = transport.quic_cancel.cancelPlan(stream_id, .explicit, .bidirectional);
+            _ = transport.quic_cancel.applyCancelPlan(conn, plan, .{}) catch {};
+        }
+        return;
     }
 }
 
@@ -2259,6 +2677,12 @@ fn dispatcherHas(comptime Dispatcher: type, comptime name: []const u8) bool {
 
 fn bestTimer(best: *?u64, candidate: u64) void {
     if (best.* == null or candidate < best.*.?) best.* = candidate;
+}
+
+fn outgoingMessageBytes(outgoing: message.OutgoingMessage) usize {
+    var bytes = outgoing.subject.len +| outgoing.body.len;
+    for (outgoing.headers) |header| bytes +|= header.name.len +| header.value.len;
+    return bytes;
 }
 
 fn readyQuicRuntimeForTest(
@@ -2302,7 +2726,7 @@ test {
 test "Node queues and polls events in FIFO order" {
     const allocator = std.testing.allocator;
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     try n.emit(.{ .connected = 1 });
@@ -2327,7 +2751,7 @@ test "Node queues and polls events in FIFO order" {
 test "Node tick records current time and validates QUIC listener config" {
     const allocator = std.testing.allocator;
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     try n.tick(99);
@@ -2340,7 +2764,7 @@ test "Node tick records current time and validates QUIC listener config" {
 test "Node prepares QUIC session lifecycle without opening UDP" {
     const allocator = std.testing.allocator;
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     const runtime = try n.openQuicSession(.{
@@ -2372,7 +2796,7 @@ test "Node prepares QUIC session lifecycle without opening UDP" {
 test "Node attaches QUIC socket endpoint and queues outbound socket messages" {
     const allocator = std.testing.allocator;
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     const runtime = try n.openQuicSession(.{
@@ -2396,7 +2820,7 @@ test "Node attaches QUIC socket endpoint and queues outbound socket messages" {
 test "Node runOnce delivers queued QUIC reliable message to attached socket" {
     const allocator = std.testing.allocator;
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     const runtime = try n.openQuicSession(.{
@@ -2428,7 +2852,7 @@ test "Node runOnce delivers queued QUIC reliable message to attached socket" {
 test "Node runOnce dispatches queued QUIC datagram and queues publication datagram" {
     const allocator = std.testing.allocator;
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     const runtime = try n.openQuicSession(.{
@@ -2504,7 +2928,7 @@ test "Node runOnce dispatches one inproc rep request through dispatcher" {
     var network = transport.inproc.Network.init(allocator);
     defer network.deinit();
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     _ = try n.listenInprocRep(&network, "users", .{});
@@ -2546,7 +2970,7 @@ test "embedded Node serves requests and replies through poll events" {
     var network = transport.inproc.Network.init(allocator);
     defer network.deinit();
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     _ = try n.listenInprocRep(&network, "svc", .{});
@@ -2595,7 +3019,7 @@ test "embedded Node error replies carry the stable error shape" {
     var network = transport.inproc.Network.init(allocator);
     defer network.deinit();
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     _ = try n.listenInprocRep(&network, "svc", .{});
@@ -2636,7 +3060,7 @@ test "embedded Node outbound request completes through reply event" {
     var network = transport.inproc.Network.init(allocator);
     defer network.deinit();
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     var rep = try socket.Socket(.rep).init(allocator, .{});
@@ -2650,7 +3074,8 @@ test "embedded Node outbound request completes through reply event" {
         .body = "42",
         .deadline_ms = 500,
     });
-    try std.testing.expectEqual(@as(usize, 1), n.inprocDial(dial_id).?.socket.inflightCount());
+    try std.testing.expectEqual(@as(usize, 0), n.inprocDial(dial_id).?.socket.inflightCount());
+    try std.testing.expectEqual(@as(usize, 1), n.pendingCount(.inproc));
 
     var request = try rep.recv();
     defer request.deinit();
@@ -2668,7 +3093,7 @@ test "embedded Node outbound request completes through reply event" {
     try std.testing.expectEqualStrings("user.ok", events[0].reply.msg.subject);
     try std.testing.expectEqualStrings("Ada", events[0].reply.msg.body);
     try std.testing.expectEqual(@as(usize, 0), n.inprocDial(dial_id).?.socket.inflightCount());
-    try std.testing.expectEqual(@as(usize, 0), n.inproc_pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), n.pendingCount(.inproc));
 }
 
 test "embedded Node request deadline expires into classified failure and drops late reply" {
@@ -2677,7 +3102,7 @@ test "embedded Node request deadline expires into classified failure and drops l
     var network = transport.inproc.Network.init(allocator);
     defer network.deinit();
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     var rep = try socket.Socket(.rep).init(allocator, .{});
@@ -2723,7 +3148,7 @@ test "embedded Node cancel emits canceled failure and drops late reply" {
     var network = transport.inproc.Network.init(allocator);
     defer network.deinit();
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     var rep = try socket.Socket(.rep).init(allocator, .{});
@@ -2758,7 +3183,7 @@ test "embedded Node surfaces synchronous send pressure for classification" {
     var network = transport.inproc.Network.init(allocator);
     defer network.deinit();
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     _ = try n.listenInprocRep(&network, "svc", .{
@@ -2787,7 +3212,7 @@ test "embedded Node deliveries carry the matched filter and honor unsubscribe" {
     var network = transport.inproc.Network.init(allocator);
     defer network.deinit();
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     var publisher = try socket.Socket(.@"pub").init(allocator, .{});
@@ -2819,7 +3244,7 @@ test "embedded Node publishes to dialed subscribers" {
     var network = transport.inproc.Network.init(allocator);
     defer network.deinit();
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     const pub_id = try n.listenInprocPub(&network, "feed", .{});
@@ -2845,7 +3270,7 @@ test "embedded Node stats count sent recv dropped and queue high water" {
     var network = transport.inproc.Network.init(allocator);
     defer network.deinit();
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     var rep = try socket.Socket(.rep).init(allocator, .{});
@@ -2911,7 +3336,7 @@ test "embedded Node slow-consumer drops are counted through sub queue policy" {
     try std.testing.expectEqual(@as(usize, 1), stats.dropped);
 }
 
-test "embedded Node event queue bound drops and counts overflow" {
+test "embedded Node reliable event queue pressure pauses without dropping requests" {
     const allocator = std.testing.allocator;
 
     var network = transport.inproc.Network.init(allocator);
@@ -2942,9 +3367,13 @@ test "embedded Node event queue bound drops and counts overflow" {
     }
 
     const stats = n.stats();
-    try std.testing.expectEqual(@as(usize, 1), stats.events_dropped);
-    try std.testing.expectEqual(@as(usize, 1), stats.dropped);
+    try std.testing.expectEqual(@as(usize, 0), stats.events_dropped);
+    try std.testing.expectEqual(@as(usize, 0), stats.dropped);
     try std.testing.expectEqual(@as(usize, 2), stats.recv);
+    var remaining: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try n.poll(&remaining));
+    defer remaining[0].deinit();
+    try std.testing.expectEqualStrings("user.three", remaining[0].request.msg.subject);
 }
 
 // ---- ServerDispatch end-to-end (hermetic: no sockets) ----------------------
@@ -2995,7 +3424,7 @@ test "listener dispatch drives qmsg sessions through quic.app.Driver end to end"
         .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
     };
 
-    var node = try Node.init(allocator, .{});
+    var node = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer node.deinit();
 
     var p: DispatchTestPeers = undefined;
@@ -3098,10 +3527,10 @@ test "listener dispatch drives qmsg sessions through quic.app.Driver end to end"
     defer got.deinit();
     try std.testing.expectEqualStrings("Ada Lovelace", got.message.body);
 
-    // Driver-owned sessions refuse the manual close path (their
-    // lifecycle belongs to the will-close teardown).
+    // Manual close requests connection shutdown; teardown remains driver-owned.
     const srv_sess_id = srv_sess.id();
-    try std.testing.expectError(error.InvalidState, node.closeQuicSession(srv_sess_id));
+    try node.closeQuicSession(srv_sess_id);
+    try std.testing.expectEqual(SessionStatus.State.closing, node.sessionStatus(srv_sess_id).?.state);
 
     // Teardown: close the client connection; the reap-driven
     // will-close hook must destroy the server session exactly once.
@@ -3147,7 +3576,7 @@ test "Node.deinit with a live driver-owned session tears down cleanly" {
         .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
     };
 
-    var node = try Node.init(allocator, .{});
+    var node = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer node.deinit();
 
     var p: DispatchTestPeers = undefined;
@@ -3217,7 +3646,7 @@ test "Node.deinit with a live driver-owned session tears down cleanly" {
 test "Node runOnce leaves replies on own request streams undispatched" {
     const allocator = std.testing.allocator;
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     const runtime = try n.openQuicSession(.{
@@ -3519,7 +3948,7 @@ test "foreign embedder drives qmsg sessions through its own Driver end to end" {
         .datagram_enabled = true,
     };
 
-    var node = try Node.init(allocator, .{});
+    var node = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer node.deinit();
 
     var p: EmbedTestPeers = undefined;
@@ -3642,7 +4071,7 @@ test "foreign embedder: reply deferred past the poll loop still reaches the requ
         .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
     };
 
-    var node = try Node.init(allocator, .{});
+    var node = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer node.deinit();
 
     var p: EmbedTestPeers = undefined;
@@ -3746,7 +4175,7 @@ test "foreign embedder: two requests on one session, one unanswered, keep the co
         .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
     };
 
-    var node = try Node.init(allocator, .{});
+    var node = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer node.deinit();
 
     var p: EmbedTestPeers = undefined;
@@ -3913,7 +4342,7 @@ fn pollForQuicRequestFailed(
 
 test "quic request outcomes: deadline, reply-wins, cancel, close, first-wins" {
     const allocator = std.testing.allocator;
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     // Deadline expiry classifies once, keyed (session, stream), and
@@ -3965,7 +4394,7 @@ test "quic request outcomes: deadline, reply-wins, cancel, close, first-wins" {
             @as(?QuicRequestFailedEvent, null),
             try pollForQuicRequestFailed(&n, &events),
         );
-        try std.testing.expectEqual(@as(usize, 0), n.quic_pending.items.len);
+        try std.testing.expectEqual(@as(usize, 0), n.pendingCount(.quic));
 
         // Wrapper pop settles requests whose reply was injected.
         const stream_id_b = try n.requestQuic(sess.id(), .{
@@ -4033,7 +4462,7 @@ test "quic request outcomes: deadline, reply-wins, cancel, close, first-wins" {
             }
         }
         try std.testing.expectEqual(@as(usize, 2), failures);
-        try std.testing.expectEqual(@as(usize, 0), n.quic_pending.items.len);
+        try std.testing.expectEqual(@as(usize, 0), n.pendingCount(.quic));
     }
 
     // Raw queueReliable stays untracked: no deadline classification
@@ -4052,7 +4481,7 @@ test "quic request outcomes: deadline, reply-wins, cancel, close, first-wins" {
             @as(?QuicRequestFailedEvent, null),
             try pollForQuicRequestFailed(&n, &events),
         );
-        try std.testing.expectEqual(@as(usize, 0), n.quic_pending.items.len);
+        try std.testing.expectEqual(@as(usize, 0), n.pendingCount(.quic));
     }
 }
 
@@ -4073,7 +4502,7 @@ test "live UDP: queueReliable round trip needs no explicit accept and deinit wit
         .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
     };
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     const listener_id = n.listenQuic("127.0.0.1:0", .{
@@ -4273,7 +4702,7 @@ test "live UDP: answered and unanswered requests on one dial session (phase B mi
         .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
     };
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     const listener_id = n.listenQuic("127.0.0.1:0", .{
@@ -4403,7 +4832,7 @@ test "live UDP: answered and unanswered requests on one dial session (phase B mi
     try std.testing.expectEqual(@as(message.MessageId, 12), failed.id);
     try std.testing.expectEqual(RequestFailure.deadline_exceeded, failed.failure);
     try std.testing.expectEqual(@as(usize, 0), stray_failures);
-    try std.testing.expectEqual(@as(usize, 0), n.quic_pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), n.pendingCount(.quic));
     try std.testing.expectEqual(transport.quic.State.ready, client.state());
 }
 
@@ -4430,7 +4859,7 @@ test "live UDP: dial session observes remote death, closes, and classifies pendi
         .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
     };
 
-    var server = try Node.init(allocator, .{});
+    var server = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     const server_listener_id = server.listenQuic("127.0.0.1:0", .{
         .tls_cert_pem = dispatch_test_cert_pem,
         .tls_key_pem = dispatch_test_key_pem,
@@ -4450,7 +4879,7 @@ test "live UDP: dial session observes remote death, closes, and classifies pendi
     const target = try localhostEndpoint(allocator, server_listener.localAddress());
     defer allocator.free(target);
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
     const client_session_id = try n.dialQuic(target, .{
         .server_name = "localhost",
@@ -4538,7 +4967,7 @@ test "live UDP: dial session observes remote death, closes, and classifies pendi
     try std.testing.expect(saw_peer_closed);
     try std.testing.expectEqual(@as(usize, 1), closed_count);
     try std.testing.expectEqual(@as(?*QuicSessionRuntime, null), n.quicSession(client_session_id));
-    try std.testing.expectEqual(@as(usize, 0), n.quic_pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), n.pendingCount(.quic));
 }
 
 // The never-landing dial (consumer hazard 4): nothing listens at the
@@ -4551,7 +4980,7 @@ test "live UDP: never-landing dial closes when the handshake times out" {
     const allocator = std.testing.allocator;
     const control = @import("control.zig");
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
     const client_session_id = n.dialQuic("127.0.0.1:1", .{
         .server_name = "localhost",
@@ -4608,7 +5037,7 @@ test "live UDP: never-landing dial closes when the handshake times out" {
 // `message_dropped` surfacing every skip.
 test "quic publish fan-out matches registry entries and sheds slow consumers" {
     const allocator = std.testing.allocator;
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     const fast = try outcomeTestSession(&n);
@@ -4702,7 +5131,7 @@ test "quic publish fan-out matches registry entries and sheds slow consumers" {
 // session that dies drops its queued frames with the wrapper.
 test "quic node subscription set queues full set and deltas per session" {
     const allocator = std.testing.allocator;
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     try n.subscribeQuic("swarm.events", .{});
@@ -4726,7 +5155,7 @@ test "quic node subscription set queues full set and deltas per session" {
 
     // subscribeQuic before any session exists is not an error; the
     // set is the source of truth for later sessions.
-    var n2 = try Node.init(allocator, .{});
+    var n2 = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n2.deinit();
     try n2.subscribeQuic("swarm.early", .{});
     try std.testing.expectEqual(@as(usize, 1), n2.quic_subscriptions.len());
@@ -4760,7 +5189,7 @@ test "live UDP: node subscriptions survive kill, reborn, and redial" {
         .datagram_enabled = true,
     };
 
-    var hub = try Node.init(allocator, .{});
+    var hub = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     const hub_listener_id = hub.listenQuic("127.0.0.1:0", .{
         .tls_cert_pem = dispatch_test_cert_pem,
         .tls_key_pem = dispatch_test_key_pem,
@@ -4779,7 +5208,7 @@ test "live UDP: node subscriptions survive kill, reborn, and redial" {
     const target = try localhostEndpoint(allocator, hub.quic_listeners.items[hub_listener_id].localAddress());
     defer allocator.free(target);
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     var now_us: u64 = 1_000;
@@ -4839,7 +5268,7 @@ test "live UDP: node subscriptions survive kill, reborn, and redial" {
 
     // Silent death (plain deinit ships nothing) + same-key reborn.
     hub.deinit();
-    var reborn = try Node.init(allocator, .{});
+    var reborn = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer reborn.deinit();
     _ = reborn.listenQuic(target, .{
         .tls_cert_pem = dispatch_test_cert_pem,
@@ -4944,7 +5373,7 @@ test "live UDP: keyed reborn listener resets an orphan under load, fast" {
         .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
     };
 
-    var server = try Node.init(allocator, .{});
+    var server = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     const server_listener_id = server.listenQuic("127.0.0.1:0", .{
         .tls_cert_pem = dispatch_test_cert_pem,
         .tls_key_pem = dispatch_test_key_pem,
@@ -4964,7 +5393,7 @@ test "live UDP: keyed reborn listener resets an orphan under load, fast" {
     const target = try localhostEndpoint(allocator, server_listener.localAddress());
     defer allocator.free(target);
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
     const client_session_id = try n.dialQuic(target, .{
         .server_name = "localhost",
@@ -4995,7 +5424,7 @@ test "live UDP: keyed reborn listener resets an orphan under load, fast" {
     // teardown only, no CONNECTION_CLOSE ships — then the reborn
     // listener takes the same port with the SAME key.
     server.deinit();
-    var reborn = try Node.init(allocator, .{});
+    var reborn = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer reborn.deinit();
     _ = reborn.listenQuic(target, .{
         .tls_cert_pem = dispatch_test_cert_pem,
@@ -5156,7 +5585,7 @@ test "live UDP: per-connection HELLO challenge binds credentials and kills repla
         .credential_provider = dialer.provider(),
     };
 
-    var n = try Node.init(allocator, .{});
+    var n = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer n.deinit();
 
     const listener_id = n.listenQuic("127.0.0.1:0", .{
@@ -5591,7 +6020,7 @@ fn runLossyScenario(
         .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
     };
 
-    var node = try Node.init(allocator, .{});
+    var node = try Node.init(allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
     defer node.deinit();
 
     var p: LossyDispatchPeers = .{
@@ -5737,4 +6166,359 @@ test "lossy: the request survives a path that never carries datagrams over 1252 
     try std.testing.expect(r.dropped >= 1);
     try std.testing.expect(r.reply_tick != null);
     try std.testing.expectEqual(transport.quic.State.ready, r.server_state.?);
+}
+
+test "socket attachment send failure retains single-owner cleanup" {
+    var node = try Node.init(std.testing.allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
+    defer node.deinit();
+    const sess = try node.openQuicSession(.{ .role = .client });
+    var req = try socket.Socket(.req).init(std.testing.allocator, .{});
+    defer req.deinit();
+    try node.attachQuicSocket(sess.id(), req.quicEndpoint());
+    try std.testing.expectError(error.InvalidState, req.sendRequest(.{ .subject = "not.ready" }));
+    try std.testing.expectEqual(@as(usize, 0), req.inflightCount());
+}
+
+test "socket replies keep the original QUIC stream" {
+    var node = try Node.init(std.testing.allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
+    defer node.deinit();
+    const sess = try node.openQuicSession(.{ .role = .server });
+    try readyQuicRuntimeForTest(sess, "client", false);
+    var rep = try socket.Socket(.rep).init(std.testing.allocator, .{});
+    defer rep.deinit();
+    try node.attachQuicSocket(sess.id(), rep.quicEndpoint());
+    try queueReliableForTest(sess, 8, .{ .subject = "echo", .id = 99 });
+    const Dispatcher = struct {};
+    var dispatcher: Dispatcher = .{};
+    _ = try node.runOnce(&dispatcher);
+    var request = try rep.recv();
+    defer request.deinit();
+    try rep.reply(request, .{ .subject = "", .body = "same stream" });
+    try std.testing.expect(sess.runtime.reliable_senders.contains(8));
+    try std.testing.expectEqual(@as(usize, 0), sess.runtime.reliable_receivers.count());
+}
+
+test "canonical outcomes remain reserved under event and request pressure" {
+    var n = try Node.init(std.testing.allocator, .{ .max_events = 1, .max_requests = 1 });
+    defer n.deinit();
+    const sess = try outcomeTestSession(&n);
+    const session_id = sess.id();
+    const request_id = try n.request(.{ .quic = session_id }, .{ .subject = "work", .id = 42 });
+    try std.testing.expectError(error.TooManyInflightRequests, n.request(.{ .quic = session_id }, .{ .subject = "overload" }));
+    try n.closeQuicSession(session_id);
+    try std.testing.expect(n.quicSession(session_id) == null);
+    var outcome = n.takeOutcome(request_id).?;
+    defer outcome.deinit();
+    try std.testing.expectEqual(RequestFailure.peer_closed, outcome.request_failed.failure);
+    try std.testing.expectEqual(request_id, outcome.request_failed.request_id);
+    try std.testing.expect(n.takeOutcome(request_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), n.request_bytes);
+    const replacement = try outcomeTestSession(&n);
+    _ = try n.request(.{ .quic = replacement.id() }, .{ .subject = "available" });
+}
+
+test "canonical completion byte pressure retains a recoverable terminal failure" {
+    var n = try Node.init(std.testing.allocator, .{ .max_completion_bytes = 4 });
+    defer n.deinit();
+    const sess = try outcomeTestSession(&n);
+    const id = try n.request(.{ .quic = sess.id() }, .{ .subject = "work", .id = 77 });
+    const stream_id = n.requests.items[0].stream_id;
+    try injectReplyForTest(sess, stream_id, 77);
+    var no_events: [0]Event = .{};
+    _ = try n.poll(&no_events);
+    var outcome = n.takeOutcome(id).?;
+    defer outcome.deinit();
+    try std.testing.expectEqual(RequestFailure.queue_full, outcome.request_failed.failure);
+    try std.testing.expectEqual(id, outcome.request_failed.request_id);
+    try std.testing.expectEqual(@as(usize, 0), n.requests.items.len);
+}
+
+test "canonical inproc generations reject late replies after a wire ID is reused" {
+    const allocator = std.testing.allocator;
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+    var rep = try socket.RepSocket.init(allocator, .{});
+    defer rep.deinit();
+    try rep.listenInproc(&network, "generation");
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+    const dial = try n.dialInprocReq(&network, "generation", .{});
+    const old_id = try n.request(.{ .inproc = dial }, .{ .subject = "work", .id = 42 });
+    var old_request = try rep.recv();
+    defer old_request.deinit();
+    try std.testing.expect(try n.cancelRequest(old_id));
+    var canceled = n.takeOutcome(old_id).?;
+    defer canceled.deinit();
+    const new_id = try n.request(.{ .inproc = dial }, .{ .subject = "work", .id = 42 });
+    var new_request = try rep.recv();
+    defer new_request.deinit();
+    try rep.reply(old_request, .{ .subject = "", .body = "old" });
+    var no_events: [0]Event = .{};
+    _ = try n.poll(&no_events);
+    try std.testing.expect(n.takeOutcome(new_id) == null);
+    try std.testing.expectEqual(@as(usize, 1), n.requests.items.len);
+    try rep.reply(new_request, .{ .subject = "", .body = "new" });
+    _ = try n.poll(&no_events);
+    var reply = n.takeOutcome(new_id).?;
+    defer reply.deinit();
+    try std.testing.expectEqual(new_id, reply.reply.request_id);
+    try std.testing.expectEqual(@as(u64, 42), reply.reply.msg.id);
+    try std.testing.expectEqualStrings("new", reply.reply.msg.body);
+}
+
+test "canonical small inproc requests fit their actual event byte budget" {
+    const allocator = std.testing.allocator;
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+    var n = try Node.init(allocator, .{ .max_event_bytes = 64 });
+    defer n.deinit();
+    _ = try n.listenInprocRep(&network, "small", .{});
+    const dial = try n.dialInprocReq(&network, "small", .{});
+    const id = try n.request(.{ .inproc = dial }, .{ .subject = "echo", .body = "x" });
+    var events: [8]Event = undefined;
+    const count = try n.poll(&events);
+    var requests: usize = 0;
+    for (events[0..count]) |*event| {
+        defer event.deinit();
+        if (event.* == .request) {
+            requests += 1;
+            try n.reply(event.request.msg.reply_handle.?, .{ .subject = "", .body = "y" });
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), requests);
+    var no_events: [0]Event = .{};
+    _ = try n.poll(&no_events);
+    var outcome = n.takeOutcome(id).?;
+    defer outcome.deinit();
+    try std.testing.expectEqualStrings("y", outcome.reply.msg.body);
+}
+
+test "canonical event delivery has one consumer even when runOnce is called" {
+    const Dispatcher = struct {
+        calls: usize = 0,
+        const Result = struct {
+            replies: std.ArrayList(message.Message) = .empty,
+            pub fn deinit(_: *@This()) void {}
+        };
+        pub fn dispatchInprocRep(self: *@This(), _: *InprocRepEndpoint) !bool {
+            self.calls += 1;
+            return false;
+        }
+        pub fn dispatchQuicReliable(self: *@This(), _: enum { rep }, incoming: message.Message, _: *session.Session) !Result {
+            var owned = incoming;
+            owned.deinit();
+            self.calls += 1;
+            return .{};
+        }
+    };
+    var n = try Node.init(std.testing.allocator, .{});
+    defer n.deinit();
+    const sess = try n.openQuicSession(.{ .role = .server });
+    try readyQuicRuntimeForTest(sess, "client", false);
+    try queueReliableForTest(sess, 0, .{ .subject = "echo" });
+    var dispatcher: Dispatcher = .{};
+    try std.testing.expectEqual(@as(usize, 0), (try n.runOnce(&dispatcher)).messages);
+    try std.testing.expectEqual(@as(usize, 0), dispatcher.calls);
+    var events: [8]Event = undefined;
+    const count = try n.poll(&events);
+    var requests: usize = 0;
+    for (events[0..count]) |*event| {
+        defer event.deinit();
+        if (event.* == .request) requests += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), requests);
+}
+
+test "canonical inproc admission denies before surfacing a request" {
+    const allocator = std.testing.allocator;
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+    var n = try Node.init(allocator, .{});
+    defer n.deinit();
+    _ = try n.listenInprocRep(&network, "restricted", .{ .session = .{
+        .id = 12,
+        .transport = .inproc,
+        .auth_state = .authenticated,
+        .authorization = .{ .subject = "peer", .issuer = "test", .allowed_subjects = .deny_all },
+    } });
+    const dial = try n.dialInprocReq(&network, "restricted", .{});
+    const id = try n.request(.{ .inproc = dial }, .{ .subject = "denied" });
+    var no_events: [0]Event = .{};
+    _ = try n.poll(&no_events);
+    var outcome = n.takeOutcome(id).?;
+    defer outcome.deinit();
+    try std.testing.expect(outcome.reply.msg.flags.err);
+    try std.testing.expectEqualStrings("Unauthorized", outcome.reply.msg.body);
+    for (n.events.items) |event| try std.testing.expect(event != .request);
+}
+
+test "ready session lookup skips older incompatible peers" {
+    const control = @import("control.zig");
+    var n = try Node.init(std.testing.allocator, .{});
+    defer n.deinit();
+    const peer: [32]u8 = @splat(0xab);
+    const older = try outcomeTestSession(&n);
+    older.appSession().peer_cert_spki = peer;
+    older.appSession().peer_supported_patterns = control.PatternBits.pub_;
+    const newer = try outcomeTestSession(&n);
+    newer.appSession().peer_cert_spki = peer;
+    newer.appSession().peer_supported_patterns = control.PatternBits.rep;
+    try std.testing.expectEqual(older.id(), n.findReadySession(peer).?);
+    try std.testing.expectEqual(newer.id(), n.findReadySessionSupporting(peer, control.PatternBits.rep).?);
+    try std.testing.expect(n.findReadySessionSupporting(peer, control.PatternBits.pull) == null);
+}
+
+test "canonical cancellation reclaims every queued QUIC request resource" {
+    var n = try Node.init(std.testing.allocator, .{});
+    defer n.deinit();
+    const sess = try outcomeTestSession(&n);
+    const id = try n.request(.{ .quic = sess.id() }, .{ .subject = "cancel" });
+    try std.testing.expectEqual(@as(usize, 1), sess.runtime.reliable_receivers.count());
+    try std.testing.expectEqual(@as(usize, 1), sess.runtime.reliable_senders.count());
+    try std.testing.expect(try n.cancelRequest(id));
+    try std.testing.expectEqual(@as(usize, 0), sess.runtime.reliable_receivers.count());
+    try std.testing.expectEqual(@as(usize, 0), sess.runtime.reliable_senders.count());
+    try std.testing.expectEqual(@as(usize, 0), sess.runtime.inboxLen());
+    try std.testing.expect(!try n.cancelRequest(id));
+}
+
+test "closed QUIC socket driver fails safely while socket retains the attachment" {
+    var n = try Node.init(std.testing.allocator, .{});
+    defer n.deinit();
+    const sess = try outcomeTestSession(&n);
+    var req = try socket.ReqSocket.init(std.testing.allocator, .{});
+    defer req.deinit();
+    try n.attachQuicSocket(sess.id(), req.quicEndpoint());
+    try n.closeQuicSession(sess.id());
+    try std.testing.expectError(error.EndpointClosed, req.sendRequest(.{ .subject = "closed" }));
+}
+
+test "datagram fanout continues after a byte-full peer and counts header bytes" {
+    var n = try Node.init(std.testing.allocator, .{});
+    defer n.deinit();
+    const slow = try outcomeTestSession(&n);
+    const fast = try outcomeTestSession(&n);
+    slow.appSession().datagram_enabled = true;
+    fast.appSession().datagram_enabled = true;
+    slow.runtime.session.options.max_queued_bytes = 12;
+    _ = try n.quic_registry.subscribe(quicRegistryPeer(slow.id()), "events", .{ .on_full = .drop_newest });
+    _ = try n.quic_registry.subscribe(quicRegistryPeer(fast.id()), "events", .{});
+    try slow.queueDatagram(.{ .subject = "events", .body = "full" });
+    try std.testing.expectEqual(@as(usize, 1), try n.publishQuicSubscribed(.{ .subject = "events", .body = "next" }));
+    try std.testing.expectEqual(@as(usize, 1), fast.pendingDatagrams());
+    try std.testing.expectEqual(@as(usize, 1), slow.pendingDatagrams());
+    const restricted = try outcomeTestSession(&n);
+    restricted.appSession().datagram_enabled = true;
+    restricted.appSession().auth_state = .authenticated;
+    restricted.appSession().authorization = try (auth.Authorization{
+        .subject = "subscriber",
+        .issuer = "test",
+        .allowed_patterns = auth.PatternSet.all,
+        .datagram_allowed = true,
+        .max_message_size = 10,
+    }).clone(std.testing.allocator);
+    _ = try n.quic_registry.subscribe(quicRegistryPeer(restricted.id()), "limited", .{});
+    try std.testing.expectEqual(@as(usize, 0), try n.publishQuicSubscribed(.{
+        .subject = "limited",
+        .headers = &.{.{ .name = "key", .value = "too much" }},
+    }));
+}
+
+test "QUIC socket generation and cancel remain tied to their original stream" {
+    var n = try Node.init(std.testing.allocator, .{});
+    defer n.deinit();
+    const sess = try outcomeTestSession(&n);
+    var req = try socket.ReqSocket.init(std.testing.allocator, .{});
+    defer req.deinit();
+    try n.attachQuicSocket(sess.id(), req.quicEndpoint());
+    _ = try req.sendRequestAt(.{ .subject = "work", .id = 42 }, 1);
+    var old_streams = sess.socket_requests.keyIterator();
+    const old_stream = old_streams.next().?.*;
+    try std.testing.expect(req.cancelRequest(42));
+    try std.testing.expectEqual(@as(usize, 0), sess.runtime.reliable_receivers.count());
+    try std.testing.expectEqual(@as(usize, 0), sess.socket_requests.count());
+    _ = try req.sendRequestAt(.{ .subject = "work", .id = 42 }, 2);
+    var new_streams = sess.socket_requests.keyIterator();
+    const new_stream = new_streams.next().?.*;
+    try std.testing.expect(old_stream != new_stream);
+    try injectReplyForTest(sess, old_stream, 42);
+    const Dispatcher = struct {};
+    var dispatcher: Dispatcher = .{};
+    _ = try n.runOnce(&dispatcher);
+    try std.testing.expect((try req.tryRecvAt(3)) == null);
+    try std.testing.expectEqual(@as(usize, 1), req.inflightCount());
+    try injectReplyForTest(sess, new_stream, 42);
+    _ = try n.runOnce(&dispatcher);
+    var reply = try req.recvAt(3);
+    defer reply.deinit();
+    try std.testing.expectEqual(@as(u64, 42), reply.id);
+    try std.testing.expect(reply.local_correlation != 0);
+    try std.testing.expectEqual(@as(usize, 0), req.inflightCount());
+}
+
+test "subscription reconciliation retries bounded additions removals and options" {
+    var n = try Node.init(std.testing.allocator, .{});
+    defer n.deinit();
+    const sess = try outcomeTestSession(&n);
+    sess.control_state.?.max_queued_frames = 1;
+    try n.subscribeQuic("first", .{ .on_full = .drop_newest });
+    try n.subscribeQuic("second", .{ .on_full = .drop_oldest });
+    try std.testing.expect(!sess.subscriptions_synced);
+    try std.testing.expectEqual(@as(usize, 1), sess.control_state.?.queuedFrameCount());
+    try std.testing.expectEqual(@as(usize, 1), sess.subscriptions_queued.?.len());
+    n.unsubscribeQuic("first");
+    try std.testing.expect(sess.subscriptions_queued.?.contains("first"));
+    sess.control_state.?.clearQueuedFrames();
+    try n.tick(1_000);
+    try std.testing.expectEqualStrings("first", sess.control_state.?.queuedFrames()[0].unsubscribe.filter);
+    try std.testing.expect(!sess.subscriptions_queued.?.contains("first"));
+    sess.control_state.?.clearQueuedFrames();
+    try n.tick(2_000);
+    try std.testing.expect(sess.subscriptions_synced);
+    try std.testing.expectEqualStrings("second", sess.control_state.?.queuedFrames()[0].subscribe.filter);
+    try std.testing.expectEqual(protocol.pubsub.optionsFromQueue(.{ .on_full = .drop_oldest }), sess.control_state.?.queuedFrames()[0].subscribe.options);
+    try n.subscribeQuic("second", .{ .on_full = .drop_newest });
+    try std.testing.expect(!sess.subscriptions_synced);
+    sess.control_state.?.clearQueuedFrames();
+    try n.tick(3_000);
+    try std.testing.expect(sess.subscriptions_synced);
+    try std.testing.expectEqual(protocol.pubsub.optionsFromQueue(.{ .on_full = .drop_newest }), sess.control_state.?.queuedFrames()[0].subscribe.options);
+    const fresh = try outcomeTestSession(&n);
+    try n.tick(4_000);
+    try std.testing.expectEqual(protocol.pubsub.optionsFromQueue(.{ .on_full = .drop_newest }), fresh.control_state.?.queuedFrames()[0].subscribe.options);
+}
+
+test "request byte admission is bounded independently of request count" {
+    var n = try Node.init(std.testing.allocator, .{ .max_request_bytes = 6, .max_requests = 4 });
+    defer n.deinit();
+    const sess = try outcomeTestSession(&n);
+    const id = try n.request(.{ .quic = sess.id() }, .{ .subject = "work", .body = "12" });
+    try std.testing.expectError(error.QueueFull, n.request(.{ .quic = sess.id() }, .{ .subject = "x" }));
+    try std.testing.expectEqual(@as(usize, 1), n.requests.items.len);
+    try std.testing.expect(try n.cancelRequest(id));
+    _ = try n.request(.{ .quic = sess.id() }, .{ .subject = "x" });
+}
+
+test "socket inbox pressure leaves reliable QUIC input queued for retry" {
+    var n = try Node.init(std.testing.allocator, .{});
+    defer n.deinit();
+    const sess = try n.openQuicSession(.{ .role = .server });
+    try readyQuicRuntimeForTest(sess, "client", false);
+    var rep = try socket.RepSocket.init(std.testing.allocator, .{ .recv_queue = .{ .max_messages = 1 } });
+    defer rep.deinit();
+    try n.attachQuicSocket(sess.id(), rep.quicEndpoint());
+    try queueReliableForTest(sess, 0, .{ .subject = "one" });
+    try queueReliableForTest(sess, 4, .{ .subject = "two" });
+    const Dispatcher = struct {};
+    var dispatcher: Dispatcher = .{};
+    try std.testing.expectEqual(@as(usize, 1), (try n.runOnce(&dispatcher)).messages);
+    try std.testing.expectEqual(@as(usize, 0), (try n.runOnce(&dispatcher)).messages);
+    try std.testing.expectEqual(@as(usize, 1), sess.runtime.inboxLen());
+    var first = try rep.recv();
+    defer first.deinit();
+    try std.testing.expectEqualStrings("one", first.subject());
+    try std.testing.expectEqual(@as(usize, 1), (try n.runOnce(&dispatcher)).messages);
+    var second = try rep.recv();
+    defer second.deinit();
+    try std.testing.expectEqualStrings("two", second.subject());
 }

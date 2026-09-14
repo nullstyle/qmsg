@@ -66,6 +66,7 @@ pub const SubscriptionSet = struct {
     pub const Entry = struct {
         filter: subject_mod.Filter,
         order: usize,
+        queue_options: queue.QueueOptions = .{},
     };
 
     pub fn init(allocator: std.mem.Allocator, max_subscriptions: usize) SubscriptionSet {
@@ -84,7 +85,16 @@ pub const SubscriptionSet = struct {
     }
 
     pub fn add(self: *SubscriptionSet, filter: []const u8) !bool {
-        if (self.contains(filter)) return false;
+        return self.addWithOptions(filter, .{});
+    }
+
+    pub fn addWithOptions(self: *SubscriptionSet, filter: []const u8, options: queue.QueueOptions) !bool {
+        for (self.entries.items) |*entry| {
+            if (!std.mem.eql(u8, entry.filter.text, filter)) continue;
+            if (std.meta.eql(entry.queue_options, options)) return false;
+            entry.queue_options = options;
+            return true;
+        }
 
         var owned = try subject_mod.Filter.init(self.allocator, filter);
         errdefer owned.deinit();
@@ -94,6 +104,7 @@ pub const SubscriptionSet = struct {
         try self.entries.append(self.allocator, .{
             .filter = owned,
             .order = self.entries.items.len,
+            .queue_options = options,
         });
         return true;
     }
@@ -123,6 +134,11 @@ pub const SubscriptionSet = struct {
 
         try emitUnsubscribe(sink, filter);
         return self.remove(filter);
+    }
+
+    pub fn optionsFor(self: SubscriptionSet, filter: []const u8) ?queue.QueueOptions {
+        for (self.entries.items) |entry| if (std.mem.eql(u8, entry.filter.text, filter)) return entry.queue_options;
+        return null;
     }
 
     pub fn contains(self: SubscriptionSet, filter: []const u8) bool {
@@ -213,8 +229,8 @@ pub const Registry = struct {
         try validateFilter(self.allocator, filter);
 
         if (self.findPeer(peer_id)) |peer| {
-            if (peer.subscriptions.contains(filter)) return false;
             peer.queue_options = options;
+            if (peer.subscriptions.contains(filter)) return false;
             return try peer.subscriptions.add(filter);
         }
 
@@ -433,7 +449,8 @@ test "registry applies subscription control frames idempotently" {
     defer matches.deinit(allocator);
     try registry.collectMatches("metrics.cpu", &matches);
     try std.testing.expectEqual(@as(usize, 1), matches.items.len);
-    try std.testing.expectEqual(queue.OnFull.drop_newest, matches.items[0].queue_options.on_full);
+    // Re-advertising the same filter updates its peer queue policy.
+    try std.testing.expectEqual(queue.OnFull.fail, matches.items[0].queue_options.on_full);
 
     try std.testing.expectEqual(ApplyResult.unsubscribed, try registry.applyControlFrame(42, .{ .unsubscribe = .{
         .filter = "metrics.*",

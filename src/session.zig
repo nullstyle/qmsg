@@ -17,6 +17,7 @@ pub const Session = struct {
     id: SessionId,
     transport: TransportKind,
     peer_id: []const u8 = "",
+    peer_supported_patterns: u64 = 0,
     auth_state: AuthState = .anonymous,
     authorization: ?auth.Authorization = null,
     datagram_enabled: bool = false,
@@ -182,6 +183,14 @@ pub const Session = struct {
         const authorization = self.authorization orelse return self.max_message_size;
         const auth_max = authorization.max_message_size orelse return self.max_message_size;
         return @min(self.max_message_size, auth_max);
+    }
+
+    /// Apply a cached policy at the semantic admission seam. Anonymous sessions
+    /// remain usable when HELLO configuration allowed them.
+    pub fn admit(self: Session, request: auth.Authorization.Check) auth.Error!void {
+        if (self.authorization != null) return self.check(request);
+        if (request.message_size) |size| if (size > self.max_message_size) return auth.Error.MessageTooLarge;
+        if (request.datagram and !self.datagram_enabled) return auth.Error.Unauthorized;
     }
 
     pub fn check(self: Session, request: auth.Authorization.Check) auth.Error!void {
