@@ -847,7 +847,6 @@ test "varint uses canonical QUIC-style lengths" {
     try std.testing.expectEqualSlices(u8, &.{ 0x3f, 0x40, 0x40, 0x7f, 0xff, 0x80, 0x00, 0x40, 0x00 }, bytes.items);
 }
 
-
 test "ping and pong control frames round-trip with their tokens" {
     const allocator = std.testing.allocator;
     const options = CodecOptions{};
