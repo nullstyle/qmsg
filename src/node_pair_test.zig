@@ -37,6 +37,7 @@ const auth = @import("auth.zig");
 const control = @import("control.zig");
 const message = @import("message.zig");
 const node_mod = @import("node.zig");
+const quic = @import("transport/quic.zig");
 
 const test_cert_pem = @embedFile("testdata/test_cert.pem");
 const test_key_pem = @embedFile("testdata/test_key.pem");
@@ -332,6 +333,13 @@ test "each node learns the other's certificate identity" {
     const hex = server.runtime.session.session.certPeerIdHex().?;
     try std.testing.expectEqual(@as(usize, 64), hex.len);
     for (hex) |c| try std.testing.expect(std.ascii.isHex(c) and !std.ascii.isUpper(c));
+
+    // The identity is knowable before the dial: `localCertSpkiDigest`
+    // over the configured `tls_cert_pem` is the `Session.peer_cert_spki`
+    // the other node ends up holding, byte for byte and in hex.
+    const local = try quic.localCertSpkiDigest(allocator, test_cert_pem);
+    try std.testing.expectEqualSlices(u8, &local, &server_view.?);
+    try std.testing.expectEqualStrings(&hex, &std.fmt.bytesToHex(local, .lower));
 }
 
 test "cert binding severs a peer announcing an identity it cannot prove" {

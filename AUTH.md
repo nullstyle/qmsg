@@ -172,9 +172,13 @@ openssl x509 -pubkey -in peer.pem \
   | openssl dgst -sha256
 ```
 
-so ids can be provisioned with any toolchain. It is also byte-for-byte
-qmesh-zig's `PeerId`, which is what lets one identity key both a qmsg
-session and a qmesh cluster member.
+so ids can be provisioned with any toolchain. In-process,
+`transport.quic.localCertSpkiDigest(allocator, tls_cert_pem)` returns the
+same 32 bytes from the local certificate (typed `LocalSpkiError`), which
+is what to advertise in a discovery record or hand to a peer as
+`expected_peer_spki`. It is also byte-for-byte qmesh-zig's `PeerId`,
+which is what lets one identity key both a qmsg session and a qmesh
+cluster member.
 
 ## Context Binding
 

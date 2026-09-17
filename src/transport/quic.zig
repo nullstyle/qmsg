@@ -598,6 +598,102 @@ pub fn validateAlpn(protocols: []const []const u8) !void {
     return error.UnsupportedTransport;
 }
 
+pub const LocalSpkiError = error{
+    /// No `-----BEGIN CERTIFICATE-----` / `-----END CERTIFICATE-----`
+    /// block, or the text between the markers is not base64.
+    InvalidPem,
+    /// The decoded bytes do not walk as a DER X.509 Certificate as far
+    /// as its SubjectPublicKeyInfo.
+    InvalidCertificate,
+    OutOfMemory,
+};
+
+/// SHA-256 over the DER SubjectPublicKeyInfo of the first certificate
+/// in `cert_pem`: the transport identity of the endpoint that presents
+/// that certificate, computed from the local configuration instead of
+/// a handshake.
+///
+/// For the same certificate this equals `Session.peer_cert_spki` as the
+/// OTHER end sees it once the handshake completes
+/// (`quic.Connection.peerCertSpkiDigest()`, SHA-256 over BoringSSL's
+/// `i2d_X509_PUBKEY`), so `std.fmt.bytesToHex(digest, .lower)` is what
+/// the peer's `Session.certPeerIdHex()` reports and what a dial's
+/// `expected_peer_spki` must be given; it is also qmesh-zig's `PeerId`
+/// and the `openssl x509 -pubkey | openssl pkey -pubin -outform DER |
+/// openssl dgst -sha256` fingerprint. An embedder uses it to know what
+/// to advertise (a discovery record, an `--expect` value for peers)
+/// before anyone connects.
+///
+/// `cert_pem` is the same `tls_cert_pem` handed to the listener or
+/// dialer; only the first block is read (the leaf of a chain file).
+/// Nothing beyond the DER structure is checked: this names a key, the
+/// pinned-CA handshake is what vouches for it.
+pub fn localCertSpkiDigest(allocator: std.mem.Allocator, cert_pem: []const u8) LocalSpkiError![32]u8 {
+    const begin = "-----BEGIN CERTIFICATE-----";
+    const end = "-----END CERTIFICATE-----";
+    const start = (std.mem.indexOf(u8, cert_pem, begin) orelse return error.InvalidPem) + begin.len;
+    const finish = std.mem.indexOfPos(u8, cert_pem, start, end) orelse return error.InvalidPem;
+    const body = cert_pem[start..finish];
+
+    const decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
+    const der_buf = try allocator.alloc(u8, decoder.calcSizeUpperBound(body.len));
+    defer allocator.free(der_buf);
+    const der_len = decoder.decode(der_buf, body) catch return error.InvalidPem;
+    const der = der_buf[0..der_len];
+
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm,
+    // signature }; TBSCertificate ::= SEQUENCE { [0] version OPTIONAL,
+    // serialNumber, signature, issuer, validity, subject,
+    // subjectPublicKeyInfo, ... } (RFC 5280 section 4.1). The digest
+    // covers the whole SubjectPublicKeyInfo element, tag and length
+    // included, which is what `i2d_X509_PUBKEY` emits.
+    const certificate = try derElement(der, 0);
+    const tbs = try derElement(der, certificate.slice.start);
+    const version_or_serial = try derElement(der, tbs.slice.start);
+    const serial = if (@as(u8, @bitCast(version_or_serial.identifier)) == 0xa0)
+        try derElement(der, version_or_serial.slice.end)
+    else
+        version_or_serial;
+    const signature = try derElement(der, serial.slice.end);
+    const issuer = try derElement(der, signature.slice.end);
+    const validity = try derElement(der, issuer.slice.end);
+    const subject = try derElement(der, validity.slice.end);
+    const spki = try derElement(der, subject.slice.end);
+    if (spki.slice.end > tbs.slice.end) return error.InvalidCertificate;
+
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(der[subject.slice.end..spki.slice.end], &digest, .{});
+    return digest;
+}
+
+/// One DER TLV header at `index`, as `std.crypto.Certificate.der.Element`
+/// but bounds-checked: std's `Element.parse` indexes the identifier and
+/// length bytes unchecked, adds a long-form length without overflow
+/// checks, and never compares the element's end to the buffer, so a
+/// truncated or garbage body has to be refused here instead of read
+/// past `der`.
+fn derElement(der: []const u8, index: u32) LocalSpkiError!std.crypto.Certificate.der.Element {
+    if (der.len > std.math.maxInt(u32)) return error.InvalidCertificate;
+    const len: u32 = @intCast(der.len);
+    if (index > len or len - index < 2) return error.InvalidCertificate;
+    const size_byte = der[index + 1];
+    var content_start: u32 = index + 2;
+    var content_len: u32 = size_byte;
+    if ((size_byte >> 7) != 0) {
+        // Long form: the low bits count the length bytes that follow.
+        const len_size: u32 = size_byte & 0x7f;
+        if (len_size == 0 or len_size > @sizeOf(u32) or len - content_start < len_size) return error.InvalidCertificate;
+        content_len = 0;
+        for (der[content_start..][0..len_size]) |byte| content_len = (content_len << 8) | byte;
+        content_start += len_size;
+    }
+    if (len - content_start < content_len) return error.InvalidCertificate;
+    return .{
+        .identifier = @bitCast(der[index]),
+        .slice = .{ .start = content_start, .end = content_start + content_len },
+    };
+}
+
 pub fn encodeHelloControlStream(allocator: std.mem.Allocator, options: QuicOptions) ![]u8 {
     return encodeControlStream(allocator, .{ .hello = helloFromOptions(options) }, options.control_codec);
 }
@@ -1305,4 +1401,113 @@ test "HELLO rejects a missing required pattern despite another compatible patter
     defer allocator.free(bytes);
     try std.testing.expectError(error.UnsupportedPattern, sess.acceptPeerControl(bytes));
     try std.testing.expectEqual(State.quic_ready, sess.state());
+}
+
+// ---- local certificate identity ----------------------------------
+
+const local_spki_test_cert_pem = @embedFile("../testdata/test_cert.pem");
+const local_spki_test_cert_wide_pem = @embedFile("../testdata/test_cert_wide.pem");
+
+/// shared-studio's `network.certificateSpki`, copied verbatim as the
+/// reference this helper was lifted from (qmsg does not depend on
+/// shared-studio). Kept only as a test oracle; it reads DER unchecked,
+/// so it is fed well-formed input only.
+fn referenceCertificateSpki(allocator: std.mem.Allocator, pem: []const u8) ![32]u8 {
+    const begin = "-----BEGIN CERTIFICATE-----";
+    const end = "-----END CERTIFICATE-----";
+    const start = (std.mem.indexOf(u8, pem, begin) orelse return error.InvalidCertificate) + begin.len;
+    const finish = std.mem.indexOfPos(u8, pem, start, end) orelse return error.InvalidCertificate;
+    const encoded = try allocator.alloc(u8, finish - start);
+    defer allocator.free(encoded);
+    var len: usize = 0;
+    for (pem[start..finish]) |char| {
+        if (std.ascii.isWhitespace(char)) continue;
+        encoded[len] = char;
+        len += 1;
+    }
+    const decoder = std.base64.standard.Decoder;
+    const der = try allocator.alloc(u8, try decoder.calcSizeForSlice(encoded[0..len]));
+    defer allocator.free(der);
+    try decoder.decode(der, encoded[0..len]);
+    const Element = std.crypto.Certificate.der.Element;
+    const cert = try Element.parse(der, 0);
+    const tbs = try Element.parse(der, cert.slice.start);
+    const version_or_serial = try Element.parse(der, tbs.slice.start);
+    const serial = if (@as(u8, @bitCast(version_or_serial.identifier)) == 0xa0)
+        try Element.parse(der, version_or_serial.slice.end)
+    else
+        version_or_serial;
+    const signature = try Element.parse(der, serial.slice.end);
+    const issuer = try Element.parse(der, signature.slice.end);
+    const validity = try Element.parse(der, issuer.slice.end);
+    const subject = try Element.parse(der, validity.slice.end);
+    const spki = try Element.parse(der, subject.slice.end);
+    if (spki.slice.end > tbs.slice.end) return error.InvalidCertificate;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(der[subject.slice.end..spki.slice.end], &digest, .{});
+    return digest;
+}
+
+test "localCertSpkiDigest matches the openssl fingerprint and shared-studio's certificateSpki" {
+    const allocator = std.testing.allocator;
+
+    // `openssl x509 -in src/testdata/<cert> -pubkey -noout | openssl
+    // pkey -pubin -outform DER | openssl dgst -sha256`, recorded so a
+    // regression in the DER walk cannot hide behind an oracle that
+    // shares it.
+    const fixtures = [_]struct { pem: []const u8, hex: []const u8 }{
+        .{ .pem = local_spki_test_cert_pem, .hex = "a9f824a809755b5f757aa2402893618d9d81aa9858de5f38dae95ccaee40ed46" },
+        .{ .pem = local_spki_test_cert_wide_pem, .hex = "24b7107f4cac2aea3a8b0f22c435d1827cbe8a6f8a964403737645cf608a627f" },
+    };
+    for (fixtures) |fixture| {
+        const digest = try localCertSpkiDigest(allocator, fixture.pem);
+        try std.testing.expectEqualStrings(fixture.hex, &std.fmt.bytesToHex(digest, .lower));
+        const reference = try referenceCertificateSpki(allocator, fixture.pem);
+        try std.testing.expectEqualSlices(u8, &reference, &digest);
+    }
+
+    // Leading text before the block (a chain file's bag attributes, a
+    // key in the same file) and CRLF line ends do not change the key.
+    const plain = try localCertSpkiDigest(allocator, local_spki_test_cert_pem);
+    const prefixed = try std.mem.concat(allocator, u8, &.{ "subject=CN=qmsg test\r\n", local_spki_test_cert_pem, "\r\n" });
+    defer allocator.free(prefixed);
+    try std.testing.expectEqualSlices(u8, &plain, &try localCertSpkiDigest(allocator, prefixed));
+    const crlf = try std.mem.replaceOwned(u8, allocator, local_spki_test_cert_pem, "\n", "\r\n");
+    defer allocator.free(crlf);
+    try std.testing.expectEqualSlices(u8, &plain, &try localCertSpkiDigest(allocator, crlf));
+}
+
+test "localCertSpkiDigest refuses garbage with a typed error instead of reading past it" {
+    const allocator = std.testing.allocator;
+
+    // Not PEM at all, or a block that never closes.
+    try std.testing.expectError(error.InvalidPem, localCertSpkiDigest(allocator, ""));
+    try std.testing.expectError(error.InvalidPem, localCertSpkiDigest(allocator, "not a certificate"));
+    try std.testing.expectError(error.InvalidPem, localCertSpkiDigest(allocator, "-----BEGIN CERTIFICATE-----\nMIIB\n"));
+    // The markers around something that is not base64.
+    try std.testing.expectError(error.InvalidPem, localCertSpkiDigest(
+        allocator,
+        "-----BEGIN CERTIFICATE-----\n!!!! not base64 !!!!\n-----END CERTIFICATE-----\n",
+    ));
+    // Well-formed base64 of bytes that are not a certificate: empty,
+    // too short for a header, a long-form length past the end, and a
+    // length that would wrap `u32`.
+    const bodies = [_][]const u8{
+        "",
+        "MA==", // 0x30: identifier with no length byte
+        "MIIB", // 0x30 0x82 0x01: long form promising two length bytes, one present
+        "MIT/////", // 0x30 0x84 0xff 0xff 0xff 0xff: 4 GiB of content
+        "MAOgAQA=", // 0x30 0x03 0xa0 0x01 0x00: a Certificate whose TBS is a bare [0]
+    };
+    for (bodies) |body| {
+        const pem = try std.mem.concat(allocator, u8, &.{ "-----BEGIN CERTIFICATE-----\n", body, "\n-----END CERTIFICATE-----\n" });
+        defer allocator.free(pem);
+        try std.testing.expectError(error.InvalidCertificate, localCertSpkiDigest(allocator, pem));
+    }
+    // The real certificate cut off inside its TBSCertificate.
+    const begin = "-----BEGIN CERTIFICATE-----\n";
+    const start = std.mem.indexOf(u8, local_spki_test_cert_pem, begin).? + begin.len;
+    const truncated = try std.mem.concat(allocator, u8, &.{ begin, local_spki_test_cert_pem[start..][0..64], "\n-----END CERTIFICATE-----\n" });
+    defer allocator.free(truncated);
+    try std.testing.expectError(error.InvalidCertificate, localCertSpkiDigest(allocator, truncated));
 }

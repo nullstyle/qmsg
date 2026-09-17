@@ -725,6 +725,14 @@ test "mutual TLS gives both ends a peer identity, and it is the same certificate
     // Both ends present the same self-signed fixture, so each side's
     // view of the other is the same 32 bytes.
     try std.testing.expectEqualSlices(u8, &server_view.?, &client_view.?);
+
+    // And they are the bytes the local configuration predicts: what an
+    // embedder computes from its own `tls_cert_pem` before any dial is
+    // exactly what the peer's handshake will report (and so what its
+    // `expected_peer_spki` must be).
+    const local = try quic.localCertSpkiDigest(allocator, test_cert_pem);
+    try std.testing.expectEqualSlices(u8, &local, &server_view.?);
+    try std.testing.expectEqualSlices(u8, &local, &client_view.?);
 }
 
 test "a qmsg session over mutual TLS binds the announced id to the certificate" {

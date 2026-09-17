@@ -7,6 +7,14 @@ changes.
 
 ## [Unreleased]
 
+- `transport.quic.localCertSpkiDigest(allocator, cert_pem)` computes the
+  certificate-bound identity from a local `tls_cert_pem` without a handshake:
+  SHA-256 over the leaf's DER SubjectPublicKeyInfo, byte-for-byte the
+  `Session.peer_cert_spki` the other end sees, `certPeerIdHex()` in hex, and
+  qmesh-zig's `PeerId`. Lifted from shared-studio's `certificateSpki`, with a
+  typed `LocalSpkiError` (`InvalidPem`, `InvalidCertificate`, `OutOfMemory`)
+  and bounds-checked DER reads. Use it to publish an identity (a discovery
+  record, an `expected_peer_spki` for peers) before anyone connects.
 - Accepted QUIC sessions now receive replies to their own initiated requests.
   Server drivers register those local bidirectional receive streams with bounded
   tracking capacity. The released-QUIC fallback also avoids rediscovering an
