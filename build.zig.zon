@@ -29,8 +29,8 @@
         // same name-version-digest form as the other pins), not the raw
         // tarball digest a newer Zig's `zig fetch` would print.
         .quic = .{
-            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.22.0.tar.gz",
-            .hash = "quic-0.22.0-DnSYvTAhMgCUk_t_RVWcFX-PgAUsi0NB2M-NtNSH_i4N",
+            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.21.2.tar.gz",
+            .hash = "quic-0.21.2-DnSYvQaTMQAfMzLBGZyb9_O4d82qZH6tdMpYYvEKvTwa",
         },
         // Optional Cap'n Proto body codec dependency (`-Dcapnp=true`).
         // LAZY: default builds and non-opting consumers never fetch or
