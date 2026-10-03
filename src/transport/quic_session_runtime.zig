@@ -97,6 +97,11 @@ pub const QuicSessionRuntime = struct {
     /// at once ("burned"), so the peer closes it like any canceled
     /// request and gives the id back.
     unopened_bidi: std.ArrayList(PendingOpen) = .empty,
+    /// Peer bidi streams that carried a `no_reply` message. Nobody
+    /// answers on them, so `pump` finishes their reply half with no
+    /// bytes: the stream then closes on both sides, and the peer gets its
+    /// place in our window back.
+    reply_fins: std.ArrayList(u64) = .empty,
 
     pub const PendingOpen = struct {
         stream_id: u64,
@@ -144,6 +149,7 @@ pub const QuicSessionRuntime = struct {
         for (self.inbox.items) |*received| received.deinit();
         self.inbox.deinit(self.allocator);
         self.unopened_bidi.deinit(self.allocator);
+        self.reply_fins.deinit(self.allocator);
 
         self.session.deinit();
         self.* = undefined;
@@ -648,6 +654,7 @@ pub const QuicSessionRuntime = struct {
         try self.openReservedStreams(transport);
         result.reliable_sent_complete += try self.pumpReliableSenders(transport);
         result.reliable_received += try self.pumpReliableReceivers(transport);
+        try self.pumpReplyFins(transport);
 
         // Liveness: inbound-side progress counts as peer activity. The
         // clock comes from the sweep cadence (tickHeartbeat sets it); when
@@ -821,6 +828,20 @@ pub const QuicSessionRuntime = struct {
         return complete;
     }
 
+    /// Finishes the reply half of each stream in `reply_fins`.
+    fn pumpReplyFins(self: *QuicSessionRuntime, transport: anytype) !void {
+        var done: usize = 0;
+        defer dropFront(u64, &self.reply_fins, done);
+        for (self.reply_fins.items) |stream_id| {
+            transport.streamFinish(stream_id) catch |err| switch (@as(anyerror, err)) {
+                // The requester already ended the stream.
+                error.StreamClosed, error.StreamNotFound => {},
+                else => return err,
+            };
+            done += 1;
+        }
+    }
+
     /// Opens the streams of `unopened_bidi` in id order. The first
     /// `StreamLimitExceeded` ends the pass: the peer gives an id back
     /// when one of our streams closes, and the next pump tries again.
@@ -868,7 +889,11 @@ pub const QuicSessionRuntime = struct {
             // Commit space before decoding. Nothing fallible follows ownership
             // transfer from the receiver, so an OOM retry cannot lose a message.
             try self.inbox.ensureUnusedCapacity(self.allocator, 1);
+            try self.reply_fins.ensureUnusedCapacity(self.allocator, 1);
             const received = (try entry.value_ptr.pump(transport)) orelse continue;
+            if (received.flags.no_reply and isPeerBidiStreamId(self.session.role, entry.key_ptr.*)) {
+                self.reply_fins.appendAssumeCapacity(entry.key_ptr.*);
+            }
             self.inbox.appendAssumeCapacity(.{
                 .stream_id = entry.key_ptr.*,
                 .message = received,
@@ -1640,6 +1665,42 @@ test "session runtime replies on an accepted peer stream" {
     var owned = received.takeMessage();
     defer owned.deinit();
     try std.testing.expectEqualStrings("jobs.run", owned.subject);
+}
+
+test "a no_reply message finishes the reply half of its stream" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .server, .{ .peer_id = "server-a" });
+    defer runtime.deinit();
+    var peer = try QuicSessionRuntime.init(allocator, 2, .client, .{ .peer_id = "client-a" });
+    defer peer.deinit();
+    var io = FakeTransport.init(allocator);
+    defer io.deinit();
+    var peer_io = FakeTransport.init(allocator);
+    defer peer_io.deinit();
+    try readyRuntimePair(&peer, &peer_io, &runtime, &io);
+
+    // The peer sent a no_reply message on 0 and a request on 4.
+    for ([_]u64{ 0, 4 }) |stream_id| {
+        const encoded = try quic_streams.encodeReliableMessage(allocator, .{
+            .subject = "work",
+            .id = stream_id + 1,
+            .flags = .{ .no_reply = stream_id == 0 },
+            .body = "x",
+        }, .{});
+        defer allocator.free(encoded);
+        const entry = try io.getOrPutStream(stream_id);
+        try entry.value_ptr.incoming.appendSlice(allocator, encoded);
+        entry.value_ptr.final_size = encoded.len;
+        try runtime.acceptReliableStream(stream_id);
+    }
+    _ = try runtime.pump(&io);
+
+    try std.testing.expectEqual(@as(usize, 2), runtime.inboxLen());
+    // FIN with no bytes on the no_reply stream; the request waits for its reply.
+    try std.testing.expect(io.streams.get(0).?.finished);
+    try std.testing.expectEqual(@as(usize, 0), io.streams.get(0).?.writes.items.len);
+    try std.testing.expect(!io.streams.get(4).?.finished);
 }
 
 test "a reply on a stream the requester ended is dropped, not a session error" {

@@ -259,6 +259,31 @@ fn skipIfNoUdp(err: anyerror) anyerror {
     };
 }
 
+// A no_reply message rides a new bidi stream. The responder must end
+// the reply half, or the stream never closes and each message keeps a
+// place in the responder's window.
+test "a session carries more no_reply messages than the peer's bidi window" {
+    const a = std.testing.allocator;
+    var p: Pair = undefined;
+    p.setUp(a, .{ .initial_max_streams_bidi = 8 }, .{}) catch |err| return skipIfNoUdp(err);
+    defer p.tearDown();
+    errdefer p.report("no_reply through a window of 8");
+    try p.driveUntilReady();
+
+    const total: usize = 40;
+    var delivered: usize = 0;
+    for (0..total) |i| {
+        try p.note(i + 1);
+        for (0..2_000) |_| {
+            try p.step();
+            delivered += (try p.serve(.answer)).no_reply;
+            if (delivered == i + 1) break;
+        }
+        try std.testing.expectEqual(i + 1, delivered);
+    }
+    try p.expectSessionsReady();
+}
+
 // A refused queueReliable must not use up a stream id: an id that is
 // reserved and never opened is a stream the peer counts as open.
 test "QueueFull refusals do not use up stream ids" {
