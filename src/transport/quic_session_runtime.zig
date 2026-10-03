@@ -797,13 +797,28 @@ pub const QuicSessionRuntime = struct {
         defer complete_ids.deinit(self.allocator);
         try complete_ids.ensureTotalCapacity(self.allocator, self.reliable_senders.count());
         defer dropCompleted(&self.reliable_senders, complete_ids.items);
+        var complete: usize = 0;
         var senders = self.reliable_senders.iterator();
         while (senders.next()) |entry| {
             // A new local stream opens in id order, in openReservedStreams.
             if (entry.value_ptr.options.open_bidi and !entry.value_ptr.opened) continue;
-            if (try entry.value_ptr.pump(transport) == .complete) complete_ids.appendAssumeCapacity(entry.key_ptr.*);
+            const progress = entry.value_ptr.pump(transport) catch |err| switch (@as(anyerror, err)) {
+                // The peer stopped the stream (STOP_SENDING: it canceled
+                // the request, or refused the stream), or the stream is
+                // closed and gone. These bytes have nowhere to go: drop
+                // the sender, keep the session.
+                error.StreamClosed, error.StreamNotFound => {
+                    complete_ids.appendAssumeCapacity(entry.key_ptr.*);
+                    continue;
+                },
+                else => return err,
+            };
+            if (progress == .complete) {
+                complete_ids.appendAssumeCapacity(entry.key_ptr.*);
+                complete += 1;
+            }
         }
-        return complete_ids.items.len;
+        return complete;
     }
 
     /// Opens the streams of `unopened_bidi` in id order. The first
@@ -974,6 +989,8 @@ const FakeStream = struct {
     /// Codes of our RESET_STREAM and STOP_SENDING, when sent.
     reset_code: ?u64 = null,
     stop_code: ?u64 = null,
+    /// Our send half is over (the peer sent STOP_SENDING): StreamClosed.
+    send_closed: bool = false,
 
     fn deinit(self: *FakeStream, allocator: std.mem.Allocator) void {
         self.incoming.deinit(allocator);
@@ -993,6 +1010,7 @@ const FakeTransport = struct {
     uni_opened: usize = 0,
     /// Every open, in call order.
     opens: std.ArrayList(u64) = .empty,
+    reaped: std.ArrayList(u64) = .empty,
 
     fn init(allocator: std.mem.Allocator) FakeTransport {
         return .{
@@ -1006,6 +1024,7 @@ const FakeTransport = struct {
         while (streams.next()) |stream| stream.deinit(self.allocator);
         self.streams.deinit();
         self.opens.deinit(self.allocator);
+        self.reaped.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -1028,7 +1047,9 @@ const FakeTransport = struct {
     }
 
     pub fn streamWrite(self: *FakeTransport, stream_id: u64, bytes: []const u8) !usize {
+        if (self.gone(stream_id)) return error.StreamNotFound;
         const stream = (try self.getOrPutStream(stream_id)).value_ptr;
+        if (stream.send_closed) return error.StreamClosed;
         const writable = @min(bytes.len, stream.write_limit);
         if (writable == 0) return 0;
         try stream.writes.appendSlice(self.allocator, bytes[0..writable]);
@@ -1036,8 +1057,17 @@ const FakeTransport = struct {
     }
 
     pub fn streamFinish(self: *FakeTransport, stream_id: u64) !void {
+        if (self.gone(stream_id)) return error.StreamNotFound;
         const stream = (try self.getOrPutStream(stream_id)).value_ptr;
+        if (stream.send_closed) return error.StreamClosed;
         stream.finished = true;
+    }
+
+    /// Streams closed on both halves and reaped: every call is
+    /// StreamNotFound.
+    fn gone(self: *FakeTransport, stream_id: u64) bool {
+        for (self.reaped.items) |id| if (id == stream_id) return true;
+        return false;
     }
 
     pub fn streamReset(self: *FakeTransport, stream_id: u64, code: u64) !void {
@@ -1610,6 +1640,34 @@ test "session runtime replies on an accepted peer stream" {
     var owned = received.takeMessage();
     defer owned.deinit();
     try std.testing.expectEqualStrings("jobs.run", owned.subject);
+}
+
+test "a reply on a stream the requester ended is dropped, not a session error" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .server, .{ .peer_id = "server-a" });
+    defer runtime.deinit();
+    var peer = try QuicSessionRuntime.init(allocator, 2, .client, .{ .peer_id = "client-a" });
+    defer peer.deinit();
+    var io = FakeTransport.init(allocator);
+    defer io.deinit();
+    var peer_io = FakeTransport.init(allocator);
+    defer peer_io.deinit();
+    try readyRuntimePair(&peer, &peer_io, &runtime, &io);
+
+    // Three requests the peer sent on 0, 4 and 8. It canceled 0
+    // (STOP_SENDING closed our send half), and 4 is closed and reaped.
+    (try io.getOrPutStream(0)).value_ptr.send_closed = true;
+    try io.reaped.append(allocator, 4);
+    for ([_]u64{ 0, 4, 8 }) |stream_id| {
+        try runtime.replyReliableOnStream(stream_id, .{ .subject = "work", .id = stream_id + 1, .body = "late" });
+    }
+
+    const result = try runtime.pump(&io);
+    try std.testing.expectEqual(@as(usize, 1), result.reliable_sent_complete);
+    try std.testing.expectEqual(@as(usize, 0), runtime.pendingReliableSenders());
+    try std.testing.expect(io.streams.get(8).?.finished);
+    try std.testing.expectEqual(quic.State.ready, runtime.state());
 }
 
 test "session runtime datagram helpers encode decode and map send backpressure" {

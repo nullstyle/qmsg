@@ -328,6 +328,34 @@ test "requests canceled before their stream opens do not pin the responder's rec
     try p.expectSessionsReady();
 }
 
+// A request the responder drops without an answer closes when the
+// requester's deadline fires its cancel plan (RESET_STREAM +
+// STOP_SENDING), so its place in the window comes back.
+test "requests the responder drops unanswered give their window places back" {
+    const a = std.testing.allocator;
+    var p: Pair = undefined;
+    p.setUp(a, .{ .initial_max_streams_bidi = 8 }, .{}) catch |err| return skipIfNoUdp(err);
+    defer p.tearDown();
+    errdefer p.report("dropped requests");
+    try p.driveUntilReady();
+
+    var outcomes: Outcomes = .{};
+    for (0..12) |i| {
+        _ = try p.request(i + 1, 50);
+        for (0..5_000) |_| {
+            try p.step();
+            _ = try p.serve(.drop);
+            try p.collect(&outcomes);
+            if (outcomes.total() == i + 1) break;
+        }
+        try std.testing.expectEqual(i + 1, outcomes.deadline_exceeded);
+    }
+    _ = try p.request(999, 2_000);
+    try p.roundTrip(&outcomes, 13, 5_000);
+    try std.testing.expectEqual(@as(usize, 1), outcomes.replies);
+    try p.expectSessionsReady();
+}
+
 // More requests than the window at once: the opens past the window
 // wait for the peer to give ids back (StreamLimitExceeded is
 // temporary), in id order.
@@ -368,4 +396,48 @@ test "256 messages queued before one pump all arrive" {
     }
     try std.testing.expectEqual(n, delivered);
     try p.expectSessionsReady();
+}
+
+// The responder answers after the requester canceled (RESET_STREAM +
+// STOP_SENDING). The stream is closed or gone; the reply must be
+// dropped, and the connection must stay up.
+test "a reply to a request the requester canceled does not close the connection" {
+    const a = std.testing.allocator;
+    var p: Pair = undefined;
+    p.setUp(a, .{}, .{}) catch |err| return skipIfNoUdp(err);
+    defer p.tearDown();
+    errdefer p.report("late reply");
+    try p.driveUntilReady();
+
+    _ = try p.request(7, 20);
+    var held: ?node_mod.Event = null;
+    defer if (held) |*event| event.deinit();
+    var outcomes: Outcomes = .{};
+    for (0..2_000) |_| {
+        try p.step();
+        if (held == null) {
+            var events: [4]node_mod.Event = undefined;
+            const count = try p.server.poll(&events);
+            for (events[0..count]) |*event| {
+                if (held == null and event.* == .request) held = event.* else event.deinit();
+            }
+        }
+        try p.collect(&outcomes);
+        if (outcomes.deadline_exceeded > 0 and held != null) break;
+    }
+    try std.testing.expect(held != null);
+    try std.testing.expectEqual(@as(usize, 1), outcomes.deadline_exceeded);
+
+    // Let the cancel reach the server and the stream close there, then
+    // answer late.
+    try p.steps(200);
+    const handle = held.?.request.msg.reply_handle orelse return error.ReplyHandleMissing;
+    try p.server.reply(handle, .{ .subject = "", .body = "late" });
+    try p.steps(200);
+    try p.expectSessionsReady();
+
+    // The session still carries a request.
+    _ = try p.request(8, 2_000);
+    try p.roundTrip(&outcomes, 2, 5_000);
+    try std.testing.expectEqual(@as(usize, 1), outcomes.replies);
 }
