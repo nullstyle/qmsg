@@ -299,3 +299,45 @@ test "QueueFull refusals do not use up stream ids" {
     }
     try p.expectSessionsReady();
 }
+
+// More requests than the window at once: the opens past the window
+// wait for the peer to give ids back (StreamLimitExceeded is
+// temporary), in id order.
+test "a burst larger than the peer's window completes" {
+    const a = std.testing.allocator;
+    var p: Pair = undefined;
+    p.setUp(a, .{ .initial_max_streams_bidi = 4 }, .{}) catch |err| return skipIfNoUdp(err);
+    defer p.tearDown();
+    errdefer p.report("burst of 12 through a window of 4");
+    try p.driveUntilReady();
+
+    const n: usize = 12; // within the 16 receivers of the default byte budget
+    for (0..n) |i| _ = try p.request(i + 1, 5_000);
+    var outcomes: Outcomes = .{};
+    try p.roundTrip(&outcomes, n, 10_000);
+    try std.testing.expectEqual(n, outcomes.replies);
+    try p.expectSessionsReady();
+}
+
+// Many messages queued before one pump. Opened out of id order, they
+// leave more separate runs of skipped ids than quic-zig accepts (64):
+// `TooManySkippedStreamIds`.
+test "256 messages queued before one pump all arrive" {
+    const a = std.testing.allocator;
+    var p: Pair = undefined;
+    p.setUp(a, .{}, .{}) catch |err| return skipIfNoUdp(err);
+    defer p.tearDown();
+    errdefer p.report("256 queued before one pump");
+    try p.driveUntilReady();
+
+    const n: usize = 256;
+    for (0..n) |i| try p.note(i + 1);
+    var delivered: usize = 0;
+    for (0..10_000) |_| {
+        try p.step();
+        delivered += (try p.serve(.answer)).no_reply;
+        if (delivered == n) break;
+    }
+    try std.testing.expectEqual(n, delivered);
+    try p.expectSessionsReady();
+}

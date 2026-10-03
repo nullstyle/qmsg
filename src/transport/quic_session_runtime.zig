@@ -84,6 +84,20 @@ pub const QuicSessionRuntime = struct {
     reliable_receivers: std.AutoHashMap(u64, quic_streams.ReliableMessageReceiver),
     inbox: std.ArrayList(ReceivedReliable) = .empty,
     envelope_codec: envelope.CodecOptions = .{},
+    /// Local bidi ids that have a queued message and are not open on the
+    /// wire yet, in id order. quic-zig v0.24.0 counts a skipped local id
+    /// as a stream that is open at the peer until it is used and closed,
+    /// refuses more than 64 separate runs of skipped ids
+    /// (`TooManySkippedStreamIds`), and refuses an open above the peer's
+    /// window (`StreamLimitExceeded`, always temporary). So
+    /// `openReservedStreams` opens these ids strictly in order, just
+    /// before the first write, and stops at the first refusal; the next
+    /// pump tries again, and later ids keep their place behind the head.
+    unopened_bidi: std.ArrayList(PendingOpen) = .empty,
+
+    pub const PendingOpen = struct {
+        stream_id: u64,
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -121,6 +135,7 @@ pub const QuicSessionRuntime = struct {
 
         for (self.inbox.items) |*received| received.deinit();
         self.inbox.deinit(self.allocator);
+        self.unopened_bidi.deinit(self.allocator);
 
         self.session.deinit();
         self.* = undefined;
@@ -298,6 +313,7 @@ pub const QuicSessionRuntime = struct {
         if (expects_reply) try self.checkReceiverCapacity();
         try self.reliable_senders.ensureUnusedCapacity(1);
         if (expects_reply) try self.reliable_receivers.ensureUnusedCapacity(1);
+        try self.unopened_bidi.ensureUnusedCapacity(self.allocator, 1);
 
         // Reserve the id last: nothing below can fail.
         const reserved = try self.stream_ids.nextBidi();
@@ -307,6 +323,7 @@ pub const QuicSessionRuntime = struct {
             stream_id,
             quic_streams.ReliableMessageReceiver.init(self.allocator, stream_id, self.envelope_codec),
         );
+        self.insertUnopenedAssumeCapacity(stream_id);
         return stream_id;
     }
 
@@ -335,7 +352,29 @@ pub const QuicSessionRuntime = struct {
         errdefer sender.deinit();
 
         try self.checkQueuedSendBytes(sender.bytes.len);
+        if (options.open_bidi) {
+            // An explicit local id joins the in-order open queue.
+            for (self.unopened_bidi.items) |pending| {
+                if (pending.stream_id == stream_id) return error.StreamAlreadyOpen;
+            }
+            try self.unopened_bidi.ensureUnusedCapacity(self.allocator, 1);
+            try self.reliable_senders.put(stream_id, sender);
+            self.insertUnopenedAssumeCapacity(stream_id);
+            return;
+        }
         try self.reliable_senders.put(stream_id, sender);
+    }
+
+    fn insertUnopenedAssumeCapacity(self: *QuicSessionRuntime, stream_id: u64) void {
+        var at: usize = self.unopened_bidi.items.len;
+        while (at > 0 and self.unopened_bidi.items[at - 1].stream_id > stream_id) at -= 1;
+        self.unopened_bidi.insertAssumeCapacity(at, .{ .stream_id = stream_id });
+    }
+
+    /// Local bidi streams that have a queued message and wait for the
+    /// peer's stream credit (see `unopened_bidi`).
+    pub fn pendingOpens(self: QuicSessionRuntime) usize {
+        return self.unopened_bidi.items.len;
     }
 
     pub fn replyReliableOnStream(
@@ -364,6 +403,11 @@ pub const QuicSessionRuntime = struct {
         if (self.reliable_senders.fetchRemove(stream_id)) |entry| {
             var owned = entry.value;
             owned.deinit();
+        }
+        for (self.unopened_bidi.items, 0..) |pending, index| {
+            if (pending.stream_id != stream_id) continue;
+            _ = self.unopened_bidi.orderedRemove(index);
+            break;
         }
         if (self.reliable_receivers.fetchRemove(stream_id)) |entry| {
             var owned = entry.value;
@@ -587,6 +631,7 @@ pub const QuicSessionRuntime = struct {
 
         try self.resolveDeferredCredential();
 
+        try self.openReservedStreams(transport);
         result.reliable_sent_complete += try self.pumpReliableSenders(transport);
         result.reliable_received += try self.pumpReliableReceivers(transport);
 
@@ -740,9 +785,27 @@ pub const QuicSessionRuntime = struct {
         defer dropCompleted(&self.reliable_senders, complete_ids.items);
         var senders = self.reliable_senders.iterator();
         while (senders.next()) |entry| {
+            // A new local stream opens in id order, in openReservedStreams.
+            if (entry.value_ptr.options.open_bidi and !entry.value_ptr.opened) continue;
             if (try entry.value_ptr.pump(transport) == .complete) complete_ids.appendAssumeCapacity(entry.key_ptr.*);
         }
         return complete_ids.items.len;
+    }
+
+    /// Opens the streams of `unopened_bidi` in id order. The first
+    /// `StreamLimitExceeded` ends the pass: the peer gives an id back
+    /// when one of our streams closes, and the next pump tries again.
+    fn openReservedStreams(self: *QuicSessionRuntime, transport: anytype) !void {
+        var done: usize = 0;
+        defer dropFront(PendingOpen, &self.unopened_bidi, done);
+        for (self.unopened_bidi.items) |pending| {
+            transport.openBidi(pending.stream_id) catch |err| switch (@as(anyerror, err)) {
+                error.StreamLimitExceeded => return,
+                else => return err,
+            };
+            if (self.reliable_senders.getPtr(pending.stream_id)) |sender| sender.opened = true;
+            done += 1;
+        }
     }
 
     fn pumpReliableReceivers(self: *QuicSessionRuntime, transport: anytype) !usize {
@@ -757,6 +820,11 @@ pub const QuicSessionRuntime = struct {
             const limits = self.session.options;
             if (self.inbox.items.len >= limits.max_queued_messages or
                 self.inboxBytes() +| limits.max_message_size > limits.max_queued_bytes) break;
+            // The reply stream of a request that still waits for the
+            // peer's stream credit is not open yet: nothing to read.
+            if (self.reliable_senders.getPtr(entry.key_ptr.*)) |sender| {
+                if (sender.options.open_bidi and !sender.opened) continue;
+            }
             // Commit space before decoding. Nothing fallible follows ownership
             // transfer from the receiver, so an OOM retry cannot lose a message.
             try self.inbox.ensureUnusedCapacity(self.allocator, 1);
@@ -771,6 +839,14 @@ pub const QuicSessionRuntime = struct {
         return received_count;
     }
 };
+
+/// Removes the first `count` items of `list`, keeping the order of the rest.
+fn dropFront(comptime T: type, list: *std.ArrayList(T), count: usize) void {
+    if (count == 0) return;
+    const rest = list.items.len - count;
+    std.mem.copyForwards(T, list.items[0..rest], list.items[count..]);
+    list.shrinkRetainingCapacity(rest);
+}
 
 /// Removes finished entries so a value that completed its work is
 /// never pumped again (a decoded receiver is an InvalidState; a
@@ -881,6 +957,14 @@ const FakeStream = struct {
 const FakeTransport = struct {
     allocator: std.mem.Allocator,
     streams: std.AutoHashMap(u64, FakeStream),
+    /// How many local streams of each kind the fake peer lets us open
+    /// (its window, never given back here); null is no limit.
+    bidi_open_limit: ?usize = null,
+    uni_open_limit: ?usize = null,
+    bidi_opened: usize = 0,
+    uni_opened: usize = 0,
+    /// Every open, in call order.
+    opens: std.ArrayList(u64) = .empty,
 
     fn init(allocator: std.mem.Allocator) FakeTransport {
         return .{
@@ -893,17 +977,26 @@ const FakeTransport = struct {
         var streams = self.streams.valueIterator();
         while (streams.next()) |stream| stream.deinit(self.allocator);
         self.streams.deinit();
+        self.opens.deinit(self.allocator);
         self.* = undefined;
     }
 
     pub fn openBidi(self: *FakeTransport, stream_id: u64) !void {
+        if (self.bidi_open_limit) |limit| if (self.bidi_opened >= limit) return error.StreamLimitExceeded;
+        try self.opens.ensureUnusedCapacity(self.allocator, 1);
         const entry = try self.getOrPutStream(stream_id);
         entry.value_ptr.opened_bidi = true;
+        self.bidi_opened += 1;
+        self.opens.appendAssumeCapacity(stream_id);
     }
 
     pub fn openUni(self: *FakeTransport, stream_id: u64) !void {
+        if (self.uni_open_limit) |limit| if (self.uni_opened >= limit) return error.StreamLimitExceeded;
+        try self.opens.ensureUnusedCapacity(self.allocator, 1);
         const entry = try self.getOrPutStream(stream_id);
         entry.value_ptr.opened_uni = true;
+        self.uni_opened += 1;
+        self.opens.appendAssumeCapacity(stream_id);
     }
 
     pub fn streamWrite(self: *FakeTransport, stream_id: u64, bytes: []const u8) !usize {
@@ -1309,6 +1402,77 @@ test "a queueReliable refusal reserves no stream id" {
     runtime.abortReliable(0);
     runtime.abortReliable(4);
     try std.testing.expectEqual(@as(u64, 8), try runtime.queueReliable(.{ .subject = "d", .id = 4 }));
+}
+
+test "queued streams open in id order and wait at the peer's stream limit" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .client, .{ .peer_id = "client-a" });
+    defer runtime.deinit();
+    var peer = try QuicSessionRuntime.init(allocator, 2, .server, .{ .peer_id = "server-a" });
+    defer peer.deinit();
+    var io = FakeTransport.init(allocator);
+    defer io.deinit();
+    var peer_io = FakeTransport.init(allocator);
+    defer peer_io.deinit();
+    try readyRuntimePair(&runtime, &io, &peer, &peer_io);
+    const opens_before = io.opens.items.len;
+
+    // The peer's window holds two of our bidi streams.
+    io.bidi_open_limit = 2;
+    var ids: [5]u64 = undefined;
+    for (&ids, 0..) |*id, i| id.* = try runtime.queueReliable(.{ .subject = "work", .id = i + 1, .body = "x" });
+    try std.testing.expectEqual(@as(usize, 5), runtime.pendingOpens());
+
+    // StreamLimitExceeded is not an error of the pump: the rest wait.
+    _ = try runtime.pump(&io);
+    try std.testing.expectEqualSlices(u64, ids[0..2], io.opens.items[opens_before..]);
+    try std.testing.expectEqual(@as(usize, 3), runtime.pendingOpens());
+    try std.testing.expect(!io.streams.contains(ids[2]));
+    _ = try runtime.pump(&io);
+    try std.testing.expectEqual(@as(usize, 3), runtime.pendingOpens());
+
+    // The peer gives ids back: the rest open, still in id order.
+    io.bidi_open_limit = null;
+    _ = try runtime.pump(&io);
+    try std.testing.expectEqualSlices(u64, &ids, io.opens.items[opens_before..]);
+    try std.testing.expectEqual(@as(usize, 0), runtime.pendingOpens());
+    try std.testing.expectEqual(@as(usize, 0), runtime.pendingReliableSenders());
+    for (ids) |id| try std.testing.expect(io.streams.get(id).?.finished);
+}
+
+test "a control stream waits at the peer's uni stream limit" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .client, .{ .peer_id = "client-a" });
+    defer runtime.deinit();
+    var peer = try QuicSessionRuntime.init(allocator, 2, .server, .{ .peer_id = "server-a" });
+    defer peer.deinit();
+    var io = FakeTransport.init(allocator);
+    defer io.deinit();
+    var peer_io = FakeTransport.init(allocator);
+    defer peer_io.deinit();
+    try readyRuntimePair(&runtime, &io, &peer, &peer_io);
+
+    var registry = protocol.pubsub.Registry.init(allocator);
+    defer registry.deinit();
+    var ledger = pushpull.CreditLedger.init(allocator);
+    defer ledger.deinit();
+    var control_state = quic_control.State.init(allocator, &registry, &ledger, .{});
+    defer control_state.deinit();
+
+    // The HELLO stream used the only uni place the peer gives.
+    io.uni_open_limit = io.uni_opened;
+    try runtime.queueSubscribe(&control_state, "jobs.*", .{});
+    const stream_id = (try runtime.flushQueuedControl(&control_state)).?;
+    _ = try runtime.pump(&io);
+    try std.testing.expect(runtime.hasControlFlushSender());
+    try std.testing.expect(!io.streams.contains(stream_id));
+
+    io.uni_open_limit = null;
+    const result = try runtime.pump(&io);
+    try std.testing.expectEqual(@as(usize, 1), result.control_flush_complete);
+    try std.testing.expect(io.streams.get(stream_id).?.finished);
 }
 
 test "session runtime replies on an accepted peer stream" {

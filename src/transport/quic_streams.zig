@@ -140,7 +140,12 @@ pub const ControlStreamSender = struct {
 
     pub fn pump(self: *ControlStreamSender, transport: anytype) !WriteProgress {
         if (!self.opened) {
-            if (self.options.open_uni) _ = try transport.openUni(self.stream_id);
+            if (self.options.open_uni) transport.openUni(self.stream_id) catch |err| switch (@as(anyerror, err)) {
+                // Above the peer's uni window: temporary since quic-zig
+                // v0.24.0. The next pump tries again.
+                error.StreamLimitExceeded => return .pending,
+                else => return err,
+            };
             self.opened = true;
         }
 
