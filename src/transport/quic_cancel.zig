@@ -55,10 +55,17 @@ pub const CancelReason = enum {
 };
 
 /// Which half of a QUIC stream qmsg is actively using when cancellation fires.
+///
+/// A bidirectional stream gives its place in the stream window back
+/// only when BOTH halves are closed (quic-zig v0.24.0). To end or refuse
+/// a bidi stream, use `.bidirectional`: `.sending` or `.receiving` alone
+/// leaves the other half open, and the stream then holds its place for
+/// the life of the connection.
 pub const StreamPhase = enum {
     /// Local qmsg is still writing request/message bytes.
     sending,
-    /// Local qmsg is waiting for bytes from the peer.
+    /// Local qmsg is waiting for bytes from the peer. STOP_SENDING only:
+    /// never use it to refuse a peer-opened bidi stream.
     receiving,
     /// Both halves may still be active; reset send and stop receive.
     bidirectional,

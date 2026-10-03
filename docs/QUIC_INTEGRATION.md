@@ -105,18 +105,15 @@ Sockets own pattern state, deadlines, queues, and request correlation.
 
 ## Build Integration
 
-`quic-zig` package metadata:
+qmsg pins a quic-zig release tarball (`build.zig.zon`, URL + hash; today
+v0.24.0, module `quic`, with its BoringSSL as module `boringssl`). Its floor
+is the tagged Zig 0.17.0, and `mise.toml` pins the same Zig. Move the two
+together: quic-zig's `build.zig` refuses a Zig older than its floor.
 
-- package name: `quic_zig`
-- module name: `quic_zig`
-- current version: `0.2.0`
-- minimum Zig version: `0.16.0`
-- transitive dependency: `boringssl_zig`
-
-qmsg currently declares `minimum_zig_version = "0.17.0"` and depends on a local
-`../quic-zig` checkout. Keep verifying that the local qmsg toolchain can build
-that checkout. If not, either align qmsg's toolchain target with quic-zig or
-pin a quic-zig branch known to build on the qmsg compiler.
+The quic option map is `{ target, release = optimize != .debug,
+sanitize-c = "trap" }`. Every package in one build that depends on quic-zig
+must pass the same map, or Zig 0.17.0 fails with "file exists in modules
+'quic' and 'quic0'". A consumer passes its `optimize` to qmsg.
 
 Keep quic support behind a clearly named module such as
 `src/transport/quic.zig`. Do not expose `quic_zig.Connection` directly in the
@@ -382,8 +379,12 @@ Tie these to qmsg limits:
 - stream and connection flow-control windows are transport flow control, not
   qmsg queue sizes. qmsg still needs bounded message queues above QUIC.
 - `initial_max_streams_bidi` is the peer-visible cap for concurrent reliable
-  message streams. It should line up with qmsg's bounded in-flight operation
-  limit.
+  message streams. Since quic-zig v0.24.0 it is a window: the peer gets an id
+  back only when one of its streams is closed in both directions, so a window
+  of W carries about W / (2 x RTT) request streams per second. qmsg keeps 256
+  (bidi) and 16 (uni). The in-flight limit for requests is lower: the
+  receiver byte budget (`max_queued_bytes / max_message_size`, 16 by
+  default). See WIRE.md, "Stream Lifetime".
 
 ## Auth And HELLO
 
@@ -436,8 +437,8 @@ the QUIC adapter.
 
 - API stability: quic-zig is pre-1.0. qmsg should hide quic-zig types behind
   qmsg transport wrappers.
-- Toolchain skew: qmsg currently targets Zig 0.17.0 while quic-zig currently
-  advertises Zig 0.16.0+. Verify before committing the dependency.
+- Toolchain skew: the quic-zig pin's Zig floor and `mise.toml` must move
+  together (see Build Integration).
 - Stream ID allocation: quic-zig requires caller-supplied IDs. qmsg must own
   role-aware stream ID allocation and stream state.
 - Stream discovery: no dedicated public "new stream" event exists today.

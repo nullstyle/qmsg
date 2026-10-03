@@ -144,8 +144,14 @@ server -> client: MESSAGE(pattern=rep, same message_id, final)
 
 Cancellation:
 
-- requester resets the stream when local deadline/cancel fires;
-- responder maps reset to `error.Canceled` if it is still processing.
+- requester resets its half (RESET_STREAM) and stops the reply half
+  (STOP_SENDING) when local deadline/cancel fires;
+- responder maps reset to `error.Canceled` if it is still processing, and
+  drops a reply it can no longer send.
+
+A message with the `no_reply` flag also opens one bidirectional stream. The
+receiver ends the reply half with a FIN that carries no bytes as soon as it
+has read the message.
 
 ### Pair
 
@@ -224,6 +230,27 @@ MVP needs:
 - `SUBSCRIBE`
 - `UNSUBSCRIBE`
 - `CREDIT` if push/pull is in MVP, otherwise later
+
+## Stream Lifetime
+
+QUIC lets each endpoint open a WINDOW of streams at once
+(`initial_max_streams_bidi` / `_uni`). The opener gets an id back only when
+its stream is closed in both directions. So every stream must end on both
+halves, or it keeps its place in the window for the life of the connection:
+
+- request and reply each end with FIN; a canceled request ends with
+  RESET_STREAM and STOP_SENDING (code `0x51_01`);
+- the reply half of a `no_reply` message ends with an empty FIN;
+- an opener uses its stream ids in order and skips none. An id whose message
+  was aborted before its stream opened is still opened, and is ended at once
+  with RESET_STREAM and STOP_SENDING (code `0x51_01`). The receiver sees a
+  canceled request;
+- a refused peer stream ends with STOP_SENDING and, when it is
+  bidirectional, RESET_STREAM;
+- an open above the peer's window waits until the peer gives an id back.
+  Later opens wait behind it, so ids stay in order.
+
+A window of W carries about W / (2 x RTT) request streams per second.
 
 ## Close Semantics
 

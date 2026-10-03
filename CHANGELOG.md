@@ -7,6 +7,46 @@ changes.
 
 ## [Unreleased]
 
+- **quic-zig v0.24.0 and the tagged Zig 0.17.0** (they move together:
+  v0.24.0 refuses every 0.17.0-dev build). v0.24.0 has no lifetime stream
+  cap: `initial_max_streams_bidi` / `_uni` is a WINDOW of streams open at
+  once, and the peer gives an id back only when its stream is closed in both
+  directions. A stream that never closes, or a skipped id, keeps its place
+  for the life of the connection. qmsg leaked places in several ways, and
+  a session could stall or close on them. Fixed:
+  - `queueReliable` checks every limit before it reserves a stream id, so a
+    `QueueFull` refusal uses up no id.
+  - Local bidi streams open in id order, just before their first write. An
+    open above the peer's window (`StreamLimitExceeded`) waits for the next
+    pump instead of failing it, and later ids wait behind it. Hash-map order
+    used to skip ids, and quic-zig refuses more than 64 separate skipped
+    runs (`TooManySkippedStreamIds`).
+  - A request aborted before its stream opened keeps its id: the id opens in
+    its turn and is ended at once with RESET_STREAM + STOP_SENDING
+    (`0x51_01`). Dropped ids made the responder arm a receiver that never
+    ended; 16 of them (the default receiver budget) stopped the session.
+  - The receiver of a `no_reply` message ends the reply half with an empty
+    FIN, so the stream closes on both sides (it also left both stream
+    tables).
+  - A reply to a request the requester already canceled is dropped instead
+    of closing the connection (`StreamClosed` / `StreamNotFound` from a
+    sender). This happened before v0.24.0 too.
+  - PING and control-flush uni ids are reserved last, so a refusal leaks
+    none. The dial-side Driver table is sized for the peer's streams AND our
+    own reply streams, like the listener's.
+- `zig build -Doptimize=Release*` now builds quic-zig and BoringSSL in
+  ReleaseSafe (was Debug): the quic option map is
+  `{ target, release = optimize != .debug, sanitize-c = "trap" }`, the same
+  map nest and qmesh-zig pass.
+- New: `QuicSessionRuntime.pendingOpens()`. `QuicConnectionAdapter` and
+  `EmbeddedDispatch.Adapter` gain `streamReset` and `streamStopSending`, and
+  a transport handed to `QuicSessionRuntime.pump` must provide both.
+  `ControlStreamSender.pump` returns `.pending` on a stream-limit refusal.
+- Tests: `src/stream_window_test.zig` (in `node-pair-test`) pushes more
+  streams through one session than the window holds, one test per leak,
+  and one session that carries 6000 streams with aborts and `no_reply`
+  messages mixed in.
+
 - `transport.quic.localCertSpkiDigest(allocator, cert_pem)` computes the
   certificate-bound identity from a local `tls_cert_pem` without a handshake:
   SHA-256 over the leaf's DER SubjectPublicKeyInfo, byte-for-byte the
