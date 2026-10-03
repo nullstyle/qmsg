@@ -29,7 +29,11 @@ pub fn ClientDispatch(comptime Owner: type) type {
                 .allocator = allocator,
                 .app = &self.app,
                 .conn = conn,
-                .max_tracked_streams = embedded.driverSizing(options).max_tracked_streams,
+                // One table holds the peer's streams (up to the windows we
+                // advertise) AND our own request streams, whose replies it
+                // also reads. Sized like ServerDispatch, so a conforming
+                // peer can never overflow it.
+                .max_tracked_streams = try std.math.add(usize, embedded.driverSizing(options).max_tracked_streams, options.max_queued_messages),
                 .datagram_buf_bytes = embedded.driverSizing(options).datagram_buf_bytes,
                 .outbox_limits = .{ .max_streams = options.max_queued_messages, .max_bytes = options.max_queued_bytes },
                 .hooks = .{

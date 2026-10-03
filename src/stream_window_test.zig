@@ -466,3 +466,69 @@ test "a reply to a request the requester canceled does not close the connection"
     try p.roundTrip(&outcomes, 2, 5_000);
     try std.testing.expectEqual(@as(usize, 1), outcomes.replies);
 }
+
+// The dial side reads its peer's streams AND the replies to its own
+// requests through one Driver table. 32 requests wait for their replies
+// while the server sends 256 no_reply messages back: 288 streams, more
+// than the peer's windows (256 + 16) the table was sized for.
+test "the dial side tracks the peer's streams and its own reply streams together" {
+    const a = std.testing.allocator;
+    var p: Pair = undefined;
+    // 64 KiB messages: the byte budget allows 256 receivers, not 16.
+    p.setUp(a, .{}, .{ .max_message_size = 64 * 1024 }) catch |err| return skipIfNoUdp(err);
+    defer p.tearDown();
+    errdefer p.report("peer streams and reply streams in one table");
+    try p.driveUntilReady();
+
+    // 32 requests the server holds.
+    const held_count: usize = 32;
+    var held: std.ArrayList(node_mod.Event) = .empty;
+    defer {
+        for (held.items) |*event| event.deinit();
+        held.deinit(a);
+    }
+    for (0..held_count) |i| _ = try p.request(i + 1, 60_000);
+    for (0..5_000) |_| {
+        try p.step();
+        var events: [64]node_mod.Event = undefined;
+        const count = try p.server.poll(&events);
+        for (events[0..count]) |*event| {
+            if (event.* == .request) try held.append(a, event.*) else event.deinit();
+        }
+        if (held.items.len == held_count) break;
+    }
+    try std.testing.expectEqual(held_count, held.items.len);
+
+    // 256 no_reply messages from the server, queued before one pump.
+    const server = p.serverRuntime() orelse return error.ServerSessionGone;
+    for (0..256) |i| _ = try server.queueReliable(.{
+        .subject = "note",
+        .id = 1_000 + i,
+        .flags = .{ .no_reply = true },
+        .body = "x",
+    });
+    var delivered: usize = 0;
+    for (0..10_000) |_| {
+        try p.step();
+        var events: [64]node_mod.Event = undefined;
+        const count = try p.client.poll(&events);
+        defer for (events[0..count]) |*event| event.deinit();
+        for (events[0..count]) |event| switch (event) {
+            .request => |inbound| {
+                if (inbound.msg.flags.no_reply) delivered += 1;
+            },
+            else => {},
+        };
+        if (delivered == 256) break;
+    }
+    try std.testing.expectEqual(@as(usize, 256), delivered);
+
+    // Then the 32 replies.
+    for (held.items) |event| {
+        try p.server.reply(event.request.msg.reply_handle orelse return error.ReplyHandleMissing, .{ .subject = "", .body = "ok" });
+    }
+    var outcomes: Outcomes = .{};
+    try p.roundTrip(&outcomes, held_count, 5_000);
+    try std.testing.expectEqual(held_count, outcomes.replies);
+    try p.expectSessionsReady();
+}

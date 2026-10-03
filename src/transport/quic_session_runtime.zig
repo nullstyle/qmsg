@@ -216,21 +216,29 @@ pub const QuicSessionRuntime = struct {
         }
 
         if (now_us -| self.last_activity_us >= interval_us) {
-            const stream_id = try self.stream_ids.nextUni();
+            // Replace-only: a previous sender must have completed (pumped
+            // to null above) or something is wrong with the sweep cadence.
+            // Checked before the uni id is reserved, and the id is reserved
+            // last: a reserved id that never opens is a stream the peer
+            // counts as open for the life of the connection.
+            if (self.ping_sender != null) return error.InvalidState;
             const frames = [_]control.Frame{.{ .ping = .{ .token = now_us } }};
             var sender = try quic_streams.ControlStreamSender.init(
                 self.allocator,
-                stream_id,
+                self.stream_ids.next_uni,
                 &frames,
                 self.session.options.control_codec,
                 .{},
             );
-            errdefer sender.deinit();
-            // Replace-only: a previous sender must have completed (pumped
-            // to null above) or something is wrong with the sweep cadence.
-            if (self.ping_sender != null) return error.InvalidState;
+            const stream_id = self.stream_ids.nextUni() catch |err| {
+                sender.deinit();
+                return err;
+            };
+            std.debug.assert(stream_id == sender.stream_id);
+            // The runtime owns the sender from here; a failed pump below
+            // leaves it for the next sweep.
             self.ping_sender = sender;
-            // Flush immediately so  means bytes on the wire.
+            // Flush immediately so `.ping_sent` means bytes on the wire.
             if (try self.ping_sender.?.pump(transport) == .complete) {
                 self.ping_sender.?.deinit();
                 self.ping_sender = null;
@@ -512,13 +520,16 @@ pub const QuicSessionRuntime = struct {
         if (control_state.queuedFrameCount() == 0) return null;
         if (self.control_flush_sender != null) return error.InvalidState;
 
-        const stream_id = try self.stream_ids.nextUni();
+        // Reserve the uni id last, once nothing can fail: a reserved id
+        // that never opens is a stream the peer counts as open for good.
         var sender = try control_state.initFlushSender(
-            stream_id,
+            self.stream_ids.next_uni,
             self.session.options.control_codec,
             .{},
         );
         errdefer sender.deinit();
+        const stream_id = try self.stream_ids.nextUni();
+        std.debug.assert(stream_id == sender.sender.stream_id);
 
         self.control_flush_sender = sender;
         return stream_id;
@@ -1960,6 +1971,8 @@ const HeartbeatFakeTransport = struct {
     wrote_stream: ?u64 = null,
 
     opened_uni: ?u64 = null,
+    /// The peer's uni window is full: every open is refused.
+    refuse_uni: bool = false,
 
     pub fn streamWrite(self: *HeartbeatFakeTransport, stream_id: u64, data: []const u8) !usize {
         if (self.wrote_stream == null) self.wrote_stream = stream_id;
@@ -1968,6 +1981,7 @@ const HeartbeatFakeTransport = struct {
     }
     pub fn streamFinish(_: *HeartbeatFakeTransport, _: u64) !void {}
     pub fn openUni(self: *HeartbeatFakeTransport, stream_id: u64) !void {
+        if (self.refuse_uni) return error.StreamLimitExceeded;
         self.opened_uni = stream_id;
     }
 };
@@ -2039,4 +2053,63 @@ test "inbound activity resets the probe and defers the next ping" {
     try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.none, try rt.tickHeartbeat(4_400_000, &transport));
     // One microsecond past the refreshed interval: ping again.
     try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.ping_sent, try rt.tickHeartbeat(4_500_001, &transport));
+}
+
+test "a ping that cannot start reserves no uni stream id" {
+    const allocator = testing.allocator;
+    var rt = try heartbeatTestRuntime(allocator);
+    defer rt.deinit();
+    var transport = HeartbeatFakeTransport{ .refuse_uni = true };
+    defer transport.written.deinit(testing.allocator);
+
+    // The first ping waits at the peer's uni limit.
+    _ = try rt.tickHeartbeat(1_000_000, &transport);
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.ping_sent, try rt.tickHeartbeat(3_000_000, &transport));
+    try testing.expect(rt.ping_sender != null);
+    const next_uni = rt.stream_ids.next_uni;
+
+    // The peer is alive, the interval passes again, and the old ping
+    // still waits: no second ping, and no uni id used up for it.
+    rt.noteInboundActivity(3_500_000);
+    try testing.expectError(error.InvalidState, rt.tickHeartbeat(4_600_000, &transport));
+    try testing.expectEqual(next_uni, rt.stream_ids.next_uni);
+
+    // The window opens: the waiting ping completes first, then the next
+    // ping takes the next id. No id was skipped.
+    transport.refuse_uni = false;
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.ping_sent, try rt.tickHeartbeat(4_700_000, &transport));
+    try testing.expect(rt.ping_sender == null);
+    try testing.expectEqual(@as(?u64, next_uni), transport.opened_uni);
+    try testing.expectEqual(next_uni + 4, rt.stream_ids.next_uni);
+}
+
+test "a control flush that fails reserves no uni stream id" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .client, .{ .peer_id = "client-a" });
+    defer runtime.deinit();
+    var peer = try QuicSessionRuntime.init(allocator, 2, .server, .{ .peer_id = "server-a" });
+    defer peer.deinit();
+    var io = FakeTransport.init(allocator);
+    defer io.deinit();
+    var peer_io = FakeTransport.init(allocator);
+    defer peer_io.deinit();
+    try readyRuntimePair(&runtime, &io, &peer, &peer_io);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var registry = protocol.pubsub.Registry.init(allocator);
+    defer registry.deinit();
+    var ledger = pushpull.CreditLedger.init(allocator);
+    defer ledger.deinit();
+    var control_state = quic_control.State.init(failing.allocator(), &registry, &ledger, .{});
+    defer control_state.deinit();
+    try runtime.queueSubscribe(&control_state, "jobs.*", .{});
+
+    const next_uni = runtime.stream_ids.next_uni;
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, runtime.flushQueuedControl(&control_state));
+    try std.testing.expectEqual(next_uni, runtime.stream_ids.next_uni);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(?u64, next_uni), try runtime.flushQueuedControl(&control_state));
 }
