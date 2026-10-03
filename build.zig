@@ -16,14 +16,22 @@ pub fn build(b: *std.Build) !void {
     // "optimize"` on a COLD cache — a fresh clone's first
     // `zig build` — and only appeared to work on the second run,
     // after the lazy fetch had already completed. Do not add it back.
+    // Forward the mode through `release` instead (Debug or ReleaseSafe):
+    // with no `release`, a `-Doptimize=Release*` build compiles quic and
+    // BoringSSL in Debug.
     //
-    // The remaining map ({target, sanitize-c}) is also exactly
-    // qmesh-zig's, and Zig keys the dependency cache on
+    // The map ({target, release, sanitize-c}) is also exactly
+    // qmesh-zig's and nest's, and Zig keys the dependency cache on
     // {pkg_hash, option-set}: one binary linking both qmsg and qmesh
     // shares a single quic module instead of compiling BoringSSL twice
-    // and minting two incompatible `quic.Connection` types.
+    // and minting two incompatible `quic.Connection` types. Zig 0.17.0
+    // makes a mismatch a compile error ("file exists in modules 'quic'
+    // and 'quic0'"); an absent `release` and `.release = false` are
+    // different maps. A parent must forward its `optimize` to qmsg, so
+    // that both compute the same `release`.
     const quic_dep = try b.dependencyLazy("quic", .{
         .target = target,
+        .release = optimize != .debug,
         .@"sanitize-c" = @as([]const u8, "trap"),
     });
     const quic_mod = quic_dep.module("quic");
