@@ -1,9 +1,7 @@
 [tools]
-# Zig master pin verified for this release. quic-zig is now a
-# tarball pin (v0.21.1), whose floor is dev.1683; qmsg is verified
-# on the consumer's toolchain (mruby-quic's pin) so the published
-# package compiles where it is consumed.
-zig = "0.17.0-dev.1978+c961124d9"
+# The tagged Zig 0.17.0 release: the floor of the quic-zig tarball
+# pin (v0.24.0), whose build.zig refuses every 0.17.0-dev build.
+zig = "0.17.0"
 
 [env]
 ZIG_GLOBAL_CACHE_DIR = "{{config_root}}/.zig-global-cache"

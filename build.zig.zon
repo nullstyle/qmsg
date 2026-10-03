@@ -2,7 +2,7 @@
     .name = .qmsg,
     .version = "0.7.0",
     .fingerprint = 0x650c9e5831497a83,
-    .minimum_zig_version = "0.17.0-dev.1786+75044cb04",
+    .minimum_zig_version = "0.17.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",
@@ -21,16 +21,16 @@
             .url = "https://github.com/nullstyle/paseto-zig/archive/refs/tags/0.4.0.tar.gz",
             .hash = "paseto-0.4.0-EBI95RcXCADs0jz3tebS1xMaAiT2r3Tpx8HsF5LfpqOS",
         },
-        // v0.21.1: caches Handshake/0-RTT packet keys per secret and frees
-        // Initial keys at every drop site, fixing the AEAD-context leak —
-        // a long-lived qmsg session leaked one 640-byte BoringSSL context
-        // per sealed or opened packet at those levels. The hash is the
-        // package id this repository's dev.1786 resolver verifies (the
-        // same name-version-digest form as the other pins), not the raw
-        // tarball digest a newer Zig's `zig fetch` would print.
+        // v0.24.0 (tag at 1d34b32): no lifetime stream cap. The stream
+        // limit is a window of streams open at once, and an id comes back
+        // only when its stream is closed in both directions, so qmsg opens
+        // local streams in id order, waits on StreamLimitExceeded, and
+        // closes every stream it opens or accepts. Its floor is the tagged
+        // Zig 0.17.0. Same pin (and option map, see build.zig) as nest and
+        // qmesh-zig, so a binary that links all three has one quic module.
         .quic = .{
-            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.21.2.tar.gz",
-            .hash = "quic-0.21.2-DnSYvQaTMQAfMzLBGZyb9_O4d82qZH6tdMpYYvEKvTwa",
+            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.24.0.tar.gz",
+            .hash = "quic-0.24.0-DnSYvUNHNABoGpnSvxo5VEF7RVsZTxddSW3UGp1vCrPw",
         },
         // Optional Cap'n Proto body codec dependency (`-Dcapnp=true`).
         // LAZY: default builds and non-opting consumers never fetch or
