@@ -130,7 +130,7 @@ pub fn deadlinePlan(
 pub fn applyCancelPlan(conn: anytype, plan: CancelPlan, options: ApplyOptions) !ApplyResult {
     var result: ApplyResult = .{};
     if (plan.actions.reset_stream) {
-        conn.streamReset(plan.stream_id, plan.app_error_code) catch |err| switch (err) {
+        conn.streamReset(plan.stream_id, plan.app_error_code) catch |err| switch (@as(anyerror, err)) {
             error.StreamNotFound => if (!options.ignore_stream_not_found) return err,
             else => return err,
         };
@@ -138,7 +138,7 @@ pub fn applyCancelPlan(conn: anytype, plan: CancelPlan, options: ApplyOptions) !
     }
 
     if (plan.actions.stop_sending) {
-        conn.streamStopSending(plan.stream_id, plan.app_error_code) catch |err| switch (err) {
+        conn.streamStopSending(plan.stream_id, plan.app_error_code) catch |err| switch (@as(anyerror, err)) {
             error.StreamNotFound => if (!options.ignore_stream_not_found) return err,
             else => return err,
         };

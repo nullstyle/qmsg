@@ -300,6 +300,34 @@ test "QueueFull refusals do not use up stream ids" {
     try p.expectSessionsReady();
 }
 
+// A request canceled before its stream opened still owns its id. The
+// responder sees the id as open (a higher id was used), arms a receiver
+// for it, and keeps that receiver until the stream ends. With the
+// default byte budget a session has 16 receivers.
+test "requests canceled before their stream opens do not pin the responder's receivers" {
+    const a = std.testing.allocator;
+    var p: Pair = undefined;
+    p.setUp(a, .{}, .{}) catch |err| return skipIfNoUdp(err);
+    defer p.tearDown();
+    errdefer p.report("cancel before open");
+    try p.driveUntilReady();
+
+    for (0..16) |i| {
+        const id = try p.request(i + 1, 60_000);
+        try std.testing.expect(try p.client.cancelRequest(id));
+    }
+    var outcomes: Outcomes = .{};
+    try p.collect(&outcomes);
+    try std.testing.expectEqual(@as(usize, 16), outcomes.canceled);
+
+    for (0..4) |round| {
+        _ = try p.request(100 + round, 2_000);
+        try p.roundTrip(&outcomes, 16 + round + 1, 5_000);
+        try std.testing.expectEqual(round + 1, outcomes.replies);
+    }
+    try p.expectSessionsReady();
+}
+
 // More requests than the window at once: the opens past the window
 // wait for the peer to give ids back (StreamLimitExceeded is
 // temporary), in id order.

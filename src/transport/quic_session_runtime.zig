@@ -84,19 +84,27 @@ pub const QuicSessionRuntime = struct {
     reliable_receivers: std.AutoHashMap(u64, quic_streams.ReliableMessageReceiver),
     inbox: std.ArrayList(ReceivedReliable) = .empty,
     envelope_codec: envelope.CodecOptions = .{},
-    /// Local bidi ids that have a queued message and are not open on the
-    /// wire yet, in id order. quic-zig v0.24.0 counts a skipped local id
-    /// as a stream that is open at the peer until it is used and closed,
-    /// refuses more than 64 separate runs of skipped ids
-    /// (`TooManySkippedStreamIds`), and refuses an open above the peer's
-    /// window (`StreamLimitExceeded`, always temporary). So
-    /// `openReservedStreams` opens these ids strictly in order, just
-    /// before the first write, and stops at the first refusal; the next
-    /// pump tries again, and later ids keep their place behind the head.
+    /// Reserved local bidi ids that are not open on the wire yet, in id
+    /// order. quic-zig v0.24.0 counts a skipped local id as a stream that
+    /// is open at the peer until it is used and closed, refuses more than
+    /// 64 separate runs of skipped ids (`TooManySkippedStreamIds`), and
+    /// refuses an open above the peer's window (`StreamLimitExceeded`,
+    /// always temporary). So `openReservedStreams` opens these ids
+    /// strictly in order, just before the first write, and stops at the
+    /// first refusal; the next pump tries again, and later ids keep their
+    /// place behind the head. An id whose message was aborted before it
+    /// opened keeps its place too: it opens and is reset on both halves
+    /// at once ("burned"), so the peer closes it like any canceled
+    /// request and gives the id back.
     unopened_bidi: std.ArrayList(PendingOpen) = .empty,
 
     pub const PendingOpen = struct {
         stream_id: u64,
+        /// The message was aborted: open the id, then reset both halves.
+        burn: bool = false,
+        /// Open on the wire; the burn is still to finish (it failed with
+        /// OOM and the next pump retries it).
+        opened: bool = false,
     };
 
     pub fn init(
@@ -304,7 +312,10 @@ pub const QuicSessionRuntime = struct {
         const expects_reply = !outgoing.flags.no_reply;
         const limits = self.session.options;
 
-        if (self.reliable_senders.count() >= limits.max_queued_messages) return error.QueueFull;
+        // Burned ids wait in the open queue too: bound it, so a peer that
+        // gives no ids back pushes back on the caller.
+        if (self.reliable_senders.count() >= limits.max_queued_messages or
+            self.unopened_bidi.items.len >= limits.max_queued_messages) return error.QueueFull;
         const stream_id = self.stream_ids.next_bidi;
         if (self.reliable_senders.contains(stream_id) or self.reliable_receivers.contains(stream_id)) return error.StreamAlreadyOpen;
         var sender = try quic_streams.ReliableMessageSender.init(self.allocator, stream_id, outgoing, self.envelope_codec, .{});
@@ -354,6 +365,7 @@ pub const QuicSessionRuntime = struct {
         try self.checkQueuedSendBytes(sender.bytes.len);
         if (options.open_bidi) {
             // An explicit local id joins the in-order open queue.
+            if (self.unopened_bidi.items.len >= limits.max_queued_messages) return error.QueueFull;
             for (self.unopened_bidi.items) |pending| {
                 if (pending.stream_id == stream_id) return error.StreamAlreadyOpen;
             }
@@ -371,8 +383,8 @@ pub const QuicSessionRuntime = struct {
         self.unopened_bidi.insertAssumeCapacity(at, .{ .stream_id = stream_id });
     }
 
-    /// Local bidi streams that have a queued message and wait for the
-    /// peer's stream credit (see `unopened_bidi`).
+    /// Reserved local bidi streams that wait for the peer's stream
+    /// credit, burned ids included (see `unopened_bidi`).
     pub fn pendingOpens(self: QuicSessionRuntime) usize {
         return self.unopened_bidi.items.len;
     }
@@ -404,9 +416,11 @@ pub const QuicSessionRuntime = struct {
             var owned = entry.value;
             owned.deinit();
         }
-        for (self.unopened_bidi.items, 0..) |pending, index| {
+        // Not open yet: the id keeps its place in the open order and is
+        // burned when its turn comes (see `unopened_bidi`).
+        for (self.unopened_bidi.items) |*pending| {
             if (pending.stream_id != stream_id) continue;
-            _ = self.unopened_bidi.orderedRemove(index);
+            pending.burn = true;
             break;
         }
         if (self.reliable_receivers.fetchRemove(stream_id)) |entry| {
@@ -795,15 +809,26 @@ pub const QuicSessionRuntime = struct {
     /// Opens the streams of `unopened_bidi` in id order. The first
     /// `StreamLimitExceeded` ends the pass: the peer gives an id back
     /// when one of our streams closes, and the next pump tries again.
+    /// A burned id is reset on both halves right after its open
+    /// (RESET_STREAM + STOP_SENDING, code `canceled`).
     fn openReservedStreams(self: *QuicSessionRuntime, transport: anytype) !void {
         var done: usize = 0;
         defer dropFront(PendingOpen, &self.unopened_bidi, done);
-        for (self.unopened_bidi.items) |pending| {
-            transport.openBidi(pending.stream_id) catch |err| switch (@as(anyerror, err)) {
-                error.StreamLimitExceeded => return,
-                else => return err,
-            };
-            if (self.reliable_senders.getPtr(pending.stream_id)) |sender| sender.opened = true;
+        for (self.unopened_bidi.items) |*pending| {
+            if (!pending.opened) {
+                transport.openBidi(pending.stream_id) catch |err| switch (@as(anyerror, err)) {
+                    error.StreamLimitExceeded => return,
+                    else => return err,
+                };
+                pending.opened = true;
+            }
+            const sender = if (pending.burn) null else self.reliable_senders.getPtr(pending.stream_id);
+            if (sender) |live| {
+                live.opened = true;
+            } else {
+                const plan = quic_cancel.cancelPlan(pending.stream_id, .explicit, .bidirectional);
+                _ = try quic_cancel.applyCancelPlan(transport, plan, .{});
+            }
             done += 1;
         }
     }
@@ -946,6 +971,9 @@ const FakeStream = struct {
     opened_bidi: bool = false,
     opened_uni: bool = false,
     finished: bool = false,
+    /// Codes of our RESET_STREAM and STOP_SENDING, when sent.
+    reset_code: ?u64 = null,
+    stop_code: ?u64 = null,
 
     fn deinit(self: *FakeStream, allocator: std.mem.Allocator) void {
         self.incoming.deinit(allocator);
@@ -1010,6 +1038,16 @@ const FakeTransport = struct {
     pub fn streamFinish(self: *FakeTransport, stream_id: u64) !void {
         const stream = (try self.getOrPutStream(stream_id)).value_ptr;
         stream.finished = true;
+    }
+
+    pub fn streamReset(self: *FakeTransport, stream_id: u64, code: u64) !void {
+        const stream = self.streams.getPtr(stream_id) orelse return error.StreamNotFound;
+        if (stream.reset_code == null) stream.reset_code = code;
+    }
+
+    pub fn streamStopSending(self: *FakeTransport, stream_id: u64, code: u64) !void {
+        const stream = self.streams.getPtr(stream_id) orelse return error.StreamNotFound;
+        if (stream.stop_code == null) stream.stop_code = code;
     }
 
     pub fn streamRead(self: *FakeTransport, stream_id: u64, out: []u8) !usize {
@@ -1397,10 +1435,12 @@ test "a queueReliable refusal reserves no stream id" {
     try std.testing.expectError(error.QueueFull, runtime.queueReliable(.{ .subject = "c", .id = 3, .flags = .{ .no_reply = true } }));
     try std.testing.expectEqual(@as(u64, 8), runtime.stream_ids.next_bidi);
 
-    // Once the two requests are gone, the next message takes the next id:
-    // the refusals left no gap.
+    // Once the two requests are gone (aborted, so their ids are burned
+    // on the next pump), the next message takes the next id: the
+    // refusals left no gap.
     runtime.abortReliable(0);
     runtime.abortReliable(4);
+    _ = try runtime.pump(&io);
     try std.testing.expectEqual(@as(u64, 8), try runtime.queueReliable(.{ .subject = "d", .id = 4 }));
 }
 
@@ -1439,6 +1479,53 @@ test "queued streams open in id order and wait at the peer's stream limit" {
     try std.testing.expectEqual(@as(usize, 0), runtime.pendingOpens());
     try std.testing.expectEqual(@as(usize, 0), runtime.pendingReliableSenders());
     for (ids) |id| try std.testing.expect(io.streams.get(id).?.finished);
+}
+
+test "a request aborted before its stream opens is burned in its turn" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .client, .{ .peer_id = "client-a" });
+    defer runtime.deinit();
+    var peer = try QuicSessionRuntime.init(allocator, 2, .server, .{ .peer_id = "server-a" });
+    defer peer.deinit();
+    var io = FakeTransport.init(allocator);
+    defer io.deinit();
+    var peer_io = FakeTransport.init(allocator);
+    defer peer_io.deinit();
+    try readyRuntimePair(&runtime, &io, &peer, &peer_io);
+    const opens_before = io.opens.items.len;
+
+    // 0 and 4 abort before the first pump; 12 aborts while it waits at
+    // the peer's limit.
+    io.bidi_open_limit = 3;
+    var ids: [5]u64 = undefined;
+    for (&ids, 0..) |*id, i| id.* = try runtime.queueReliable(.{ .subject = "work", .id = i + 1, .body = "x" });
+    runtime.abortReliable(ids[0]);
+    runtime.abortReliable(ids[1]);
+    _ = try runtime.pump(&io);
+    try std.testing.expectEqualSlices(u64, ids[0..3], io.opens.items[opens_before..]);
+    runtime.abortReliable(ids[3]);
+    io.bidi_open_limit = null;
+    _ = try runtime.pump(&io);
+
+    // Every reserved id reached the wire, in order. An aborted one
+    // carries no bytes and ends both halves with `canceled`; the others
+    // carry their message.
+    try std.testing.expectEqualSlices(u64, &ids, io.opens.items[opens_before..]);
+    try std.testing.expectEqual(@as(usize, 0), runtime.pendingOpens());
+    for (ids, 0..) |id, i| {
+        const stream = io.streams.get(id).?;
+        const aborted = i == 0 or i == 1 or i == 3;
+        if (aborted) {
+            try std.testing.expectEqual(@as(usize, 0), stream.writes.items.len);
+            try std.testing.expect(!stream.finished);
+            try std.testing.expectEqual(@as(?u64, quic_cancel.AppErrorCode.canceled), stream.reset_code);
+            try std.testing.expectEqual(@as(?u64, quic_cancel.AppErrorCode.canceled), stream.stop_code);
+        } else {
+            try std.testing.expect(stream.finished);
+            try std.testing.expect(stream.reset_code == null and stream.stop_code == null);
+        }
+    }
 }
 
 test "a control stream waits at the peer's uni stream limit" {

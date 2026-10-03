@@ -91,6 +91,14 @@ pub const QuicConnectionAdapter = struct {
         try self.conn.streamFinish(stream_id);
     }
 
+    pub fn streamReset(self: *QuicConnectionAdapter, stream_id: u64, code: u64) !void {
+        try self.conn.streamReset(stream_id, code);
+    }
+
+    pub fn streamStopSending(self: *QuicConnectionAdapter, stream_id: u64, code: u64) !void {
+        try self.conn.streamStopSending(stream_id, code);
+    }
+
     pub fn streamReceiveStatus(self: *QuicConnectionAdapter, stream_id: u64) ?ReceiveStatus {
         const state = self.conn.streamRecvState(stream_id) orelse return null;
         return .{

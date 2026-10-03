@@ -174,6 +174,14 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
                 try self.conn.streamFinish(stream_id);
             }
 
+            pub fn streamReset(self: *Adapter, stream_id: u64, code: u64) !void {
+                try self.conn.streamReset(stream_id, code);
+            }
+
+            pub fn streamStopSending(self: *Adapter, stream_id: u64, code: u64) !void {
+                try self.conn.streamStopSending(stream_id, code);
+            }
+
             pub fn streamRead(self: *Adapter, stream_id: u64, out: []u8) !usize {
                 const state = self.seat.streams.getPtr(stream_id) orelse return 0;
                 const available = state.buf.items.len - state.start;
