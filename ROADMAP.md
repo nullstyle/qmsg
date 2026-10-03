@@ -307,11 +307,12 @@ Exit criteria:
 
 CI (`.github/workflows/ci.yml`) runs the unit+QUIC lane on Linux and macOS,
 the examples lane, and the optional capnp-codec lane on every push and PR,
-on the `mise.toml`-pinned toolchain. Known toolchain note: the private
-ziglang fork's in-flight builds (dev.2001+ as of 2026-09-03) regressed
-`@hasDecl` on struct decls, which `Node.runOnce`'s dispatcher probes use —
-four tests fail there deterministically and pass on the pinned dev.1786;
-that is a compiler regression to report to the fork, not a qmsg bug.
+on the `mise.toml`-pinned toolchain (the tagged Zig 0.17.0). Toolchain
+note from 2026-09-03: the private ziglang fork's in-flight builds
+(dev.2001+ at that time) regressed `@hasDecl` on struct decls, which
+`Node.runOnce`'s dispatcher probes use — four tests failed there
+deterministically and passed on dev.1786, the pin at that time; that was
+a compiler regression to report to the fork, not a qmsg bug.
 
 Unit tests:
 

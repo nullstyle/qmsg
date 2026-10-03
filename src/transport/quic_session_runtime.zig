@@ -190,9 +190,15 @@ pub const QuicSessionRuntime = struct {
 
     /// One heartbeat sweep. `.none` when no interval is negotiated or the
     /// session is not ready; `.ping_sent` when idle past the interval
-    /// emits a PING on a one-shot uni control stream; `.timed_out` when an
-    /// outstanding probe is past its deadline (2x interval, 1s floor),
+    /// queues a PING on a one-shot uni control stream; `.timed_out` when
+    /// an outstanding probe is past its deadline (2x interval, 1s floor),
     /// which begins closing the session.
+    ///
+    /// `.ping_sent` does not always put bytes on the wire: when the
+    /// peer's uni window is full, the PING waits for an id like any other
+    /// uni stream. The probe deadline runs from this sweep in both cases,
+    /// so a peer that sends nothing and gives no uni id back in time
+    /// times out.
     pub fn tickHeartbeat(self: *QuicSessionRuntime, now_us: u64, transport: anytype) !HeartbeatOutcome {
         self.heartbeat_now_us = now_us;
         if (self.ping_sender) |*sender| {
@@ -238,7 +244,9 @@ pub const QuicSessionRuntime = struct {
             // The runtime owns the sender from here; a failed pump below
             // leaves it for the next sweep.
             self.ping_sender = sender;
-            // Flush immediately so `.ping_sent` means bytes on the wire.
+            // Flush now. The PING is on the wire, or it waits for the
+            // peer's uni window (the pump returns `.pending`); the probe
+            // deadline runs in both cases.
             if (try self.ping_sender.?.pump(transport) == .complete) {
                 self.ping_sender.?.deinit();
                 self.ping_sender = null;
@@ -2148,10 +2156,13 @@ test "a ping that cannot start reserves no uni stream id" {
     var transport = HeartbeatFakeTransport{ .refuse_uni = true };
     defer transport.written.deinit(testing.allocator);
 
-    // The first ping waits at the peer's uni limit.
+    // The first ping waits at the peer's uni limit. Its probe deadline
+    // runs all the same.
     _ = try rt.tickHeartbeat(1_000_000, &transport);
     try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.ping_sent, try rt.tickHeartbeat(3_000_000, &transport));
     try testing.expect(rt.ping_sender != null);
+    try testing.expect(transport.opened_uni == null);
+    try testing.expect(rt.outstanding_ping != null);
     const next_uni = rt.stream_ids.next_uni;
 
     // The peer is alive, the interval passes again, and the old ping
