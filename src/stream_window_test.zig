@@ -11,7 +11,8 @@
 //! Every test here pushes more streams through ONE session than the
 //! window holds, and asserts the healthy result. Each one failed on
 //! qmsg before the fix it names. Two `Node`s, events delivery, real
-//! sockets on 127.0.0.1, and a virtual clock (one step is 1 ms).
+//! sockets on 127.0.0.1, and a virtual clock (one step is 1 ms) that
+//! may run at most `max_speedup` times faster than real time.
 //! Diagnostics print only when a test fails.
 
 const std = @import("std");
@@ -26,6 +27,16 @@ const Node = node_mod.Node;
 const cert_pem = @embedFile("testdata/test_cert.pem");
 const key_pem = @embedFile("testdata/test_key.pem");
 const step_us: u64 = 1_000;
+const start_us: u64 = 1_000;
+
+/// An idle step takes far less than 1 ms of real time. Unpaced, the
+/// virtual clock runs past deadlines and the idle timeout while a
+/// datagram is late in real time, which happens under heavy machine
+/// load. Paced, a lag must last 1/10 of a virtual timeout to do that.
+const max_speedup: i64 = 10;
+
+/// A deadline for requests that must succeed: far past any wait here.
+const long_deadline_ms: u64 = 60_000;
 
 const Pair = struct {
     allocator: std.mem.Allocator,
@@ -33,7 +44,8 @@ const Pair = struct {
     client: Node,
     target: []u8 = &.{},
     session: node_mod.QuicSessionId = 0,
-    now_us: u64 = 1_000,
+    now_us: u64 = start_us,
+    started: std.Io.Timestamp,
 
     /// Constructed in place: a `Node` holds interior pointers.
     fn setUp(self: *Pair, allocator: std.mem.Allocator, server_transport: quic.QuicOptions, client_transport: quic.QuicOptions) !void {
@@ -41,6 +53,7 @@ const Pair = struct {
             .allocator = allocator,
             .server = try Node.init(allocator, .{ .delivery = .events }),
             .client = undefined,
+            .started = std.Io.Timestamp.now(io(), .awake),
         };
         errdefer self.server.deinit();
         var server_options = server_transport;
@@ -77,8 +90,18 @@ const Pair = struct {
 
     fn step(self: *Pair) !void {
         self.now_us += step_us;
+        try self.pace();
         try self.server.tick(self.now_us);
         try self.client.tick(self.now_us);
+    }
+
+    /// Sleeps while the virtual clock is more than `max_speedup` times
+    /// ahead of real time.
+    fn pace(self: *Pair) !void {
+        const real_us = self.started.untilNow(io(), .awake).toMicroseconds();
+        const virtual_us: i64 = @intCast(self.now_us - start_us);
+        const ahead_us = @divTrunc(virtual_us, max_speedup) - real_us;
+        if (ahead_us >= 1_000) try std.Io.sleep(io(), .fromMicroseconds(ahead_us), .awake);
     }
 
     fn steps(self: *Pair, count: usize) !void {
@@ -222,6 +245,10 @@ fn pendingOpens(runtime: anytype) usize {
     return 0;
 }
 
+fn io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 fn reportConn(label: []const u8, c: *quic_zig.Connection) void {
     std.debug.print("  {s}: closed={} local_bidi limit={d} opened={d} holes={d} | peer_bidi limit={d} opened={d} closed={d} holes={d} | live streams={d}\n", .{
         label,                        c.isClosed(),
@@ -296,7 +323,7 @@ test "QueueFull refusals do not use up stream ids" {
 
     // Four requests the server holds without an answer.
     var held: [4]node_mod.RequestId = undefined;
-    for (&held, 0..) |*id, i| id.* = try p.request(i + 1, 60_000);
+    for (&held, 0..) |*id, i| id.* = try p.request(i + 1, long_deadline_ms);
     var seen: usize = 0;
     for (0..2_000) |_| {
         try p.step();
@@ -307,7 +334,7 @@ test "QueueFull refusals do not use up stream ids" {
 
     // Eight refusals: the client queue is full.
     for (0..8) |i| {
-        try std.testing.expectError(error.QueueFull, p.request(100 + i, 60_000));
+        try std.testing.expectError(error.QueueFull, p.request(100 + i, long_deadline_ms));
     }
 
     // Cancel the held four (RESET_STREAM + STOP_SENDING closes them),
@@ -318,7 +345,7 @@ test "QueueFull refusals do not use up stream ids" {
     try std.testing.expectEqual(held.len, outcomes.canceled);
     try p.steps(200);
     for (0..10) |round| {
-        _ = try p.request(1_000 + round, 2_000);
+        _ = try p.request(1_000 + round, long_deadline_ms);
         try p.roundTrip(&outcomes, held.len + round + 1, 5_000);
         try std.testing.expectEqual(round + 1, outcomes.replies);
     }
@@ -338,7 +365,7 @@ test "requests canceled before their stream opens do not pin the responder's rec
     try p.driveUntilReady();
 
     for (0..16) |i| {
-        const id = try p.request(i + 1, 60_000);
+        const id = try p.request(i + 1, long_deadline_ms);
         try std.testing.expect(try p.client.cancelRequest(id));
     }
     var outcomes: Outcomes = .{};
@@ -346,7 +373,7 @@ test "requests canceled before their stream opens do not pin the responder's rec
     try std.testing.expectEqual(@as(usize, 16), outcomes.canceled);
 
     for (0..4) |round| {
-        _ = try p.request(100 + round, 2_000);
+        _ = try p.request(100 + round, long_deadline_ms);
         try p.roundTrip(&outcomes, 16 + round + 1, 5_000);
         try std.testing.expectEqual(round + 1, outcomes.replies);
     }
@@ -375,7 +402,7 @@ test "requests the responder drops unanswered give their window places back" {
         }
         try std.testing.expectEqual(i + 1, outcomes.deadline_exceeded);
     }
-    _ = try p.request(999, 2_000);
+    _ = try p.request(999, long_deadline_ms);
     try p.roundTrip(&outcomes, 13, 5_000);
     try std.testing.expectEqual(@as(usize, 1), outcomes.replies);
     try p.expectSessionsReady();
@@ -393,7 +420,7 @@ test "a burst larger than the peer's window completes" {
     try p.driveUntilReady();
 
     const n: usize = 12; // within the 16 receivers of the default byte budget
-    for (0..n) |i| _ = try p.request(i + 1, 5_000);
+    for (0..n) |i| _ = try p.request(i + 1, long_deadline_ms);
     var outcomes: Outcomes = .{};
     try p.roundTrip(&outcomes, n, 10_000);
     try std.testing.expectEqual(n, outcomes.replies);
@@ -462,7 +489,7 @@ test "a reply to a request the requester canceled does not close the connection"
     try p.expectSessionsReady();
 
     // The session still carries a request.
-    _ = try p.request(8, 2_000);
+    _ = try p.request(8, long_deadline_ms);
     try p.roundTrip(&outcomes, 2, 5_000);
     try std.testing.expectEqual(@as(usize, 1), outcomes.replies);
 }
@@ -487,7 +514,7 @@ test "the dial side tracks the peer's streams and its own reply streams together
         for (held.items) |*event| event.deinit();
         held.deinit(a);
     }
-    for (0..held_count) |i| _ = try p.request(i + 1, 60_000);
+    for (0..held_count) |i| _ = try p.request(i + 1, long_deadline_ms);
     for (0..5_000) |_| {
         try p.step();
         var events: [64]node_mod.Event = undefined;
@@ -531,4 +558,138 @@ test "the dial side tracks the peer's streams and its own reply streams together
     try p.roundTrip(&outcomes, held_count, 5_000);
     try std.testing.expectEqual(held_count, outcomes.replies);
     try p.expectSessionsReady();
+}
+
+// One session for thousands of streams, through a window of 16, with
+// every way a stream ends mixed in: answered requests, no_reply
+// messages, requests canceled before and after their stream opened,
+// and requests whose deadline fires before a late answer. More streams
+// than the old 4096-stream lifetime cap. At the end every stream is
+// closed on both connections, no id is skipped, and both sessions are
+// still up.
+test "one session carries thousands of requests with aborts and no_reply messages mixed in" {
+    const a = std.testing.allocator;
+    var p: Pair = undefined;
+    // 64 KiB messages: the byte budget allows 256 receivers, so a round
+    // of 24 never meets QueueFull.
+    p.setUp(a, .{ .initial_max_streams_bidi = 16 }, .{ .max_message_size = 64 * 1024 }) catch |err| return skipIfNoUdp(err);
+    defer p.tearDown();
+    errdefer p.report("long session");
+    try p.driveUntilReady();
+
+    const Kind = enum { answered, no_reply, cancel_before_open, cancel_after_open, late_answer };
+    const pattern = [_]Kind{ .answered, .no_reply, .answered, .cancel_before_open, .answered, .cancel_after_open, .answered, .late_answer };
+    const rounds: usize = 250;
+    const per_round: usize = 24;
+    const total = rounds * per_round;
+
+    var sent = std.EnumArray(Kind, usize).initFill(0);
+    var outcomes: Outcomes = .{};
+    var requests: usize = 0;
+    var no_reply_seen: usize = 0;
+    var held: std.ArrayList(struct { event: node_mod.Event, at_us: u64 }) = .empty;
+    defer {
+        for (held.items) |*entry| entry.event.deinit();
+        held.deinit(a);
+    }
+    var cancel_later: std.ArrayList(node_mod.RequestId) = .empty;
+    defer cancel_later.deinit(a);
+
+    for (0..rounds) |round| {
+        for (0..per_round) |slot| {
+            const i = round * per_round + slot;
+            const kind = pattern[i % pattern.len];
+            sent.getPtr(kind).* += 1;
+            const id: u64 = i + 1;
+            switch (kind) {
+                .answered => _ = try p.request(id, long_deadline_ms),
+                .no_reply => try p.note(id),
+                .cancel_before_open => try std.testing.expect(try p.client.cancelRequest(try p.request(id, long_deadline_ms))),
+                .cancel_after_open => try cancel_later.append(a, try p.request(id, long_deadline_ms)),
+                .late_answer => _ = try p.request(id, 30),
+            }
+            if (kind != .no_reply) requests += 1;
+        }
+
+        var round_steps: usize = 0;
+        while (outcomes.total() < requests) : (round_steps += 1) {
+            if (round_steps == 5_000) return error.RoundStalled;
+            try p.step();
+            if (round_steps == 3) {
+                for (cancel_later.items) |rid| _ = try p.client.cancelRequest(rid);
+                cancel_later.clearRetainingCapacity();
+            }
+
+            // Server: answer at once, or hold the late ones for 60 ms
+            // (their deadline is 30 ms) and answer them then.
+            var events: [64]node_mod.Event = undefined;
+            const count = try p.server.poll(&events);
+            for (events[0..count]) |*event| {
+                if (event.* != .request) {
+                    event.deinit();
+                    continue;
+                }
+                const msg = event.request.msg;
+                if (msg.flags.no_reply) {
+                    no_reply_seen += 1;
+                    event.deinit();
+                } else if (pattern[(msg.id - 1) % pattern.len] == .late_answer) {
+                    try held.append(a, .{ .event = event.*, .at_us = p.now_us });
+                } else {
+                    defer event.deinit();
+                    try p.server.reply(msg.reply_handle orelse return error.ReplyHandleMissing, .{ .subject = "", .body = "ok" });
+                }
+            }
+            var index: usize = 0;
+            while (index < held.items.len) {
+                if (p.now_us - held.items[index].at_us < 60 * step_us) {
+                    index += 1;
+                    continue;
+                }
+                var entry = held.swapRemove(index);
+                defer entry.event.deinit();
+                try p.server.reply(entry.event.request.msg.reply_handle orelse return error.ReplyHandleMissing, .{ .subject = "", .body = "late" });
+            }
+            try p.collect(&outcomes);
+        }
+    }
+
+    // Drain: the last late answers and no_reply messages, then the
+    // closes and their acknowledgements.
+    for (0..1_000) |_| {
+        try p.step();
+        no_reply_seen += (try p.serve(.answer)).no_reply;
+        while (held.pop()) |entry| {
+            var owned = entry;
+            defer owned.event.deinit();
+            try p.server.reply(owned.event.request.msg.reply_handle orelse return error.ReplyHandleMissing, .{ .subject = "", .body = "late" });
+        }
+        try p.collect(&outcomes);
+    }
+
+    // Exactly one outcome per request, and the right one.
+    try std.testing.expectEqual(requests, outcomes.total());
+    try std.testing.expectEqual(@as(usize, 0), outcomes.other_failures);
+    try std.testing.expectEqual(sent.get(.late_answer), outcomes.deadline_exceeded);
+    try std.testing.expect(outcomes.canceled >= sent.get(.cancel_before_open));
+    try std.testing.expect(outcomes.replies >= sent.get(.answered));
+    try std.testing.expectEqual(sent.get(.no_reply), no_reply_seen);
+    try p.expectSessionsReady();
+
+    // Every stream opened and closed: no id skipped, nothing left.
+    const client = try p.clientRuntime();
+    try std.testing.expectEqual(@as(usize, 0), client.runtime.pendingOpens());
+    try std.testing.expectEqual(@as(usize, 0), client.runtime.pendingReliableSenders());
+    try std.testing.expectEqual(@as(usize, 0), client.runtime.pendingReliableReceivers());
+    const server = p.serverRuntime() orelse return error.ServerSessionGone;
+    try std.testing.expectEqual(@as(usize, 0), server.runtime.pendingReliableSenders());
+    try std.testing.expectEqual(@as(usize, 0), server.runtime.pendingReliableReceivers());
+    const client_conn = p.clientConn() orelse return error.ClientConnGone;
+    const server_conn = p.serverConn() orelse return error.ServerConnGone;
+    try std.testing.expectEqual(@as(u64, total), client_conn.local_bidi_ids.opened);
+    try std.testing.expectEqual(@as(usize, 0), client_conn.local_bidi_ids.holeCount());
+    try std.testing.expectEqual(@as(usize, 0), server_conn.peer_bidi_ids.holeCount());
+    try std.testing.expectEqual(@as(u64, total), server_conn.peer_bidi_ids.closed);
+    try std.testing.expectEqual(@as(usize, 0), client_conn.streams.count());
+    try std.testing.expectEqual(@as(usize, 0), server_conn.streams.count());
 }
