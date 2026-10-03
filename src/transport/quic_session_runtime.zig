@@ -1044,6 +1044,8 @@ const FakeTransport = struct {
     uni_open_limit: ?usize = null,
     bidi_opened: usize = 0,
     uni_opened: usize = 0,
+    /// The next N calls to `streamStopSending` fail with OutOfMemory.
+    fail_stop_sending: usize = 0,
     /// Every open, in call order.
     opens: std.ArrayList(u64) = .empty,
     reaped: std.ArrayList(u64) = .empty,
@@ -1065,6 +1067,8 @@ const FakeTransport = struct {
     }
 
     pub fn openBidi(self: *FakeTransport, stream_id: u64) !void {
+        // quic-zig never opens a used id again.
+        if (self.streams.get(stream_id)) |stream| if (stream.opened_bidi) return error.StreamAlreadyOpen;
         if (self.bidi_open_limit) |limit| if (self.bidi_opened >= limit) return error.StreamLimitExceeded;
         try self.opens.ensureUnusedCapacity(self.allocator, 1);
         const entry = try self.getOrPutStream(stream_id);
@@ -1112,6 +1116,10 @@ const FakeTransport = struct {
     }
 
     pub fn streamStopSending(self: *FakeTransport, stream_id: u64, code: u64) !void {
+        if (self.fail_stop_sending > 0) {
+            self.fail_stop_sending -= 1;
+            return error.OutOfMemory;
+        }
         const stream = self.streams.getPtr(stream_id) orelse return error.StreamNotFound;
         if (stream.stop_code == null) stream.stop_code = code;
     }
@@ -1594,6 +1602,81 @@ test "a request aborted before its stream opens is burned in its turn" {
     }
 }
 
+test "burned ids that wait for the peer's credit count toward the queue limit" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .client, .{ .peer_id = "client-a", .max_queued_messages = 3 });
+    defer runtime.deinit();
+    var peer = try QuicSessionRuntime.init(allocator, 2, .server, .{ .peer_id = "server-a" });
+    defer peer.deinit();
+    var io = FakeTransport.init(allocator);
+    defer io.deinit();
+    var peer_io = FakeTransport.init(allocator);
+    defer peer_io.deinit();
+    try readyRuntimePair(&runtime, &io, &peer, &peer_io);
+
+    // The peer gives no bidi id. Each request expires while it waits:
+    // its sender and receiver go, and its id stays in the open queue.
+    io.bidi_open_limit = 0;
+    for (0..3) |i| {
+        const id = try runtime.queueReliable(.{ .subject = "work", .id = i + 1, .body = "x" });
+        _ = try runtime.pump(&io);
+        runtime.abortReliable(id);
+    }
+    try std.testing.expectEqual(@as(usize, 3), runtime.pendingOpens());
+    try std.testing.expectEqual(@as(usize, 0), runtime.pendingReliableSenders());
+    try std.testing.expectEqual(@as(usize, 0), runtime.pendingReliableReceivers());
+
+    // The open queue is full: the caller gets QueueFull, and no id is used.
+    const next_bidi = runtime.stream_ids.next_bidi;
+    try std.testing.expectError(error.QueueFull, runtime.queueReliable(.{ .subject = "work", .id = 4, .body = "x" }));
+    try std.testing.expectError(error.QueueFull, runtime.queueReliableOnStream(next_bidi, .{ .subject = "work", .id = 4, .body = "x" }, .{}));
+    try std.testing.expectEqual(next_bidi, runtime.stream_ids.next_bidi);
+    try std.testing.expectEqual(@as(usize, 3), runtime.pendingOpens());
+
+    // The peer gives ids back: the burned ids open and end, and the
+    // queue takes messages again.
+    io.bidi_open_limit = null;
+    _ = try runtime.pump(&io);
+    try std.testing.expectEqual(@as(usize, 0), runtime.pendingOpens());
+    try std.testing.expectEqual(next_bidi, try runtime.queueReliable(.{ .subject = "work", .id = 5, .body = "x" }));
+}
+
+test "a burn whose STOP_SENDING fails ends on the next pump, with no second open" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .client, .{ .peer_id = "client-a" });
+    defer runtime.deinit();
+    var peer = try QuicSessionRuntime.init(allocator, 2, .server, .{ .peer_id = "server-a" });
+    defer peer.deinit();
+    var io = FakeTransport.init(allocator);
+    defer io.deinit();
+    var peer_io = FakeTransport.init(allocator);
+    defer peer_io.deinit();
+    try readyRuntimePair(&runtime, &io, &peer, &peer_io);
+    const opens_before = io.opens.items.len;
+
+    const burned = try runtime.queueReliable(.{ .subject = "work", .id = 1, .body = "x" });
+    const next = try runtime.queueReliable(.{ .subject = "work", .id = 2, .body = "x" });
+    runtime.abortReliable(burned);
+
+    // The id opens and is reset, then its STOP_SENDING fails with OOM.
+    io.fail_stop_sending = 1;
+    try std.testing.expectError(error.OutOfMemory, runtime.pump(&io));
+    try std.testing.expectEqualSlices(u64, &.{burned}, io.opens.items[opens_before..]);
+    try std.testing.expectEqual(@as(usize, 2), runtime.pendingOpens());
+
+    // The next pump does not open the id again (quic-zig refuses that
+    // with StreamAlreadyOpen). It finishes the burn, then opens the next id.
+    _ = try runtime.pump(&io);
+    try std.testing.expectEqualSlices(u64, &.{ burned, next }, io.opens.items[opens_before..]);
+    try std.testing.expectEqual(@as(usize, 0), runtime.pendingOpens());
+    const stream = io.streams.get(burned).?;
+    try std.testing.expectEqual(@as(?u64, quic_cancel.AppErrorCode.canceled), stream.reset_code);
+    try std.testing.expectEqual(@as(?u64, quic_cancel.AppErrorCode.canceled), stream.stop_code);
+    try std.testing.expect(io.streams.get(next).?.finished);
+}
+
 test "a control stream waits at the peer's uni stream limit" {
     const allocator = std.testing.allocator;
 
@@ -1973,8 +2056,11 @@ const HeartbeatFakeTransport = struct {
     opened_uni: ?u64 = null,
     /// The peer's uni window is full: every open is refused.
     refuse_uni: bool = false,
+    /// Every write fails with OutOfMemory.
+    fail_write: bool = false,
 
     pub fn streamWrite(self: *HeartbeatFakeTransport, stream_id: u64, data: []const u8) !usize {
+        if (self.fail_write) return error.OutOfMemory;
         if (self.wrote_stream == null) self.wrote_stream = stream_id;
         try self.written.appendSlice(testing.allocator, data);
         return data.len;
@@ -2081,6 +2167,30 @@ test "a ping that cannot start reserves no uni stream id" {
     try testing.expect(rt.ping_sender == null);
     try testing.expectEqual(@as(?u64, next_uni), transport.opened_uni);
     try testing.expectEqual(next_uni + 4, rt.stream_ids.next_uni);
+}
+
+test "a ping whose first write fails stays with the runtime" {
+    const allocator = testing.allocator;
+    var rt = try heartbeatTestRuntime(allocator);
+    defer rt.deinit();
+    var transport = HeartbeatFakeTransport{ .fail_write = true };
+    defer transport.written.deinit(testing.allocator);
+
+    // The PING's stream opens, and its first write fails.
+    _ = try rt.tickHeartbeat(1_000_000, &transport);
+    try testing.expectError(error.OutOfMemory, rt.tickHeartbeat(3_000_000, &transport));
+    try testing.expect(rt.ping_sender != null);
+
+    // The peer is alive. The next sweep writes the same PING, and the
+    // runtime frees its sender once.
+    transport.fail_write = false;
+    rt.noteInboundActivity(3_000_000);
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.none, try rt.tickHeartbeat(3_500_000, &transport));
+    try testing.expect(rt.ping_sender == null);
+    const frames = [_]control.Frame{.{ .ping = .{ .token = 3_000_000 } }};
+    const expected = try quic_streams.encodeControlStream(allocator, &frames, rt.session.options.control_codec);
+    defer allocator.free(expected);
+    try testing.expectEqualSlices(u8, expected, transport.written.items);
 }
 
 test "a control flush that fails reserves no uni stream id" {
