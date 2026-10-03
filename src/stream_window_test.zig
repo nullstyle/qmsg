@@ -10,9 +10,10 @@
 //!
 //! Every test here pushes more streams through ONE session than the
 //! window holds, and asserts the healthy result. Each one failed on
-//! qmsg before the fix it names. Two `Node`s, events delivery, real
-//! sockets on 127.0.0.1, and a virtual clock (one step is 1 ms) that
-//! may run at most `max_speedup` times faster than real time.
+//! qmsg before the fix it names. The dropped-requests test passed before
+//! too: it covers the requester's cancel plan. Two `Node`s, events
+//! delivery, real sockets on 127.0.0.1, and a virtual clock (one step is
+//! 1 ms) that may run at most `max_speedup` times faster than real time.
 //! Diagnostics print only when a test fails.
 
 const std = @import("std");
@@ -227,7 +228,7 @@ const Pair = struct {
         std.debug.print("\n[stream-window] {s}\n", .{label});
         if (self.client.quicSession(self.session)) |r| std.debug.print(
             "  client session {s}: senders={d} receivers={d} inbox={d} pending_opens={d} next_bidi={d}\n",
-            .{ @tagName(r.state()), r.runtime.pendingReliableSenders(), r.runtime.pendingReliableReceivers(), r.runtime.inboxLen(), pendingOpens(&r.runtime), r.runtime.stream_ids.next_bidi },
+            .{ @tagName(r.state()), r.runtime.pendingReliableSenders(), r.runtime.pendingReliableReceivers(), r.runtime.inboxLen(), r.runtime.pendingOpens(), r.runtime.stream_ids.next_bidi },
         ) else std.debug.print("  client session gone\n", .{});
         if (self.serverRuntime()) |r| std.debug.print(
             "  server session {s}: senders={d} receivers={d} inbox={d}\n",
@@ -237,13 +238,6 @@ const Pair = struct {
         if (self.serverConn()) |c| reportConn("server conn", c);
     }
 };
-
-/// `pendingOpens` is new with the stream fixes; read it when present.
-fn pendingOpens(runtime: anytype) usize {
-    const T = @TypeOf(runtime.*);
-    if (comptime @hasDecl(T, "pendingOpens")) return runtime.pendingOpens();
-    return 0;
-}
 
 fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();

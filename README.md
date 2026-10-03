@@ -339,9 +339,8 @@ Message bodies are raw bytes by design; the typed-codec slot (ROADMAP
 phase 9) has a Cap'n Proto implementation behind an opt-in build flag.
 It adds a LAZY dependency on
 [capnp-zig](https://github.com/nullstyle/capnp-zig) — builds without the
-flag never compile or link it into qmsg's module graph (note: on current
-0.17-dev toolchains, dependency resolution still downloads and
-hash-validates every manifest entry, lazy or not):
+flag never compile or link it into qmsg's module graph, and on Zig 0.17.0
+they do not fetch it either:
 
 ```sh
 zig build -Dcapnp=true capnp-test
