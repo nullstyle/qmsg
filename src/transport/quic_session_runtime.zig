@@ -278,14 +278,35 @@ pub const QuicSessionRuntime = struct {
     /// `recvReliable` returns null forever and the request expires.
     /// A stream that never receives its reply keeps an idle receiver
     /// until the session deinits.
+    ///
+    /// Every check that can refuse the message (`QueueFull`, an
+    /// encoding error, OOM) runs BEFORE the stream id is reserved. Since
+    /// quic-zig v0.24.0 a local id that is skipped and never opened is a
+    /// stream the peer counts as open for the life of the connection,
+    /// so a refusal must not use one up.
     pub fn queueReliable(self: *QuicSessionRuntime, outgoing: message.OutgoingMessage) !u64 {
         try self.ensureReadyForApplicationData();
+        const expects_reply = !outgoing.flags.no_reply;
+        const limits = self.session.options;
 
-        const stream_id = try self.stream_ids.nextBidi();
-        if (!outgoing.flags.no_reply) try self.acceptReliableStream(stream_id);
-        errdefer self.abortReliable(stream_id);
-        try self.queueReliableOnStream(stream_id, outgoing, .{});
+        if (self.reliable_senders.count() >= limits.max_queued_messages) return error.QueueFull;
+        const stream_id = self.stream_ids.next_bidi;
+        if (self.reliable_senders.contains(stream_id) or self.reliable_receivers.contains(stream_id)) return error.StreamAlreadyOpen;
+        var sender = try quic_streams.ReliableMessageSender.init(self.allocator, stream_id, outgoing, self.envelope_codec, .{});
+        errdefer sender.deinit();
+        try self.checkQueuedSendBytes(sender.bytes.len);
+        if (expects_reply) try self.checkReceiverCapacity();
+        try self.reliable_senders.ensureUnusedCapacity(1);
+        if (expects_reply) try self.reliable_receivers.ensureUnusedCapacity(1);
 
+        // Reserve the id last: nothing below can fail.
+        const reserved = try self.stream_ids.nextBidi();
+        std.debug.assert(reserved == stream_id);
+        self.reliable_senders.putAssumeCapacityNoClobber(stream_id, sender);
+        if (expects_reply) self.reliable_receivers.putAssumeCapacityNoClobber(
+            stream_id,
+            quic_streams.ReliableMessageReceiver.init(self.allocator, stream_id, self.envelope_codec),
+        );
         return stream_id;
     }
 
@@ -313,7 +334,7 @@ pub const QuicSessionRuntime = struct {
         );
         errdefer sender.deinit();
 
-        if (sender.bytes.len > limits.max_queued_bytes or self.queuedSendBytes() > limits.max_queued_bytes - sender.bytes.len) return error.QueueFull;
+        try self.checkQueuedSendBytes(sender.bytes.len);
         try self.reliable_senders.put(stream_id, sender);
     }
 
@@ -328,12 +349,7 @@ pub const QuicSessionRuntime = struct {
     pub fn acceptReliableStream(self: *QuicSessionRuntime, stream_id: u64) !void {
         try self.ensureReadyForApplicationData();
         if (self.reliable_receivers.contains(stream_id)) return error.StreamAlreadyOpen;
-        const limits = self.session.options;
-        if (self.reliable_receivers.count() + self.inbox.items.len >= limits.max_queued_messages) return error.QueueFull;
-        // Reserve a full message for every active decoder; fragmented streams
-        // cannot each consume the entire session byte budget independently.
-        const reserved = std.math.mul(usize, self.reliable_receivers.count() + 1, limits.max_message_size) catch return error.QueueFull;
-        if (reserved > limits.max_queued_bytes or self.inboxBytes() > limits.max_queued_bytes - reserved) return error.QueueFull;
+        try self.checkReceiverCapacity();
 
         const receiver = quic_streams.ReliableMessageReceiver.init(
             self.allocator,
@@ -362,6 +378,23 @@ pub const QuicSessionRuntime = struct {
             var owned = self.inbox.orderedRemove(index);
             owned.deinit();
         }
+    }
+
+    /// `QueueFull` when `bytes_len` more queued send bytes would pass
+    /// the session's byte budget.
+    fn checkQueuedSendBytes(self: *QuicSessionRuntime, bytes_len: usize) Error!void {
+        const limit = self.session.options.max_queued_bytes;
+        if (bytes_len > limit or self.queuedSendBytes() > limit - bytes_len) return error.QueueFull;
+    }
+
+    /// `QueueFull` when the session cannot hold one more receiver.
+    fn checkReceiverCapacity(self: *QuicSessionRuntime) Error!void {
+        const limits = self.session.options;
+        if (self.reliable_receivers.count() + self.inbox.items.len >= limits.max_queued_messages) return error.QueueFull;
+        // Reserve a full message for every active decoder; fragmented streams
+        // cannot each consume the entire session byte budget independently.
+        const reserved = std.math.mul(usize, self.reliable_receivers.count() + 1, limits.max_message_size) catch return error.QueueFull;
+        if (reserved > limits.max_queued_bytes or self.inboxBytes() > limits.max_queued_bytes - reserved) return error.QueueFull;
     }
 
     fn queuedSendBytes(self: *QuicSessionRuntime) usize {
@@ -1246,6 +1279,36 @@ test "queueReliable arms the reply receiver on the request's own stream" {
     defer received.deinit();
     try std.testing.expectEqual(stream_id, received.stream_id);
     try std.testing.expectEqualStrings("user-42", received.message.body);
+}
+
+test "a queueReliable refusal reserves no stream id" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try QuicSessionRuntime.init(allocator, 1, .client, .{ .peer_id = "client-a", .max_queued_messages = 2 });
+    defer runtime.deinit();
+    var peer = try QuicSessionRuntime.init(allocator, 2, .server, .{ .peer_id = "server-a" });
+    defer peer.deinit();
+    var io = FakeTransport.init(allocator);
+    defer io.deinit();
+    var peer_io = FakeTransport.init(allocator);
+    defer peer_io.deinit();
+    try readyRuntimePair(&runtime, &io, &peer, &peer_io);
+
+    // A message the envelope refuses.
+    try std.testing.expectError(error.InvalidMessage, runtime.queueReliable(.{ .subject = "x", .id = 9, .flags = .{ .unreliable = true } }));
+    try std.testing.expectEqual(@as(u64, 0), try runtime.queueReliable(.{ .subject = "a", .id = 1 }));
+    try std.testing.expectEqual(@as(u64, 4), try runtime.queueReliable(.{ .subject = "b", .id = 2 }));
+    // Two receivers armed: no room for a third reply.
+    try std.testing.expectError(error.QueueFull, runtime.queueReliable(.{ .subject = "c", .id = 3 }));
+    // Two senders queued: no room for a third message.
+    try std.testing.expectError(error.QueueFull, runtime.queueReliable(.{ .subject = "c", .id = 3, .flags = .{ .no_reply = true } }));
+    try std.testing.expectEqual(@as(u64, 8), runtime.stream_ids.next_bidi);
+
+    // Once the two requests are gone, the next message takes the next id:
+    // the refusals left no gap.
+    runtime.abortReliable(0);
+    runtime.abortReliable(4);
+    try std.testing.expectEqual(@as(u64, 8), try runtime.queueReliable(.{ .subject = "d", .id = 4 }));
 }
 
 test "session runtime replies on an accepted peer stream" {

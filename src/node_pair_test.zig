@@ -39,6 +39,11 @@ const message = @import("message.zig");
 const node_mod = @import("node.zig");
 const quic = @import("transport/quic.zig");
 
+test {
+    // Long-lived sessions against quic-zig's stream window.
+    _ = @import("stream_window_test.zig");
+}
+
 const test_cert_pem = @embedFile("testdata/test_cert.pem");
 const test_key_pem = @embedFile("testdata/test_key.pem");
 
