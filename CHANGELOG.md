@@ -7,6 +7,20 @@ changes.
 
 ## [Unreleased]
 
+- **quic-zig v0.25.0, a security fix.** In every older quic-zig release
+  one short datagram from anyone who saw a packet of a connection (or a
+  datagram a small receive buffer cut short) made `Connection.handle`
+  return an error. `Server.feed` then closed the connection, and on a dial
+  session the error left `Node.tick` (`InvalidState`). v0.25.0 drops such
+  a packet. No API changed and the quic option map is the same. Changes
+  qmsg sees without a code change: `poll` returns null instead of
+  `error.TooManyInFlight` (qmsg never mapped that error); a handshake
+  recovers from loss at the pace of the round trip, with more handshake
+  datagrams under loss; a client sends no Initial after its first
+  Handshake packet; and during a handshake `nextTimerDeadline` can be a
+  probe deadline, which the runtimes' `nextTimer` reports like any other.
+  The suite passes unchanged on v0.25.0 (822/822, the lossy-handshake
+  tests in `src/node.zig` included).
 - **quic-zig v0.24.1 and the tagged Zig 0.17.0** (they move together:
   v0.24.1 refuses every 0.17.0-dev build). v0.24.1 has the `src/` of
   v0.24.0; the package also accepts an `optimize` option, which qmsg does

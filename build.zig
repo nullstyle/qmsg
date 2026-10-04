@@ -15,9 +15,10 @@ pub fn build(b: *std.Build) !void {
     // `.optimize` here therefore failed with `invalid option:
     // "optimize"` on a COLD cache — a fresh clone's first
     // `zig build` — and only appeared to work on the second run,
-    // after the lazy fetch had already completed. v0.24.1 accepts
-    // `optimize` too; do not add it back all the same: `release` works
-    // on every release, and it is the key qmesh-zig and nest pass.
+    // after the lazy fetch had already completed. From v0.24.1 it
+    // accepts `optimize` too (the pin is v0.25.0); do not add it back all
+    // the same: `release` works on every release, and it is the key
+    // qmesh-zig and nest pass.
     // Forward the mode through `release` (Debug or ReleaseSafe):
     // with no `release`, a `-Doptimize=Release*` build compiles quic and
     // BoringSSL in Debug.
