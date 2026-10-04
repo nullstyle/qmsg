@@ -1,6 +1,6 @@
 [tools]
 # The tagged Zig 0.17.0 release: the floor of the quic-zig tarball
-# pin (v0.24.0), whose build.zig refuses every 0.17.0-dev build.
+# pin (v0.24.1), whose build.zig refuses every 0.17.0-dev build.
 zig = "0.17.0"
 
 [env]

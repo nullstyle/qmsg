@@ -7,10 +7,12 @@ changes.
 
 ## [Unreleased]
 
-- **quic-zig v0.24.0 and the tagged Zig 0.17.0** (they move together:
-  v0.24.0 refuses every 0.17.0-dev build). v0.24.0 has no lifetime stream
-  cap: `initial_max_streams_bidi` / `_uni` is a WINDOW of streams open at
-  once, and the peer gives an id back only when its stream is closed in both
+- **quic-zig v0.24.1 and the tagged Zig 0.17.0** (they move together:
+  v0.24.1 refuses every 0.17.0-dev build). v0.24.1 has the `src/` of
+  v0.24.0; the package also accepts an `optimize` option, which qmsg does
+  not pass. Since v0.24.0 quic-zig has no lifetime stream cap:
+  `initial_max_streams_bidi` / `_uni` is a WINDOW of streams open at once,
+  and the peer gives an id back only when its stream is closed in both
   directions. A stream that never closes, or a skipped id, keeps its place
   for the life of the connection. qmsg leaked places in several ways, and
   a session could stall or close on them. Fixed:
