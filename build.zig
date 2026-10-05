@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) !void {
     // "optimize"` on a COLD cache — a fresh clone's first
     // `zig build` — and only appeared to work on the second run,
     // after the lazy fetch had already completed. From v0.24.1 it
-    // accepts `optimize` too (the pin is v0.25.0); do not add it back all
+    // accepts `optimize` too (the pin is v0.27.0); do not add it back all
     // the same: `release` works on every release, and it is the key
     // qmesh-zig and nest pass.
     // Forward the mode through `release` (Debug or ReleaseSafe):

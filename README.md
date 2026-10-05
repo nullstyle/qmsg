@@ -50,7 +50,7 @@ and embedded or App-driven consumption. The public root module exports:
 The inproc socket examples build and run against the current public API. The
 App facade can now serve inproc REP routes through `runOnce`, and can prepare
 QUIC listener/session runtime plumbing. QUIC has a pinned released
-`quic-zig` dependency (URL+hash tarball, v0.25.0), option wrappers, transport-parameter
+`quic-zig` dependency (URL+hash tarball, v0.27.0), option wrappers, transport-parameter
 mapping, socket-free runtime wrappers around `quic_zig.Server`/`Client`,
 Node-embeddable UDP socket owners, per-session QUIC drivers, socket QUIC
 attachment callbacks, App dispatch for already-decoded QUIC messages,

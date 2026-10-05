@@ -21,12 +21,18 @@
             .url = "https://github.com/nullstyle/paseto-zig/archive/refs/tags/0.4.0.tar.gz",
             .hash = "paseto-0.4.0-EBI95RcXCADs0jz3tebS1xMaAiT2r3Tpx8HsF5LfpqOS",
         },
-        // v0.25.0 (tag at 67f0fea): the security fix. Before it, one short
-        // datagram from anyone who saw a packet of the connection (or one
-        // a small receive buffer cut short) made `Connection.handle` fail,
-        // and the connection closed; now such a packet is dropped. The
-        // package accepts `optimize` too (since v0.24.1), which the shared
-        // map does not pass. Since v0.24.0 there is no lifetime stream cap.
+        // v0.27.0 (tag at 9d2ab6e). It holds v0.25.0's security fix (one
+        // short datagram from anyone who saw a packet of the connection, or
+        // one a small receive buffer cut short, made `Connection.handle`
+        // fail and the connection close; such a packet is now dropped) and
+        // v0.26.0's repairs: a peer that leaves a connection ID out of its
+        // transport parameters is refused, no handshake datagram is longer
+        // than 1200 bytes, a close during the handshake reaches the peer,
+        // and a key update waits for the confirmed handshake. v0.27.0 adds
+        // session tickets that live through a server restart; qmsg sets
+        // none of the new fields. The package accepts `optimize` too (since
+        // v0.24.1), which the shared map does not pass. Since v0.24.0 there
+        // is no lifetime stream cap.
         // The stream limit is a window of streams open at once, and an id
         // comes back only when its stream is closed in both directions, so
         // qmsg opens local streams in id order and waits on
@@ -38,8 +44,8 @@
         // 0.17.0. Same pin (and option map, see build.zig) as nest and
         // qmesh-zig, so a binary that links all three has one quic module.
         .quic = .{
-            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.25.0.tar.gz",
-            .hash = "quic-0.25.0-DnSYvcRANgAnmiJVo3UPd3XOuezmr8Ia1mXeqXgow4vw",
+            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.27.0.tar.gz",
+            .hash = "quic-0.27.0-DnSYvdkEOQDHm_pJQOp6Vo47gQ1Cm7-0c2sgVV0M6Xht",
         },
         // Optional Cap'n Proto body codec dependency (`-Dcapnp=true`).
         // LAZY: default builds and non-opting consumers never fetch or

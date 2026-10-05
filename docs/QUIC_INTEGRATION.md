@@ -106,7 +106,7 @@ Sockets own pattern state, deadlines, queues, and request correlation.
 ## Build Integration
 
 qmsg pins a quic-zig release tarball (`build.zig.zon`, URL + hash; today
-v0.25.0, module `quic`, with its BoringSSL as module `boringssl`). Its floor
+v0.27.0, module `quic`, with its BoringSSL as module `boringssl`). Its floor
 is the tagged Zig 0.17.0, and `mise.toml` pins the same Zig. Move the two
 together: quic-zig's `build.zig` refuses a Zig older than its floor.
 
@@ -168,8 +168,17 @@ qmsg `dialQuic(endpoint, options)` maps to:
    in 0-RTT.
 4. Own the UDP socket and feed inbound datagrams to
    `client.conn.handleWithEcn` / `handle`.
-5. Drain outbound datagrams with `client.conn.pollDatagram(tx, now_us)`.
-6. Call `client.conn.tick(now_us)` and consume `client.conn.pollEvent()`.
+5. Drive qmsg session state from `client.conn` (consume
+   `client.conn.pollEvent()` and read the streams).
+6. Call `client.conn.tick(now_us)`.
+7. Drain outbound datagrams with `client.conn.pollDatagram(tx, now_us)`.
+
+Both loops read between feed and tick. `tick` ends with quic-zig's stream
+GC: a stream whose end (a FIN with no data, or a RESET_STREAM) arrived
+alone after every byte was read is destroyed there, and a read after that
+`tick` finds no stream (`quic.app` reports `.reaped`, which cannot tell a
+clean end from a reset). Until qmsg's dial loop read before `tick`, a
+complete reply whose FIN came alone failed with `peer_closed`.
 
 ### Session Lifecycle
 

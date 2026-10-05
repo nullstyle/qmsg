@@ -7,6 +7,42 @@ changes.
 
 ## [Unreleased]
 
+- **A dial session no longer reports a complete reply as `peer_closed`.**
+  quic-zig reclaims a stream at the end of `tick` once both halves are
+  done. When the end of a stream comes in a frame of its own (a FIN with
+  no data, or a RESET_STREAM) after every byte was read, the next `tick`
+  destroys the stream, and a read after it finds no stream (`quic.app`
+  reports `.reaped`, which cannot tell a clean end from a reset). The
+  dial loop (`tickQuicClients`) fed datagrams, ticked, and then read. So
+  a complete reply whose FIN came alone failed with
+  `request_failed{peer_closed}`, and a raw or socket request lost its
+  reply and waited for its deadline. The listener loop was already right.
+  The dial loop now feeds, reads (the session pump and the heartbeat),
+  ticks, and drains. A reset is still a failure: qmsg reads no reset
+  codes. `src/stream_end_test.zig` (in `node-pair-test`) sends a whole
+  reply without FIN and then the end alone, to two `Node`s over real UDP:
+  the FIN case failed before the fix and passes now; the reset case is a
+  failure before and after. The test helpers and the two examples that
+  drive QUIC by hand (`quic_runtime_reqrep`, `embedded_quic_attach`)
+  also read between feed and tick now.
+- **quic-zig v0.27.0** (from v0.25.0; v0.26.0 skipped). No security fix;
+  nothing qmsg calls was removed or renamed, and the option map is the
+  same. qmsg needs no code change for what the two releases change: it
+  keeps no tokens of its own (tokens are 114 bytes now, were 96), it
+  never asks for a key update (`KeyUpdateBlocked` until the handshake is
+  confirmed; `mapQuicError` already maps it to `FlowControlled`), its
+  transport parameters go through `Server` and `Client`, which send the
+  connection IDs that a peer now must send, it never calls
+  `setRememberedPeerTransportParams`, and it sets none of the new
+  session-ticket fields. One test change: since v0.26.0 no handshake
+  datagram is longer than 1200 bytes, so the client's Finished and HELLO
+  share a small datagram (155 bytes) and the DPLPMTUD probe goes alone.
+  The two lossy-handshake tests in `src/node.zig` dropped "the client's
+  first datagram over 1300 bytes" and found none. Their policies now pick
+  the datagram that holds a Handshake and a 1-RTT packet (and, in the
+  second test, the two client datagrams after it); both pass, with 1 and
+  3 datagrams dropped. 824/824 tests (313 unit, 182 quic, 329
+  node-pair) and 27/27 example steps on v0.27.0.
 - **quic-zig v0.25.0, a security fix.** In every older quic-zig release
   one short datagram from anyone who saw a packet of a connection (or a
   datagram a small receive buffer cut short) made `Connection.handle`

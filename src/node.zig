@@ -5723,11 +5723,37 @@ fn localhostEndpoint(allocator: std.mem.Allocator, address: std.Io.net.IpAddress
 // policies model what the fleet saw on Linux VMs (the client's first
 // >1300-byte datagram after the server flight never reached the server:
 // Handshake Finished coalesced with the 1-RTT HELLO padded to the first
-// DPLPMTUD probe size).
+// DPLPMTUD probe size). Since quic-zig v0.26.0 no handshake datagram is
+// longer than 1200 bytes: the Finished and the HELLO still share one
+// datagram, but it is small (155 bytes here) and the probe goes alone. So
+// the policies find that datagram by its packets, not by its size.
 // ---------------------------------------------------------------------
 
 const wide_test_cert_pem = @embedFile("testdata/test_cert_wide.pem");
 const wide_test_key_pem = @embedFile("testdata/test_key_wide_cert.pem");
+
+/// A Handshake packet and a 1-RTT packet in one datagram: the client's
+/// Finished with the HELLO that follows it.
+fn coalescesHandshakeWith1Rtt(datagram: []const u8) bool {
+    var pos: usize = 0;
+    var handshake = false;
+    while (pos < datagram.len) {
+        const first = datagram[pos];
+        if ((first & 0x80) == 0) return handshake;
+        const kind = (first & 0x30) >> 4;
+        if (kind == 3) return false;
+        var p = pos + 5;
+        if (p >= datagram.len) return false;
+        p += 1 + @as(usize, datagram[p]);
+        if (p >= datagram.len) return false;
+        p += 1 + @as(usize, datagram[p]);
+        if (kind == 0) p += @intCast(readVarint(datagram, &p) orelse return false);
+        const len = readVarint(datagram, &p) orelse return false;
+        if (kind == 2) handshake = true;
+        pos = p + @as(usize, @intCast(len));
+    }
+    return false;
+}
 
 fn leadsWithInitial(datagram: []const u8) bool {
     if (datagram.len == 0) return false;
@@ -5822,14 +5848,18 @@ const DatagramQueue = struct {
 const LossPolicy = enum {
     /// No loss (control).
     none,
-    /// Drop exactly one datagram: the client's first >1300-byte datagram
-    /// after the server flight (Finished + HELLO-in-probe).
-    drop_first_large_once,
+    /// Drop exactly one datagram: the client's first datagram after the
+    /// server flight that holds a Handshake and a 1-RTT packet (the
+    /// Finished and the HELLO). Through quic-zig v0.25.0 it was padded to
+    /// a DPLPMTUD probe, past 1300 bytes.
+    drop_finished_once,
     /// Path MTU 1280 over IPv4: every client datagram > 1252 bytes is lost.
     mtu_1252,
-    /// Drop the client's first three >1300-byte datagrams (the coalesced
-    /// one and two HELLO-carrying probes).
-    drop_first_large_thrice,
+    /// Drop the Finished + HELLO datagram (as `drop_finished_once`) and the
+    /// next two client datagrams, whatever they hold. Through v0.25.0 this
+    /// dropped the first three >1300-byte datagrams (the coalesced one and
+    /// two HELLO-carrying probes).
+    drop_finished_thrice,
 };
 
 const ServerSnap = struct {
@@ -5857,7 +5887,7 @@ const LossyDispatchPeers = struct {
     now_us: u64 = 1_000,
     tick: u32 = 0,
     one_way_delay_us: u64 = 0,
-    policy: LossPolicy = .drop_first_large_once,
+    policy: LossPolicy = .drop_finished_once,
     server_flight_seen: bool = false,
     dropped: u32 = 0,
     verbose: bool = true,
@@ -5886,8 +5916,9 @@ const LossyDispatchPeers = struct {
         if (!self.server_flight_seen) return false;
         switch (self.policy) {
             .none => return false,
-            .drop_first_large_once => return self.dropped < 1 and bytes.len > 1300,
-            .drop_first_large_thrice => return self.dropped < 3 and bytes.len > 1300,
+            .drop_finished_once => return self.dropped < 1 and coalescesHandshakeWith1Rtt(bytes),
+            .drop_finished_thrice => return (self.dropped == 0 and coalescesHandshakeWith1Rtt(bytes)) or
+                (self.dropped > 0 and self.dropped < 3),
             .mtu_1252 => return bytes.len > 1252,
         }
     }
@@ -6159,7 +6190,7 @@ fn finishScenario(p: *LossyDispatchPeers, result: *ScenarioResult) !ScenarioResu
 
 test "lossy: dropping the coalesced Finished+HELLO datagram still reaches ready and a reply" {
     const allocator = std.testing.allocator;
-    const r = try runLossyScenario(allocator, 0, .drop_first_large_once, false);
+    const r = try runLossyScenario(allocator, 0, .drop_finished_once, false);
     try std.testing.expectEqual(@as(u32, 1), r.dropped);
     try std.testing.expect(r.ready_tick != null);
     try std.testing.expect(r.reply_tick != null);
@@ -6167,9 +6198,9 @@ test "lossy: dropping the coalesced Finished+HELLO datagram still reaches ready 
     try std.testing.expectEqual(transport.quic.State.ready, r.server_state.?);
 }
 
-test "lossy: the request survives when the first large datagram is dropped three times" {
-    const r = try runLossyScenario(std.testing.allocator, 1_000, .drop_first_large_thrice, false);
-    try std.testing.expect(r.dropped >= 1);
+test "lossy: the request survives when the Finished+HELLO datagram and the next two are dropped" {
+    const r = try runLossyScenario(std.testing.allocator, 1_000, .drop_finished_thrice, false);
+    try std.testing.expectEqual(@as(u32, 3), r.dropped);
     try std.testing.expect(r.reply_tick != null);
     try std.testing.expectEqual(transport.quic.State.ready, r.server_state.?);
 }
