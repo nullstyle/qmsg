@@ -97,6 +97,10 @@ fn pumpRuntimeServerToClient(
     return n;
 }
 
+/// Both ends tick FIRST: the caller reads streams after a drive, so the
+/// order is feed, read, tick. quic-zig's stream GC runs in tick; a tick
+/// between feed and read reaps a stream whose end (a bare FIN or a
+/// RESET_STREAM) arrived alone after every byte was read.
 fn driveRuntime(
     client: *quic_runtime.ClientRuntime,
     listener: *quic_runtime.ListenerRuntime,
@@ -104,10 +108,10 @@ fn driveRuntime(
     client_addr: quic_runtime.Address,
     now_us: u64,
 ) !void {
-    _ = try pumpRuntimeClientToServer(client, listener, rx, client_addr, now_us);
-    _ = try pumpRuntimeServerToClient(listener, client, rx, now_us);
     try listener.tick(now_us);
     try client.tick(now_us);
+    _ = try pumpRuntimeClientToServer(client, listener, rx, client_addr, now_us);
+    _ = try pumpRuntimeServerToClient(listener, client, rx, now_us);
 }
 
 fn driveRuntimeReady(
@@ -230,13 +234,14 @@ const HermeticQuicPair = struct {
         return self.srv.iterator()[0].conn;
     }
 
+    /// Ticks first, for the reason `driveRuntime` gives.
     fn drive(self: *HermeticQuicPair, now_us: u64) !void {
         var rx: [8192]u8 = undefined;
+        try self.srv.tick(now_us);
+        try self.cli.conn.tick(now_us);
         _ = try pumpClientToServer(&self.cli, &self.srv, &rx, self.peer_addr, now_us);
         while (self.srv.drainStatelessResponse()) |_| {}
         _ = try pumpServerToClient(&self.srv, &self.cli, &rx, now_us);
-        try self.srv.tick(now_us);
-        try self.cli.conn.tick(now_us);
     }
 
     fn handshake(self: *HermeticQuicPair) !void {

@@ -157,6 +157,13 @@ const Embedder = struct {
 /// hermetic example an in-memory bridge; a real embedder's UDP
 /// handling stands here), service its Driver (hooks fire into qmsg),
 /// then give each qmsg connection one send-side pass.
+///
+/// Every QUIC endpoint reads between its feed and its tick. The listener
+/// is fed, serviced, then ticked. The dial side is read by the caller
+/// after this function returns, so its tick comes first, in the next
+/// call: quic-zig reclaims a finished stream inside tick, and a tick
+/// between feed and read loses the end of a stream whose FIN arrived
+/// alone after every byte was read.
 fn drive(
     allocator: std.mem.Allocator,
     listener: *qmsg.transport.quic_runtime.ListenerRuntime,
@@ -169,6 +176,7 @@ fn drive(
         .addr = .{ 0x7f, 0, 0, 1 },
         .port = 40_000,
     } };
+    try client.tick(now_us);
     while (try client.drainOutbound(rx, now_us)) |out| {
         _ = try listener.feedInbound(.{ .bytes = rx[0..out.len], .from = from }, now_us);
     }
@@ -182,7 +190,6 @@ fn drive(
         try client.feedInbound(.{ .bytes = rx[0..out.len] }, now_us);
     }
     try listener.tick(now_us);
-    try client.tick(now_us);
     try embedder.node.tick(now_us);
     _ = allocator;
 }

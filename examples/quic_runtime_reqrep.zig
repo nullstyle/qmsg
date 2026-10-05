@@ -188,6 +188,11 @@ fn exchangeReqRep(
     std.debug.print("quic req/rep received {s}: {s}\n", .{ reply.subject, reply.body });
 }
 
+/// One pass of both loops. Tick FIRST: the caller reads its streams after
+/// a drive, so the order is feed, read, tick. quic-zig reclaims a finished
+/// stream inside tick; a tick between feed and read loses the end of a
+/// stream whose FIN (or RESET_STREAM) arrived alone after every byte was
+/// read, and the read then finds no stream.
 fn drive(
     client: *quic_runtime.ClientRuntime,
     listener: *quic_runtime.ListenerRuntime,
@@ -195,6 +200,8 @@ fn drive(
     client_addr: quic_runtime.Address,
     now_us: u64,
 ) !void {
+    try listener.tick(now_us);
+    try client.tick(now_us);
     while (try client.drainOutbound(rx, now_us)) |out| {
         _ = try listener.feedInbound(.{
             .bytes = rx[0..out.len],
@@ -207,6 +214,4 @@ fn drive(
             .from = null,
         }, now_us);
     }
-    try listener.tick(now_us);
-    try client.tick(now_us);
 }

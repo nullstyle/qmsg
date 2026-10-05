@@ -2343,7 +2343,13 @@ pub const Node = struct {
     fn tickQuicClients(self: *Node, now_us: u64) !void {
         for (self.quic_clients.items) |client| {
             try feedQuicEndpoint(&client.client, now_us);
-            try client.client.tick(now_us);
+            // Read BEFORE tick, as the listener loop does. tick ends
+            // with quic-zig's stream GC: a stream whose end arrived in
+            // a frame of its own (a bare FIN or a RESET_STREAM, after
+            // every byte was read) is destroyed there, and a read after
+            // it sees `.reaped`, not `.fin`. A complete reply was then
+            // reported as `peer_closed`.
+            //
             // A dial connection that reached QUIC's TERMINAL closed
             // state (peer CONNECTION_CLOSE observed through the
             // draining deadline, a stateless reset, an idle or
@@ -2356,17 +2362,19 @@ pub const Node = struct {
             // window: late and certain beats early and guessed.
             if (client.client.runtime.connection().isClosed()) continue;
             try self.ensureClientReady(client);
-            if (client.runtime.runtime.isClosingOrClosed()) {
-                try drainQuicEndpoint(&client.client, now_us);
-                continue;
+            if (!client.runtime.runtime.isClosingOrClosed()) {
+                try self.pumpClientSession(client);
+                // Liveness sweep: dial sessions heartbeat on the node
+                // clock. Errors are classified by the sweep itself
+                // (timeout begins closing); transport-level failures
+                // surface via the pump.
+                const hb_conn = client.client.runtime.connection();
+                var hb_adapter = transport.quic_streams.QuicConnectionAdapter.init(hb_conn);
+                _ = client.runtime.runtime.tickHeartbeat(now_us, &hb_adapter) catch {};
             }
-            try self.pumpClientSession(client);
-            // Liveness sweep: dial sessions heartbeat on the node clock.
-            // Errors are classified by the sweep itself (timeout begins
-            // closing); transport-level failures surface via the pump.
-            const hb_conn = client.client.runtime.connection();
-            var hb_adapter = transport.quic_streams.QuicConnectionAdapter.init(hb_conn);
-            _ = client.runtime.runtime.tickHeartbeat(now_us, &hb_adapter) catch {};
+            try client.client.tick(now_us);
+            // tick may close it (idle timeout, the end of draining).
+            if (client.client.runtime.connection().isClosed()) continue;
             try drainQuicEndpoint(&client.client, now_us);
         }
         try self.reapDeadQuicClients();
@@ -3388,11 +3396,16 @@ const DispatchTestPeers = struct {
     rx: [8192]u8 = undefined,
     now_us: u64 = 1_000,
 
+    /// The client is read by the caller between two drives, so its tick
+    /// comes first here: feed, then the caller's read, then tick. A tick
+    /// between feed and read would let quic-zig's stream GC reap a stream
+    /// whose end arrived alone.
     fn drive(self: *DispatchTestPeers) !void {
         const from: transport.quic_runtime.Address = .{ .ipv4 = .{
             .addr = .{ 0x7f, 0, 0, 1 },
             .port = 40_000,
         } };
+        try self.client.tick(self.now_us);
         while (try self.client.drainOutbound(&self.rx, self.now_us)) |out| {
             _ = try self.listener.feedInbound(.{
                 .bytes = self.rx[0..out.len],
@@ -3404,7 +3417,6 @@ const DispatchTestPeers = struct {
             try self.client.feedInbound(.{ .bytes = self.rx[0..out.len] }, self.now_us);
         }
         try self.listener.tick(self.now_us);
-        try self.client.tick(self.now_us);
         self.now_us += 1_000;
     }
 };
@@ -3845,11 +3857,13 @@ const EmbedTestPeers = struct {
     rx: [8192]u8 = undefined,
     now_us: u64 = 1_000,
 
+    /// Client tick first, for the reason `DispatchTestPeers.drive` gives.
     fn drive(self: *EmbedTestPeers) !void {
         const from: transport.quic_runtime.Address = .{ .ipv4 = .{
             .addr = .{ 0x7f, 0, 0, 1 },
             .port = 40_000,
         } };
+        try self.client.tick(self.now_us);
         while (try self.client.drainOutbound(&self.rx, self.now_us)) |out| {
             _ = try self.listener.feedInbound(.{
                 .bytes = self.rx[0..out.len],
@@ -3866,7 +3880,6 @@ const EmbedTestPeers = struct {
             try self.client.feedInbound(.{ .bytes = self.rx[0..out.len] }, self.now_us);
         }
         try self.listener.tick(self.now_us);
-        try self.client.tick(self.now_us);
         self.now_us += 1_000;
     }
 };
@@ -5879,16 +5892,15 @@ const LossyDispatchPeers = struct {
         }
     }
 
-    /// Mirrors Node.tickQuicClients: recvAndFeedOne, tick, ensureClientReady,
-    /// pump session, heartbeat, drain (all outbound into the c2s FIFO, the
-    /// loss policy applied on the way).
+    /// Mirrors Node.tickQuicClients: recvAndFeedOne, ensureClientReady,
+    /// pump session, heartbeat, tick, drain (all outbound into the c2s FIFO,
+    /// the loss policy applied on the way).
     fn clientTick(self: *LossyDispatchPeers) !void {
         if (self.s2c.pop(self.now_us)) |popped| {
             var item = popped;
             self.server_flight_seen = true;
             try self.client.feedInbound(.{ .bytes = item.bytes[0..item.len] }, self.now_us);
         }
-        try self.client.tick(self.now_us);
         const conn = self.client.connection();
         if (!self.client_sess.transport_ready and conn.handshakeDone()) {
             self.client_sess.transport_ready = true;
@@ -5900,6 +5912,7 @@ const LossyDispatchPeers = struct {
             var hb_adapter = transport.quic_streams.QuicConnectionAdapter.init(conn);
             _ = self.client_sess.runtime.tickHeartbeat(self.now_us, &hb_adapter) catch {};
         }
+        try self.client.tick(self.now_us);
         while (try self.client.drainOutbound(&self.rx, self.now_us)) |out| {
             const bytes = self.rx[0..out.len];
             self.c2s_count += 1;
