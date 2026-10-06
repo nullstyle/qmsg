@@ -7,16 +7,42 @@ changes.
 
 ## [Unreleased]
 
-- **A Debug build panics when two readers share one QUIC session's
-  inboxes.** Under `.delivery = .events`, `poll` reads every session (and
-  under `.legacy`, every attached session). A direct
-  `QuicSessionRuntime.recvReliable` or `recvDatagram` on such a session
-  is a second reader: each one misses what the other took, with no error.
-  The session now records its first reader, and a Debug build panics on a
-  second one with a message that names the two-field opt-out. Release
-  builds do not change. Two tests in `src/node.zig`: poll then a direct
-  read on a default `Node` is caught, and a legacy `Node` leaves the
-  inboxes to the direct reader.
+## [0.8.0] - 2026-10-06
+
+The quic-zig v0.29.0 release. 0.7.0 pins quic-zig v0.21.0, and no
+earlier tag has the stream-window repairs that quic-zig v0.24.0 and
+later need; only `main` had them. This release moves to quic-zig v0.29.0,
+which holds v0.25.0's security fix, and to the tagged Zig 0.17.0. Two
+changes break behavior with no compile error, so read them first: a
+`Node` now defaults to canonical events, and `replyInproc` needs the
+event's reply handle. mruby-quic found both on `main`. 830/830 tests
+(316 unit, 182 quic, 332 node-pair), 27/27 example steps and 3/3
+capnp-test on macOS, and mruby-quic's suite passes 142/142 against this
+tree.
+
+### Breaking
+
+- **BREAKING (behavior): a standalone `Node` defaults to canonical events
+  for inproc and QUIC** (`.delivery = .events`, `.event_format =
+  .canonical`). Code written for 0.7.0 compiles unchanged and behaves
+  differently. `poll` now drains every QUIC session's inboxes (0.7.0
+  drained only attached sessions), and it names the events `request`,
+  `reply`, `request_failed` and `delivery`, not `quic_*`. An embedder that
+  also reads a session itself (`quicSession(id).recvReliable()` or
+  `.recvDatagram()`) finds nothing, and its replies disappear with no
+  error. mruby-quic hit this: 9 tests failed and 1 crashed, and the build
+  gave no warning. A Debug build now panics on that second reader, and
+  the message names the fix. To keep the 0.7.0 behavior, set both fields:
+
+  ```zig
+  var node = try qmsg.Node.init(allocator, .{
+      .delivery = .legacy,
+      .event_format = .legacy_transport,
+  });
+  ```
+
+  `request`, `cancelRequest`, and `reply` use a local `RequestId` and
+  retained reply handles. See [MIGRATION.md](docs/MIGRATION.md).
 - **BREAKING (behavior): `Node.replyInproc` and `replyErrorInproc`
   return `error.ReplyHandleMissing` for an event without a reply
   handle.** They fell back to a reply by message id alone
@@ -32,6 +58,24 @@ changes.
   the handle. A test in `src/node.zig` sends from one `Node` to another:
   the copy without the handle gets the error, and the retained copy's
   reply completes the request.
+- **BREAKING (build): the floor is the tagged Zig 0.17.0** (0.7.0
+  accepted 0.17.0-dev.1786+75044cb04). quic-zig v0.24.1 and later refuse
+  every 0.17.0-dev build. **BREAKING (API):** a transport handed to
+  `QuicSessionRuntime.pump` must provide `streamReset` and
+  `streamStopSending` (see the v0.24.1 entry below).
+
+### Other changes
+
+- **A Debug build panics when two readers share one QUIC session's
+  inboxes.** Under `.delivery = .events`, `poll` reads every session (and
+  under `.legacy`, every attached session). A direct
+  `QuicSessionRuntime.recvReliable` or `recvDatagram` on such a session
+  is a second reader: each one misses what the other took, with no error.
+  The session now records its first reader, and a Debug build panics on a
+  second one with a message that names the two-field opt-out. Release
+  builds do not change. Two tests in `src/node.zig`: poll then a direct
+  read on a default `Node` is caught, and a legacy `Node` leaves the
+  inboxes to the direct reader.
 - **quic-zig v0.29.0** (from v0.27.0; v0.28.0 and v0.28.1 skipped). No
   security fix and no wire change. Nothing qmsg calls was removed or
   renamed, and the option map is the same. v0.28.0 keeps the end of a
@@ -139,7 +183,6 @@ changes.
   streams through one session than the window holds, one test per leak,
   and one session that carries 6000 streams with aborts and `no_reply`
   messages mixed in.
-
 - `transport.quic.localCertSpkiDigest(allocator, cert_pem)` computes the
   certificate-bound identity from a local `tls_cert_pem` without a handshake:
   SHA-256 over the leaf's DER SubjectPublicKeyInfo, byte-for-byte the
@@ -153,27 +196,6 @@ changes.
   tracking capacity. The released-QUIC fallback also avoids rediscovering an
   already consumed request while its reply half remains open. A real two-node
   regression covers simultaneous requests in both directions.
-- **BREAKING (behavior): a standalone `Node` defaults to canonical events
-  for inproc and QUIC** (`.delivery = .events`, `.event_format =
-  .canonical`). Code written for 0.7.0 compiles unchanged and behaves
-  differently. `poll` now drains every QUIC session's inboxes (0.7.0
-  drained only attached sessions), and it names the events `request`,
-  `reply`, `request_failed` and `delivery`, not `quic_*`. An embedder that
-  also reads a session itself (`quicSession(id).recvReliable()` or
-  `.recvDatagram()`) finds nothing, and its replies disappear with no
-  error. mruby-quic hit this: 9 tests failed and 1 crashed, and the build
-  gave no warning. A Debug build now panics on that second reader, and
-  the message names the fix. To keep the 0.7.0 behavior, set both fields:
-
-  ```zig
-  var node = try qmsg.Node.init(allocator, .{
-      .delivery = .legacy,
-      .event_format = .legacy_transport,
-  });
-  ```
-
-  `request`, `cancelRequest`, and `reply` use a local `RequestId` and
-  retained reply handles. See [MIGRATION.md](docs/MIGRATION.md).
 - Accepted requests reserve bounded terminal outcomes until `poll` or
   `takeOutcome` consumes them. Separate count and byte budgets cover pending
   requests, replies, and ordinary events. Reply routing survives request-body
