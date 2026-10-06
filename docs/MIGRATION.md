@@ -5,6 +5,14 @@ The default `Node` uses `.delivery = .events` and
 through `poll`: `request`, `reply`, `request_failed`, and `delivery`.
 The qmsg wire protocol remains `qmsg/1`; this is a library interface change.
 
+**Breaking (behavior), since 0.8.0, and the compiler does not report it.** A
+`Node.init` call written for 0.7.0 compiles unchanged and gets these
+defaults. `poll` then drains every QUIC session's inboxes, so code that also
+reads a session itself (`recvReliable` / `recvDatagram`) finds nothing, and
+its replies disappear with no error. A Debug build panics on that second
+reader. To keep the 0.7.0 behavior, set both fields of
+[Explicit compatibility mode](#explicit-compatibility-mode).
+
 ## Requests, replies, and ownership
 
 Use `Node.request` for either transport. Its return value is an opaque local
@@ -139,7 +147,8 @@ are `quic_request`, `quic_reply`, `quic_request_failed`, and `quic_delivery`.
 Transport-specific request/reply helpers remain compatibility adapters.
 
 Choose one receive consumer per session. Under the default event mode, do not
-also drain raw session inboxes. `App.init` deliberately selects legacy inbox
+also drain raw session inboxes. A Debug build panics when one session has
+both readers. `App.init` deliberately selects legacy inbox
 delivery for its `runOnce` dispatcher; low-level App examples retain that
 pattern. Standalone Node examples use the canonical interface:
 [embedded_inproc_node.zig](../examples/embedded_inproc_node.zig) and

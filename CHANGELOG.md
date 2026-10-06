@@ -7,6 +7,16 @@ changes.
 
 ## [Unreleased]
 
+- **A Debug build panics when two readers share one QUIC session's
+  inboxes.** Under `.delivery = .events`, `poll` reads every session (and
+  under `.legacy`, every attached session). A direct
+  `QuicSessionRuntime.recvReliable` or `recvDatagram` on such a session
+  is a second reader: each one misses what the other took, with no error.
+  The session now records its first reader, and a Debug build panics on a
+  second one with a message that names the two-field opt-out. Release
+  builds do not change. Two tests in `src/node.zig`: poll then a direct
+  read on a default `Node` is caught, and a legacy `Node` leaves the
+  inboxes to the direct reader.
 - **BREAKING (behavior): `Node.replyInproc` and `replyErrorInproc`
   return `error.ReplyHandleMissing` for an event without a reply
   handle.** They fell back to a reply by message id alone
@@ -143,10 +153,27 @@ changes.
   tracking capacity. The released-QUIC fallback also avoids rediscovering an
   already consumed request while its reply half remains open. A real two-node
   regression covers simultaneous requests in both directions.
-- Standalone `Node` now defaults to canonical events for inproc and QUIC.
-  `request`, `cancelRequest`, and `reply` use a local `RequestId` and retained
-  reply handles. Older transport-specific events and direct inbox consumers
-  have explicit compatibility options; see [MIGRATION.md](docs/MIGRATION.md).
+- **BREAKING (behavior): a standalone `Node` defaults to canonical events
+  for inproc and QUIC** (`.delivery = .events`, `.event_format =
+  .canonical`). Code written for 0.7.0 compiles unchanged and behaves
+  differently. `poll` now drains every QUIC session's inboxes (0.7.0
+  drained only attached sessions), and it names the events `request`,
+  `reply`, `request_failed` and `delivery`, not `quic_*`. An embedder that
+  also reads a session itself (`quicSession(id).recvReliable()` or
+  `.recvDatagram()`) finds nothing, and its replies disappear with no
+  error. mruby-quic hit this: 9 tests failed and 1 crashed, and the build
+  gave no warning. A Debug build now panics on that second reader, and
+  the message names the fix. To keep the 0.7.0 behavior, set both fields:
+
+  ```zig
+  var node = try qmsg.Node.init(allocator, .{
+      .delivery = .legacy,
+      .event_format = .legacy_transport,
+  });
+  ```
+
+  `request`, `cancelRequest`, and `reply` use a local `RequestId` and
+  retained reply handles. See [MIGRATION.md](docs/MIGRATION.md).
 - Accepted requests reserve bounded terminal outcomes until `poll` or
   `takeOutcome` consumes them. Separate count and byte budgets cover pending
   requests, replies, and ordinary events. Reply routing survives request-body

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const message = @import("message.zig");
 const queue = @import("queue.zig");
 const socket = @import("socket.zig");
@@ -522,9 +523,34 @@ pub const QuicSessionRuntime = struct {
     /// for this session (per redial-generation session).
     subscriptions_synced: bool = false,
     subscriptions_queued: ?protocol.pubsub.SubscriptionSet = null,
+    /// The first reader of this session's inboxes: `poll`, which
+    /// drains every session it owns into events, or a direct
+    /// `recvReliable` / `recvDatagram` call. Two readers split one
+    /// stream of messages, and each misses what the other took, with
+    /// no error. A Debug build panics on the second (`claimInbox`).
+    inbox_reader: InboxReader = .none,
+
+    const InboxReader = enum { none, poll, direct };
 
     pub fn id(self: QuicSessionRuntime) QuicSessionId {
         return self.runtime.id();
+    }
+
+    /// Records the first reader of the inboxes; false for a second one.
+    fn claimInbox(self: *QuicSessionRuntime, reader: InboxReader) bool {
+        if (self.inbox_reader == .none) self.inbox_reader = reader;
+        return self.inbox_reader == reader;
+    }
+
+    fn claimInboxOrPanic(self: *QuicSessionRuntime, reader: InboxReader) void {
+        if (self.claimInbox(reader) or builtin.mode != .debug) return;
+        std.debug.panic(
+            "qmsg: QUIC session {d} has two inbox readers: Node.poll and a direct " ++
+                "recvReliable/recvDatagram. Each one misses what the other read. Under " ++
+                ".delivery = .events (the default) poll reads every session: use its events, " ++
+                "or pass .delivery = .legacy and .event_format = .legacy_transport to Node.init.",
+            .{self.id()},
+        );
     }
 
     pub fn appSession(self: *QuicSessionRuntime) *session.Session {
@@ -543,8 +569,11 @@ pub const QuicSessionRuntime = struct {
     /// the node's pending entry for their `(session, stream)` — a
     /// later sweep cannot misclassify a reply the consumer already
     /// holds. (Draining through `.runtime.recvReliable` directly
-    /// bypasses settlement; see `Node.settleQuicRequest`.)
+    /// bypasses settlement; see `Node.settleQuicRequest`.) Not for a
+    /// session that `poll` reads (every session under the default
+    /// `.delivery = .events`): a Debug build panics on the second reader.
     pub fn recvReliable(self: *QuicSessionRuntime) ?transport.quic_session_runtime.ReceivedReliable {
+        self.claimInboxOrPanic(.direct);
         const received = self.runtime.recvReliable() orelse return null;
         _ = self.node.settleQuicRequest(self.id(), received.stream_id);
         return received;
@@ -587,7 +616,14 @@ pub const QuicSessionRuntime = struct {
         try self.datagram_outbox.append(self.runtime.allocator, owned);
     }
 
+    /// Pops one received datagram. Like `recvReliable`, not for a
+    /// session that `poll` reads.
     pub fn recvDatagram(self: *QuicSessionRuntime) ?transport.quic_datagram.ReceivedDatagram {
+        self.claimInboxOrPanic(.direct);
+        return self.popDatagram();
+    }
+
+    fn popDatagram(self: *QuicSessionRuntime) ?transport.quic_datagram.ReceivedDatagram {
         if (self.datagram_inbox.items.len == 0) return null;
         return self.datagram_inbox.orderedRemove(0);
     }
@@ -1443,6 +1479,7 @@ pub const Node = struct {
         for (self.quic_sessions.items) |runtime| {
             if (!runtime.runtime.event_delivery and self.options.delivery != .events) continue;
             if (self.quicSocketAttachment(runtime.id()) != null) continue;
+            runtime.claimInboxOrPanic(.poll);
 
             while (runtime.runtime.peekReliableStreamId()) |stream_id| {
                 const is_request = transport.quic_session_runtime.isPeerBidiStreamId(
@@ -1488,7 +1525,7 @@ pub const Node = struct {
                 }
             }
 
-            while (runtime.recvDatagram()) |received_datagram| {
+            while (runtime.popDatagram()) |received_datagram| {
                 var received = received_datagram;
                 const incoming = received.takeMessage();
                 try self.emit(.{ .quic_delivery = .{
@@ -2049,7 +2086,7 @@ pub const Node = struct {
             const can_dispatch_datagram = comptime dispatcherHas(@TypeOf(dispatcher), "dispatchQuicDatagram");
             if (attachment == null and !can_dispatch_datagram) continue;
 
-            var received = runtime.recvDatagram() orelse continue;
+            var received = runtime.popDatagram() orelse continue;
             var incoming = received.takeMessage();
 
             if (attachment) |endpoint| {
@@ -6420,6 +6457,41 @@ test "canonical event delivery has one consumer even when runOnce is called" {
         if (event.* == .request) requests += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), requests);
+}
+
+test "poll and a direct read are two readers of one QUIC session" {
+    var n = try Node.init(std.testing.allocator, .{});
+    defer n.deinit();
+    const sess = try n.openQuicSession(.{ .role = .server });
+    try readyQuicRuntimeForTest(sess, "client", false);
+    try queueReliableForTest(sess, 0, .{ .subject = "echo" });
+    var events: [8]Event = undefined;
+    const count = try n.poll(&events);
+    for (events[0..count]) |*event| event.deinit();
+    // mruby-quic's case: under the default `.delivery = .events` poll
+    // took the request, and a direct `recvReliable` after it would find
+    // nothing. A Debug build panics on that second reader.
+    try std.testing.expectEqual(@as(usize, 0), sess.runtime.inbox.items.len);
+    try std.testing.expect(!sess.claimInbox(.direct));
+    try std.testing.expect(sess.claimInbox(.poll));
+}
+
+test "a legacy Node leaves a session's inboxes to its direct reader" {
+    var n = try Node.init(std.testing.allocator, .{ .delivery = .legacy, .event_format = .legacy_transport });
+    defer n.deinit();
+    const sess = try n.openQuicSession(.{ .role = .server });
+    try readyQuicRuntimeForTest(sess, "client", false);
+    try queueReliableForTest(sess, 0, .{ .subject = "echo" });
+    var events: [8]Event = undefined;
+    var count = try n.poll(&events);
+    for (events[0..count]) |*event| event.deinit();
+    var received = sess.recvReliable() orelse return error.TestUnexpectedResult;
+    defer received.deinit();
+    try std.testing.expectEqualStrings("echo", received.message.subject);
+    try std.testing.expect(sess.recvDatagram() == null);
+    count = try n.poll(&events);
+    for (events[0..count]) |*event| event.deinit();
+    try std.testing.expectEqual(QuicSessionRuntime.InboxReader.direct, sess.inbox_reader);
 }
 
 test "canonical inproc admission denies before surfacing a request" {

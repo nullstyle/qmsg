@@ -62,6 +62,7 @@ Direct inbox consumers must select `NodeOptions.delivery = .legacy`.
 The node-level session wrapper's `recvReliable` settles a registered request
 when it returns the reply. Consumers that bypass that wrapper must call
 `settleQuicRequest` themselves. Do not drain the inbox in parallel with the
-default canonical event consumer. The separate
+default canonical event consumer: a Debug build panics when the wrapper
+reads a session that `poll` also reads. The separate
 `event_format = .legacy_transport` option restores `quic_reply` and
 `quic_request_failed` names for consumers still using that event schema.
