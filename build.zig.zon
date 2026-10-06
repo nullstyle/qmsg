@@ -1,6 +1,6 @@
 .{
     .name = .qmsg,
-    .version = "0.8.0",
+    .version = "0.8.1",
     .fingerprint = 0x650c9e5831497a83,
     .minimum_zig_version = "0.17.0",
     .paths = .{
@@ -21,6 +21,19 @@
             .url = "https://github.com/nullstyle/paseto-zig/archive/refs/tags/0.4.0.tar.gz",
             .hash = "paseto-0.4.0-EBI95RcXCADs0jz3tebS1xMaAiT2r3Tpx8HsF5LfpqOS",
         },
+        // v0.30.1 (tag at ccf6ae2). Behavior only: no wire change, no API
+        // change, the same option map. A probe timeout is not a loss (RFC
+        // 9002 section 6.2.4): the Application space's probe timeout no
+        // longer declares the oldest packet lost nor cuts the congestion
+        // window; the probe carries its frames again, and the thresholds
+        // decide when its ACK comes. The handshake's probe timeout is
+        // bounded at about a second and runs from the last send, so a
+        // client waiting for a lost server flight probes every second.
+        // `quic.unixWallClockUs` compiles on Zig 0.17.0 now, and
+        // `Server.adoptLoopThread()` is new; qmsg calls neither. Not
+        // v0.30.0: it did not compile on Windows. The set (http3-zig,
+        // capnp-zig, qmesh-zig, nest, mruby-quic) moved with it on
+        // 2026-10-06. Before it:
         // v0.29.0 (tag at b9a15e6). It holds v0.25.0's security fix (one
         // short datagram from anyone who saw a packet of the connection, or
         // one a small receive buffer cut short, made `Connection.handle`
@@ -54,8 +67,8 @@
         // of them pins this same tag and passes the same option map (see
         // build.zig).
         .quic = .{
-            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.29.0.tar.gz",
-            .hash = "quic-0.29.0-DnSYvahYOwAdaHX-Ct3_iZGZycF387GmpAbI9G9wjFGg",
+            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.30.1.tar.gz",
+            .hash = "quic-0.30.1-DnSYvVnOOwBfpDxHQWI41E6YxM1RqqkCuven5bK46jXR",
         },
         // Optional Cap'n Proto body codec dependency (`-Dcapnp=true`).
         // LAZY: default builds and non-opting consumers never fetch or

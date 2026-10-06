@@ -7,6 +7,34 @@ changes.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-06
+
+The quic-zig v0.30.1 release: the pin moves, nothing else changes. The
+quic packages (http3-zig, capnp-zig, qmsg, qmesh-zig, nest, mruby-quic)
+pin one quic tag with one option map and move together; the set moved
+to v0.30.1 on 2026-10-06, and a binary that links qmsg with one of them
+holds one quic only with this release. 830/830 tests (316 unit, 182
+quic, 332 node-pair), 27/27 example steps and 3/3 capnp-test on macOS,
+the same counts as 0.8.0.
+
+### Changed
+
+- **quic-zig v0.30.1** (from v0.29.0; v0.30.0 skipped: it did not
+  compile on Windows). Behavior only: no wire change, no API change,
+  and the option map is the same; nothing qmsg calls was removed or
+  renamed. A probe timeout is not a loss (RFC 9002 section 6.2.4): the
+  Application space's probe timeout no longer declares the oldest
+  unacknowledged packet lost nor cuts the congestion window; the probe
+  carries its frames again, and the thresholds decide what was lost
+  when its ACK comes. So an ACK that was only late is no longer a
+  window cut, and a tail loss is still repaired at the probe timeout,
+  with the same data. The handshake's probe timeout is bounded at
+  about a second and runs from the last send: a client waiting for a
+  lost server flight probes every second, not at 1, 2, 4, 8 s. Also
+  new: `quic.unixWallClockUs` compiles on Zig 0.17.0, and
+  `Server.adoptLoopThread()` moves the Debug loop-thread latch at a
+  quiescent handoff; qmsg calls neither.
+
 ## [0.8.0] - 2026-10-06
 
 The quic-zig v0.29.0 release. 0.7.0 pins quic-zig v0.21.0, and no

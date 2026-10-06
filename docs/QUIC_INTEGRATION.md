@@ -106,7 +106,7 @@ Sockets own pattern state, deadlines, queues, and request correlation.
 ## Build Integration
 
 qmsg pins a quic-zig release tarball (`build.zig.zon`, URL + hash; today
-v0.29.0, module `quic`, with its BoringSSL as module `boringssl`). Its floor
+v0.30.1, module `quic`, with its BoringSSL as module `boringssl`). Its floor
 is the tagged Zig 0.17.0, and `mise.toml` pins the same Zig. Move the two
 together: quic-zig's `build.zig` refuses a Zig older than its floor.
 
