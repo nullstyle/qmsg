@@ -7,6 +7,22 @@ changes.
 
 ## [Unreleased]
 
+- **quic-zig v0.29.0** (from v0.27.0; v0.28.0 and v0.28.1 skipped). No
+  security fix and no wire change. Nothing qmsg calls was removed or
+  renamed, and the option map is the same. v0.28.0 keeps the end of a
+  stream that a `tick` reclaimed: `quic.app` reports `.fin` or `.reset`
+  for it, where it reported `.reaped`, and a stream the application
+  stopped (`streamStopSending`) now ends as `.reaped`. qmsg needs no
+  change. It reads every stream before `tick` (see the dial-loop fix
+  below). It stops a stream only when it cancels the request on it, and
+  it removes the pending entry first, so a `.reaped` end finds nothing
+  to fail. It does not use `runUdpClient` (whose hook now runs before
+  `tick`), `streamReadFin` or `Outbox.finish`. v0.28.1 fixes a 32-bit
+  build. v0.29.0 takes a late packet as late, not lost, costs about
+  91 KB per connection (was 1.09 MB), and lets a client connect through
+  loss. qmsg sets none of its new `Server.Config` fields. 824/824 tests
+  (313 unit, 182 quic, 329 node-pair), 27/27 example steps and 3/3
+  capnp-test on v0.29.0, the same counts as on v0.27.0.
 - **A dial session no longer reports a complete reply as `peer_closed`.**
   quic-zig reclaims a stream at the end of `tick` once both halves are
   done. When the end of a stream comes in a frame of its own (a FIN with

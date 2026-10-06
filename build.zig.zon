@@ -21,7 +21,7 @@
             .url = "https://github.com/nullstyle/paseto-zig/archive/refs/tags/0.4.0.tar.gz",
             .hash = "paseto-0.4.0-EBI95RcXCADs0jz3tebS1xMaAiT2r3Tpx8HsF5LfpqOS",
         },
-        // v0.27.0 (tag at 9d2ab6e). It holds v0.25.0's security fix (one
+        // v0.29.0 (tag at b9a15e6). It holds v0.25.0's security fix (one
         // short datagram from anyone who saw a packet of the connection, or
         // one a small receive buffer cut short, made `Connection.handle`
         // fail and the connection close; such a packet is now dropped) and
@@ -30,9 +30,17 @@
         // than 1200 bytes, a close during the handshake reaches the peer,
         // and a key update waits for the confirmed handshake. v0.27.0 adds
         // session tickets that live through a server restart; qmsg sets
-        // none of the new fields. The package accepts `optimize` too (since
-        // v0.24.1), which the shared map does not pass. Since v0.24.0 there
-        // is no lifetime stream cap.
+        // none of the new fields. v0.28.0 keeps the end of a stream that a
+        // `tick` reclaimed: `quic.app` reports it as `.fin` or `.reset`,
+        // not `.reaped`, and a stream the app stopped ends as `.reaped`.
+        // qmsg reads before `tick`, and it stops a stream only when it
+        // cancels the request on it. v0.28.1 is a 32-bit build fix. v0.29.0
+        // takes a late packet as late, not lost, costs about 91 KB per
+        // connection (was 1.09 MB), and connects through handshake loss; no
+        // wire change, and qmsg sets none of its new `Server.Config`
+        // fields. The package accepts `optimize` too (since v0.24.1), which
+        // the shared map does not pass. Since v0.24.0 there is no lifetime
+        // stream cap.
         // The stream limit is a window of streams open at once, and an id
         // comes back only when its stream is closed in both directions, so
         // qmsg opens local streams in id order and waits on
@@ -41,11 +49,13 @@
         // no_reply message. An accepted request's stream closes with its
         // reply; a request that gets no reply stays open until the
         // requester's deadline or cancel ends it. Its floor is the tagged Zig
-        // 0.17.0. Same pin (and option map, see build.zig) as nest and
-        // qmesh-zig, so a binary that links all three has one quic module.
+        // 0.17.0. A binary that links qmsg with nest, qmesh-zig, capnp-zig,
+        // http3-zig or mruby-quic has one quic module only when every one
+        // of them pins this same tag and passes the same option map (see
+        // build.zig).
         .quic = .{
-            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.27.0.tar.gz",
-            .hash = "quic-0.27.0-DnSYvdkEOQDHm_pJQOp6Vo47gQ1Cm7-0c2sgVV0M6Xht",
+            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.29.0.tar.gz",
+            .hash = "quic-0.29.0-DnSYvahYOwAdaHX-Ct3_iZGZycF387GmpAbI9G9wjFGg",
         },
         // Optional Cap'n Proto body codec dependency (`-Dcapnp=true`).
         // LAZY: default builds and non-opting consumers never fetch or
