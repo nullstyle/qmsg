@@ -146,7 +146,9 @@ pub const Request = struct {
 /// everything `RepSocket.reply` reads off a received request, so
 /// event-driven embedders that did not keep the owned `Request` alive
 /// (they reply later, from just the id they saw in an event) can still
-/// answer correctly.
+/// answer correctly. Without `handle` the reply goes by id alone: a
+/// `Socket(.req)` requester takes it, but a `Node` requester matches
+/// the local correlation that only the handle carries, and drops it.
 pub const ReplyKey = struct {
     handle: ?ReplyHandle = null,
     id: message.MessageId,

@@ -80,6 +80,10 @@ pub const MessageDropped = struct {
 ///
 /// `msg` is owned by the event. Reply through `Node.replyInproc`
 /// (or `replyErrorInproc`) while the event is alive, then `deinit`.
+/// Both reply through `msg.reply_handle`, which carries the
+/// requester's local correlation. To reply after the event is freed,
+/// keep a copy that retains the handle (`msg.reply_handle.?.retain()`
+/// or `msg.clone`). A copy without it gets `error.ReplyHandleMissing`.
 pub const RequestEvent = struct {
     endpoint_id: InprocRepId = 0,
     stream_id: ?u64 = null,
@@ -1215,52 +1219,43 @@ pub const Node = struct {
         return false;
     }
 
-    /// Replies to a request surfaced as a `request` event, while the
-    /// event is still alive (its subject is echoed when the outgoing
-    /// reply leaves the subject empty).
     /// Reply using a retained local capability, independent of request payload lifetime.
     pub fn reply(self: *Node, handle: message.ReplyHandle, outgoing: message.OutgoingMessage) !void {
         try handle.reply(outgoing);
         self.counters.sent += 1;
     }
 
+    /// Replies to a request surfaced as a `request` event through its
+    /// reply handle (the subject is echoed when the outgoing reply
+    /// leaves the subject empty). The handle carries the requester's
+    /// local correlation, and a Node requester drops a reply without
+    /// it. So an event with no handle (a copy built field by field
+    /// after the event was freed) returns `error.ReplyHandleMissing`:
+    /// keep a copy with `msg.reply_handle.?.retain()` or `msg.clone`.
     pub fn replyInproc(
         self: *Node,
         incoming_request: *const RequestEvent,
         outgoing: message.OutgoingMessage,
     ) !void {
-        if (incoming_request.msg.reply_handle) |handle| return self.reply(handle, outgoing);
-        const endpoint = self.inprocRepEndpoint(incoming_request.endpoint_id) orelse return error.EndpointNotFound;
-        try endpoint.socket.replyKey(.{
-            .id = incoming_request.msg.id,
-            .deadline_ms = incoming_request.msg.deadline_ms,
-            .subject = incoming_request.msg.subject,
-        }, outgoing);
-        self.counters.sent += 1;
+        const handle = incoming_request.msg.reply_handle orelse return error.ReplyHandleMissing;
+        try self.reply(handle, outgoing);
     }
 
     /// Replies with an error message instead of a payload; the
     /// requester's `ReplyEvent` carries `flags.err` plus the
-    /// `qmsg-error-code` / `qmsg-error-message` headers.
+    /// `qmsg-error-code` / `qmsg-error-message` headers. Like
+    /// `replyInproc`, it needs the event's reply handle.
     pub fn replyErrorInproc(
         self: *Node,
         incoming_request: *const RequestEvent,
         app_error: socket.ErrorReply,
     ) !void {
-        if (incoming_request.msg.reply_handle) |handle| {
-            const headers = [_]message.Header{
-                .{ .name = socket.ErrorReply.code_header, .value = app_error.code },
-                .{ .name = socket.ErrorReply.message_header, .value = app_error.message },
-            };
-            return self.reply(handle, .{ .subject = app_error.subject, .flags = .{ .err = true }, .headers = &headers, .body = app_error.message });
-        }
-        const endpoint = self.inprocRepEndpoint(incoming_request.endpoint_id) orelse return error.EndpointNotFound;
-        try endpoint.socket.replyErrorKey(.{
-            .id = incoming_request.msg.id,
-            .deadline_ms = incoming_request.msg.deadline_ms,
-            .subject = incoming_request.msg.subject,
-        }, app_error);
-        self.counters.sent += 1;
+        const handle = incoming_request.msg.reply_handle orelse return error.ReplyHandleMissing;
+        const headers = [_]message.Header{
+            .{ .name = socket.ErrorReply.code_header, .value = app_error.code },
+            .{ .name = socket.ErrorReply.message_header, .value = app_error.message },
+        };
+        try self.reply(handle, .{ .subject = app_error.subject, .flags = .{ .err = true }, .headers = &headers, .body = app_error.message });
     }
 
     /// Binds one inproc pub endpoint; subscribers dial this address
@@ -1368,11 +1363,6 @@ pub const Node = struct {
 
         self.inproc_sub = sub;
         owns_sub = false;
-    }
-
-    fn inprocRepEndpoint(self: *Node, id: InprocRepId) ?*InprocRepEndpoint {
-        if (id >= self.inproc_rep_endpoints.items.len) return null;
-        return self.inproc_rep_endpoints.items[id];
     }
 
     fn nowMs(self: *const Node) u64 {
@@ -6308,6 +6298,65 @@ test "canonical inproc generations reject late replies after a wire ID is reused
     try std.testing.expectEqual(new_id, reply.reply.request_id);
     try std.testing.expectEqual(@as(u64, 42), reply.reply.msg.id);
     try std.testing.expectEqualStrings("new", reply.reply.msg.body);
+}
+
+test "replyInproc on a request copy without its reply handle fails, and a retained copy answers" {
+    const allocator = std.testing.allocator;
+    var network = transport.inproc.Network.init(allocator);
+    defer network.deinit();
+    var server = try Node.init(allocator, .{});
+    defer server.deinit();
+    _ = try server.listenInprocRep(&network, "kept", .{});
+    var client = try Node.init(allocator, .{});
+    defer client.deinit();
+    const dial = try client.dialInprocReq(&network, "kept", .{});
+    const id = try client.request(.{ .inproc = dial }, .{ .subject = "work", .body = "x" });
+
+    var events: [4]Event = undefined;
+    const count = try server.poll(&events);
+    var request: ?RequestEvent = null;
+    for (events[0..count]) |*event| {
+        if (event.* == .request and request == null) request = event.request else event.deinit();
+    }
+    // Two copies that outlive the event, built field by field as an
+    // embedder keeps a request it answers later. Only `kept` retains
+    // the reply handle.
+    var bare: RequestEvent = undefined;
+    var kept: RequestEvent = undefined;
+    {
+        var served = request orelse return error.TestUnexpectedResult;
+        defer served.deinit();
+        bare = .{
+            .endpoint_id = served.endpoint_id,
+            .session_id = served.session_id,
+            .msg = try message.Message.init(allocator, .{ .subject = served.msg.subject, .id = served.msg.id }),
+        };
+        errdefer bare.deinit();
+        kept = .{
+            .endpoint_id = served.endpoint_id,
+            .session_id = served.session_id,
+            .msg = try message.Message.init(allocator, .{ .subject = served.msg.subject, .id = served.msg.id }),
+        };
+        kept.msg.reply_handle = served.msg.reply_handle.?.retain();
+    }
+    defer bare.deinit();
+    defer kept.deinit();
+
+    // By id alone the reply would carry no correlation, and the client
+    // Node would drop it (`message_dropped`) and fail the request at its
+    // deadline. The replier gets the error instead.
+    try std.testing.expectError(error.ReplyHandleMissing, server.replyInproc(&bare, .{ .subject = "", .body = "lost" }));
+    try std.testing.expectError(error.ReplyHandleMissing, server.replyErrorInproc(&bare, .{ .code = "lost" }));
+    try server.replyInproc(&kept, .{ .subject = "", .body = "kept" });
+
+    var no_events: [0]Event = .{};
+    _ = try client.poll(&no_events);
+    var outcome = client.takeOutcome(id) orelse return error.TestUnexpectedResult;
+    defer outcome.deinit();
+    try std.testing.expectEqual(id, outcome.reply.request_id);
+    try std.testing.expectEqualStrings("kept", outcome.reply.msg.body);
+    try std.testing.expectEqual(@as(usize, 0), client.stats().dropped);
+    try std.testing.expectEqual(@as(usize, 0), client.eventCount());
 }
 
 test "canonical small inproc requests fit their actual event byte budget" {

@@ -7,6 +7,21 @@ changes.
 
 ## [Unreleased]
 
+- **BREAKING (behavior): `Node.replyInproc` and `replyErrorInproc`
+  return `error.ReplyHandleMissing` for an event without a reply
+  handle.** They fell back to a reply by message id alone
+  (`RepSocket.replyKey`). That reply carries no local correlation, and a
+  requesting `Node` matches on it: it dropped the reply
+  (`message_dropped`, `Stats.dropped`), the request failed with
+  `deadline_exceeded`, and the replier saw no error. (A `Socket(.req)`
+  requester took the reply, because it treats a missing correlation as
+  a match.) Every `request` event from `poll` has a handle, so only a
+  copy built field by field lacks one. mruby-quic built such a copy to
+  answer a request after its event was freed. Keep a copy with
+  `msg.reply_handle.?.retain()` or `msg.clone`; `Message.deinit` releases
+  the handle. A test in `src/node.zig` sends from one `Node` to another:
+  the copy without the handle gets the error, and the retained copy's
+  reply completes the request.
 - **quic-zig v0.29.0** (from v0.27.0; v0.28.0 and v0.28.1 skipped). No
   security fix and no wire change. Nothing qmsg calls was removed or
   renamed, and the option map is the same. v0.28.0 keeps the end of a

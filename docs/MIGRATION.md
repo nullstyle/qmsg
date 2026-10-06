@@ -57,6 +57,12 @@ keeping the request body. It reports `EndpointClosed` after its target is
 destroyed; it does not keep a connection alive. A final reply completes the
 handle, so another reply returns `InvalidState`.
 
+`replyInproc` and `replyErrorInproc` reply through the same handle. If you
+keep a copy of a request event, retain the handle in the copy
+(`msg.reply_handle.?.retain()`, or `msg.clone`). A copy without it returns
+`error.ReplyHandleMissing`. Before 0.8.0 such a reply went by message id
+alone, and a requesting `Node` dropped it with no error at the replier.
+
 Use `Node.cancelRequest(request_id)` for cancellation. A terminal outcome stays
 available until consumed by `poll` or `takeOutcome(request_id)`. `takeOutcome`
 removes one already-completed result; it does not pump network I/O or advance
