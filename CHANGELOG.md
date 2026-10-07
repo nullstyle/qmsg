@@ -7,6 +7,42 @@ changes.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-10-07
+
+The quic-zig v0.32.0 release: the pin moves, nothing else changes. The
+quic packages (http3-zig, capnp-zig, qmsg, qmesh-zig, nest, mruby-quic)
+pin one quic tag with one option map and move together; the set moved
+to v0.32.0 on 2026-10-07 in one step (v0.31.1 skipped as a step, not as
+content), and a binary that links qmsg with one of them holds one quic
+only with this release. 830/830 tests (316 unit, 182 quic, 332 node-pair), 27/27 example steps and 3/3 capnp-test on macOS, Zig 0.17.0: the same counts as 0.8.1.
+
+### Changed
+
+- **quic-zig v0.32.0** (from v0.30.1). No wire change, no API change,
+  the same option map; nothing qmsg calls was removed or renamed.
+  v0.31.0: a client confirms the handshake on an ACK of its own 1-RTT
+  packet, so a lost HANDSHAKE_DONE no longer holds it unconfirmed, and
+  `Server.feed` leaves a `.dropped` datagram as it came. v0.31.1: the
+  idle timer follows RFC 9000 section 10.1 (a send restarts it only for
+  the first ack-eliciting packet since the last packet received, a
+  received packet counts once it opened, the timeout is at least three
+  probe timeouts), so a dead peer's connection ends one idle timeout
+  after the first probe, not three: qmsg's dead-peer gate found that
+  regression of v0.30.1 (a 2 s timeout noticed a dead peer after 6 s,
+  about 2 runs in 5 failed) and confirmed the fix (2.1 s, N=6).
+  v0.32.0: the receive window an endpoint keeps open is the one it
+  announced; through v0.31.1 the credit given after the initial window
+  was a fixed 1 MiB per stream and 16 MiB per connection whatever was
+  announced. qmsg's bidirectional streams and its connection
+  (`QuicOptions`: 1 MiB and 16 MiB) announce exactly those, so nothing
+  changes there; its unidirectional streams announce 64 KiB, which is
+  now their window for life, not 1 MiB after the first 64 KiB. New
+  knobs qmsg does not set: `max_buffered_send` on Connection,
+  Client.Config and Server.Config (the sender's window per stream,
+  1 MiB by default). The ACK frame carries 64 ranges below the largest
+  (was 16), and the loss thresholds that widen for reordering shrink
+  back after 16 clean round trips.
+
 ## [0.8.1] - 2026-10-06
 
 The quic-zig v0.30.1 release: the pin moves, nothing else changes. The

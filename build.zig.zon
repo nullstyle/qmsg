@@ -1,6 +1,6 @@
 .{
     .name = .qmsg,
-    .version = "0.8.1",
+    .version = "0.8.2",
     .fingerprint = 0x650c9e5831497a83,
     .minimum_zig_version = "0.17.0",
     .paths = .{
@@ -21,6 +21,26 @@
             .url = "https://github.com/nullstyle/paseto-zig/archive/refs/tags/0.4.0.tar.gz",
             .hash = "paseto-0.4.0-EBI95RcXCADs0jz3tebS1xMaAiT2r3Tpx8HsF5LfpqOS",
         },
+        // v0.32.0 (tag at ffdb251): three releases in one move, the set
+        // (http3-zig, capnp-zig, qmesh-zig, nest, mruby-quic) with it on
+        // 2026-10-07 (v0.31.1 skipped as a step, not as content). No wire
+        // change, no API change, the same option map. v0.31.0: a client
+        // confirms the handshake on an ACK of its own 1-RTT packet, and
+        // `Server.feed` leaves a `.dropped` datagram as it came. v0.31.1:
+        // the idle timer follows RFC 9000 section 10.1, so a dead peer's
+        // connection ends one idle timeout after the first probe, not
+        // three (qmsg found that regression of v0.30.1 with its dead-peer
+        // gate). v0.32.0: the receive window an endpoint keeps open is the
+        // one it announced (before, a fixed 1 MiB per stream and 16 MiB
+        // per connection after the initial window): qmsg's bidi streams
+        // and connection announce exactly those, no change there; its
+        // unidirectional streams announce 64 KiB (`QuicOptions`), which is
+        // now their window for life, not 1 MiB after the first 64 KiB.
+        // Also `max_buffered_send` on Connection, Client.Config and
+        // Server.Config (the sender's window per stream, default 1 MiB,
+        // qmsg sets none), 64 ACK ranges in a frame (was 16), and the
+        // loss thresholds that widen for reordering shrink back after 16
+        // clean round trips. Before it:
         // v0.30.1 (tag at ccf6ae2). Behavior only: no wire change, no API
         // change, the same option map. A probe timeout is not a loss (RFC
         // 9002 section 6.2.4): the Application space's probe timeout no
@@ -67,8 +87,8 @@
         // of them pins this same tag and passes the same option map (see
         // build.zig).
         .quic = .{
-            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.30.1.tar.gz",
-            .hash = "quic-0.30.1-DnSYvVnOOwBfpDxHQWI41E6YxM1RqqkCuven5bK46jXR",
+            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.32.0.tar.gz",
+            .hash = "quic-0.32.0-DnSYvcGOPADCEZMispvPbD9RznRtyIGq77zHIgmS8iVl",
         },
         // Optional Cap'n Proto body codec dependency (`-Dcapnp=true`).
         // LAZY: default builds and non-opting consumers never fetch or
