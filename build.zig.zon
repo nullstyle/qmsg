@@ -1,6 +1,6 @@
 .{
     .name = .qmsg,
-    .version = "0.8.2",
+    .version = "0.8.3",
     .fingerprint = 0x650c9e5831497a83,
     .minimum_zig_version = "0.17.0",
     .paths = .{
@@ -86,9 +86,10 @@
         // http3-zig or mruby-quic has one quic module only when every one
         // of them pins this same tag and passes the same option map (see
         // build.zig).
+        // v0.33.0 (2026-10-07): cluster A move; the quic release note has what changed.
         .quic = .{
-            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.32.0.tar.gz",
-            .hash = "quic-0.32.0-DnSYvcGOPADCEZMispvPbD9RznRtyIGq77zHIgmS8iVl",
+            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.33.0.tar.gz",
+            .hash = "quic-0.33.0-DnSYvfk6PQAwBH4pHnhv97zhZeAoJ_0JZRjDIPu_jG8u",
         },
         // Optional Cap'n Proto body codec dependency (`-Dcapnp=true`).
         // LAZY: default builds and non-opting consumers never fetch or
