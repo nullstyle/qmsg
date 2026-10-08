@@ -1,6 +1,6 @@
 .{
     .name = .qmsg,
-    .version = "0.8.3",
+    .version = "0.8.4",
     .fingerprint = 0x650c9e5831497a83,
     .minimum_zig_version = "0.17.0",
     .paths = .{
@@ -87,9 +87,10 @@
         // of them pins this same tag and passes the same option map (see
         // build.zig).
         // v0.33.0 (2026-10-07): cluster A move; the quic release note has what changed.
+        // v0.37.1 (2026-10-08): cluster A move; the quic release note has what changed.
         .quic = .{
-            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.33.0.tar.gz",
-            .hash = "quic-0.33.0-DnSYvfk6PQAwBH4pHnhv97zhZeAoJ_0JZRjDIPu_jG8u",
+            .url = "https://github.com/nullstyle/quic-zig/archive/refs/tags/v0.37.1.tar.gz",
+            .hash = "quic-0.37.1-DnSYvTlfPwChWkn-M8TGtX81DkFobQDQQat0GMff1YRe",
         },
         // Optional Cap'n Proto body codec dependency (`-Dcapnp=true`).
         // LAZY: default builds and non-opting consumers never fetch or

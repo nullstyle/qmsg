@@ -7,6 +7,13 @@ changes.
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-10-08
+
+The quic-zig v0.37.1 release: the pin moves, nothing else changes
+(cluster A: nest, qmsg, qmesh-zig and mruby-quic move together; the quic
+release note has what changed). Gates: 
+
+
 ## [0.8.3] - 2026-10-07
 
 The quic-zig v0.33.0 release: the pin moves, nothing else changes
