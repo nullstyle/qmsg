@@ -7,6 +7,13 @@ changes.
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-10-08
+
+The quic-zig v0.37.2 release: the pin moves, nothing else changes
+(cluster A: nest, qmsg, qmesh-zig and mruby-quic move together; the quic
+release note has what changed). Gates: qmsg-test: 15/15 steps succeeded; 830/830 tests passed; qmsg-quic-test: 11/11 steps succeeded; qmsg-node-pair-test: 11/11 steps succeeded; qmsg-examples: 27/27 steps succeeded; qmsg-capnp-test: 3/3 steps succeeded; 
+
+
 ## [0.8.4] - 2026-10-08
 
 The quic-zig v0.37.1 release: the pin moves, nothing else changes
