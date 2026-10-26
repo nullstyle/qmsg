@@ -128,6 +128,47 @@ verification for the deployment as well. To require protocol capabilities, set
 bit. `findReadySessionSupporting(peer_spki, required_patterns)` reuses only an
 authenticated ready session satisfying those requirements.
 
+## QUIC heartbeat and graceful shutdown
+
+Heartbeats are enabled only when both HELLOs offer a nonzero
+`heartbeat_interval_ms`; the effective interval is the smaller offer. The
+runtime answers PING with PONG and tracks idle probes on the caller's clock.
+Lifecycle response state is bounded, including when flow control prevents a
+response from being written.
+
+`closeQuicSession(id)` retains its immediate-abort behavior. To drain a ready
+session, call:
+
+```zig
+try node.goawayQuicSession(session_id, 0, "shutdown", now_us, 5_000_000);
+```
+
+The session stops accepting new work and `sessionStatus(id)` reports
+`.closing`. Existing streams and retained reply handles continue to run for
+the explicit drain interval; keep ticking and polling. The connection closes
+at the deadline even if application work remains. Empty transport queues do
+not shorten this interval, since asynchronous application work may still own a
+reply handle. Receiving GOAWAY starts the configured
+`QuicOptions.drain_timeout_ms` interval (default 5000 ms).
+
+The additive `session_goaway` event carries `session_id`, `code`, and an owned
+`reason`. Update exhaustive event switches and call `Event.deinit` as for
+message events. Like other ordinary lifecycle events, this notification is
+subject to event queue bounds; `sessionStatus` remains available independently.
+Accepted requests still retain one terminal outcome if the session closes.
+
+`Node.nextTimer()` includes heartbeat and drain deadlines. Foreign owners must
+set `EmbeddedDispatch.setHeartbeatClock(now_us)` before servicing seats and
+combine each runtime's `nextLifecycleTimer()` with their own QUIC deadlines.
+Use a monotonic microsecond clock and continue servicing inbound data before
+evaluating timeout expiration.
+
+Unknown control tags with bit 61 set are optional extensions and can be
+skipped on bounded follow-up control streams. Unknown required tags,
+malformed frames, and invalid startup HELLOs remain errors. The standalone
+control decoder remains strict. ALPN and the HELLO wire version remain
+`qmsg/1` and `1`.
+
 ## Explicit compatibility mode
 
 Older direct-inbox integrations can opt into:

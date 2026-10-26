@@ -74,6 +74,7 @@ const Options = struct {
     cert_binding: auth.CertBinding = .off,
     /// Negotiated idle timeout, both directions.
     max_idle_timeout_ms: u64 = 30_000,
+    heartbeat_interval_ms: u64 = 0,
 };
 
 const Pair = struct {
@@ -117,6 +118,7 @@ const Pair = struct {
                 .role_flags = control.RoleFlags.server,
                 .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
                 .max_idle_timeout_ms = options.max_idle_timeout_ms,
+                .heartbeat_interval_ms = options.heartbeat_interval_ms,
                 .auth_config = .{ .cert_binding = options.cert_binding },
             },
         });
@@ -141,6 +143,7 @@ const Pair = struct {
                 .role_flags = control.RoleFlags.client,
                 .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
                 .max_idle_timeout_ms = options.max_idle_timeout_ms,
+                .heartbeat_interval_ms = options.heartbeat_interval_ms,
             },
         });
     }
@@ -253,6 +256,223 @@ test "two independent nodes complete a request across real UDP" {
         }
     }
     return error.ReplyTimeout;
+}
+
+test "lifecycle: real UDP peers answer heartbeats and stay ready" {
+    var pair: Pair = undefined;
+    pair.setUp(std.testing.allocator, .{ .heartbeat_interval_ms = 20 }) catch |err| return skipIfNoUdp(err);
+    defer pair.tearDown();
+    try pair.driveUntilReady();
+    for (0..1500) |_| {
+        try pair.step();
+        const client = pair.client.node.quicSession(pair.client_session) orelse return error.HealthyPeerLost;
+        const server = pair.serverRuntime() orelse return error.HealthyPeerLost;
+        try std.testing.expectEqual(quic.State.ready, client.state());
+        try std.testing.expectEqual(quic.State.ready, server.state());
+    }
+    try std.testing.expect((try pair.clientRuntime()).runtime.pings_received > 0);
+    try std.testing.expect(pair.serverRuntime().?.runtime.pings_received > 0);
+}
+
+test "lifecycle: GOAWAY keeps deferred replies alive and reports an owned event" {
+    var pair: Pair = undefined;
+    pair.setUp(std.testing.allocator, .{}) catch |err| return skipIfNoUdp(err);
+    defer pair.tearDown();
+    pair.server.node.options.delivery = .events;
+    pair.client.node.options.delivery = .events;
+    try pair.driveUntilReady();
+    const client_id = pair.client_session;
+    const server_id = pair.serverRuntime().?.id();
+    const request_id = try pair.client.node.request(.{ .quic = client_id }, .{ .subject = "work", .body = "deferred", .deadline_ms = 3000 });
+    var retained: ?message.ReplyHandle = null;
+    defer if (retained) |*handle| handle.deinit();
+    for (0..500) |_| {
+        try pair.step();
+        var events: [8]node_mod.Event = undefined;
+        const count = try pair.server.node.poll(&events);
+        defer for (events[0..count]) |*event| event.deinit();
+        for (events[0..count]) |event| if (event == .request) {
+            retained = event.request.msg.reply_handle.?.retain();
+        };
+        if (retained != null) break;
+    }
+    try std.testing.expect(retained != null);
+    try pair.server.node.goawayQuicSession(server_id, 42, "maintenance", pair.now_us, 500_000);
+    try std.testing.expectEqual(node_mod.SessionStatus.State.closing, pair.server.node.sessionStatus(server_id).?.state);
+    try std.testing.expectError(error.EndpointClosed, pair.server.node.request(.{ .quic = server_id }, .{ .subject = "new" }));
+    try std.testing.expectError(error.EndpointClosed, pair.server.node.publishQuic(server_id, .{ .subject = "new" }));
+    var goaway_count: usize = 0;
+    for (0..100) |_| {
+        try pair.step();
+        var events: [8]node_mod.Event = undefined;
+        const count = try pair.client.node.poll(&events);
+        defer for (events[0..count]) |*event| event.deinit();
+        for (events[0..count]) |event| if (event == .session_goaway) {
+            goaway_count += 1;
+            try std.testing.expectEqual(client_id, event.session_goaway.session_id);
+            try std.testing.expectEqual(@as(u64, 42), event.session_goaway.code);
+            try std.testing.expectEqualStrings("maintenance", event.session_goaway.reason);
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), goaway_count);
+    try std.testing.expectError(error.EndpointClosed, pair.client.node.request(.{ .quic = client_id }, .{ .subject = "new" }));
+    try pair.server.node.reply(retained.?, .{ .subject = "", .body = "finished during drain" });
+    var replies: usize = 0;
+    for (0..200) |_| {
+        try pair.step();
+        var events: [8]node_mod.Event = undefined;
+        const count = try pair.client.node.poll(&events);
+        defer for (events[0..count]) |*event| event.deinit();
+        for (events[0..count]) |event| switch (event) {
+            .reply => |reply| {
+                try std.testing.expectEqual(request_id, reply.request_id);
+                try std.testing.expectEqualStrings("finished during drain", reply.msg.body);
+                replies += 1;
+            },
+            .request_failed => return error.DeferredRequestFailed,
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), replies);
+    // Drain the full interval even though the application inbox is now empty.
+    try std.testing.expect(pair.serverRuntime() != null);
+    for (0..1000) |_| try pair.step();
+    try std.testing.expectError(error.EndpointClosed, pair.server.node.reply(retained.?, .{ .subject = "", .body = "late" }));
+}
+
+test "lifecycle: unanswered real UDP heartbeat fails each pending request once under event pressure" {
+    var pair: Pair = undefined;
+    pair.setUp(std.testing.allocator, .{ .heartbeat_interval_ms = 20 }) catch |err| return skipIfNoUdp(err);
+    defer pair.tearDown();
+    pair.server.node.options.delivery = .events;
+    pair.client.node.options.delivery = .events;
+    try pair.driveUntilReady();
+    const id = pair.serverRuntime().?.id();
+    pair.server.node.options.max_events = 0;
+    const request_id = try pair.server.node.request(.{ .quic = id }, .{ .subject = "unanswered", .deadline_ms = 10_000 });
+    pair.killClient();
+    var failures: usize = 0;
+    for (0..2500) |_| {
+        try pair.step();
+        var events: [8]node_mod.Event = undefined;
+        const count = try pair.server.node.poll(&events);
+        defer for (events[0..count]) |*event| event.deinit();
+        for (events[0..count]) |event| if (event == .request_failed and event.request_failed.request_id == request_id) {
+            failures += 1;
+            try std.testing.expectEqual(node_mod.RequestFailure.peer_closed, event.request_failed.failure);
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), failures);
+    try std.testing.expect(pair.server.node.takeOutcome(request_id) == null);
+}
+
+test "lifecycle: accepted GOAWAY uses the current clock after long uptime" {
+    var pair: Pair = undefined;
+    pair.setUp(std.testing.allocator, .{}) catch |err| return skipIfNoUdp(err);
+    defer pair.tearDown();
+    pair.server.node.options.delivery = .events;
+    pair.client.node.options.delivery = .events;
+    try pair.driveUntilReady();
+    pair.now_us = 20_000_000;
+    const server_id = pair.serverRuntime().?.id();
+    const request_id = try pair.client.node.request(.{ .quic = pair.client_session }, .{ .subject = "work", .deadline_ms = 30_000 });
+    var handle: ?message.ReplyHandle = null;
+    defer if (handle) |*owned| owned.deinit();
+    for (0..500) |_| {
+        try pair.step();
+        var events: [8]node_mod.Event = undefined;
+        const count = try pair.server.node.poll(&events);
+        defer for (events[0..count]) |*event| event.deinit();
+        for (events[0..count]) |event| if (event == .request) {
+            handle = event.request.msg.reply_handle.?.retain();
+        };
+        if (handle != null) break;
+    }
+    try std.testing.expect(handle != null);
+    const sent_at = pair.now_us;
+    try pair.client.node.goawayQuicSession(pair.client_session, 8, "client leaves", sent_at, 500_000);
+    var notified = false;
+    for (0..100) |_| {
+        try pair.step();
+        const runtime = pair.server.node.quicSession(server_id) orelse return error.DrainClosedEarly;
+        if (runtime.runtime.received_goaway != null) {
+            try std.testing.expectEqual(quic.State.ready, runtime.state());
+            try std.testing.expect(runtime.runtime.drain_deadline_us.? >= sent_at + 5_000_000);
+            notified = true;
+        }
+    }
+    try std.testing.expect(notified);
+    try pair.server.node.reply(handle.?, .{ .subject = "", .body = "deferred after client GOAWAY" });
+    for (0..200) |_| {
+        try pair.step();
+        var events: [8]node_mod.Event = undefined;
+        const count = try pair.client.node.poll(&events);
+        defer for (events[0..count]) |*event| event.deinit();
+        for (events[0..count]) |event| if (event == .reply and event.reply.request_id == request_id) return;
+    }
+    return error.DeferredReplyMissing;
+}
+
+test "lifecycle: a reset PONG sender closes only its peer and keeps Node tick usable" {
+    try resetPongContainment(false);
+    try resetPongContainment(true);
+}
+
+fn resetPongContainment(bad_on_client: bool) !void {
+    var pair: Pair = undefined;
+    pair.setUp(std.testing.allocator, .{}) catch |err| return skipIfNoUdp(err);
+    defer pair.tearDown();
+    pair.client.node.options.delivery = .events;
+    try pair.driveUntilReady();
+    const bad = if (bad_on_client) try pair.clientRuntime() else pair.serverRuntime().?;
+    const bad_node = if (bad_on_client) &pair.client.node else &pair.server.node;
+    const bad_id = bad.id();
+    const healthy_id = try pair.client.node.dialQuic(pair.target, .{
+        .server_name = "localhost",
+        .ca_pem = test_cert_pem,
+        .identity_verification = .none,
+        .client_cert_pem = test_cert_pem,
+        .client_key_pem = test_key_pem,
+        .transport = .{
+            .peer_id = "other-peer",
+            .supported_patterns = control.PatternBits.req | control.PatternBits.rep,
+        },
+    });
+    for (0..2000) |_| {
+        try pair.step();
+        if (pair.client.node.sessionStatus(healthy_id).?.state == .ready and pair.server.node.quic_sessions.items.len == 2) break;
+    }
+    try std.testing.expectEqual(node_mod.SessionStatus.State.ready, pair.client.node.sessionStatus(healthy_id).?.state);
+
+    // A real connection whose uni send half was reset has the same
+    // StreamClosed posture as a PONG stream stopped by peer STOP_SENDING.
+    // Keep the qmsg sender pending so serviceSeat must contain the error.
+    const conn = bad.connection.?;
+    const stream_id = try bad.runtime.stream_ids.nextUni();
+    _ = try conn.openUni(stream_id);
+    try conn.streamReset(stream_id, 99);
+    try std.testing.expectError(error.StreamClosed, conn.streamWrite(stream_id, "refused"));
+    bad.runtime.pong_sender = try @import("transport/quic_streams.zig").ControlStreamSender.init(std.testing.allocator, stream_id, &.{.{ .pong = .{ .token = 42 } }}, .{}, .{});
+    bad.runtime.pong_sender.?.opened = true;
+
+    // This used to escape StreamClosed: pumpSeat closed the peer, then the
+    // same serviceSeat repumped the retained sender through tickHeartbeat.
+    pair.now_us += step_us;
+    try bad_node.tick(pair.now_us);
+    if (bad_node.sessionStatus(bad_id)) |status| try std.testing.expectEqual(node_mod.SessionStatus.State.closing, status.state);
+
+    const request_id = try pair.client.node.request(.{ .quic = healthy_id }, .{ .subject = "user.get", .deadline_ms = 1000 });
+    for (0..2000) |_| {
+        try pair.step();
+        var events: [16]node_mod.Event = undefined;
+        const count = try pair.client.node.poll(&events);
+        defer for (events[0..count]) |*event| event.deinit();
+        for (events[0..count]) |event| if (event == .reply and event.reply.request_id == request_id) {
+            try std.testing.expectEqualStrings(reply_body, event.reply.msg.body);
+            return;
+        };
+    }
+    return error.OtherPeerBecameUnusable;
 }
 
 test "accepted QUIC sessions originate requests and receive replies on their own streams" {

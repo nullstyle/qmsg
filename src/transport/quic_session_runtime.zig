@@ -74,6 +74,19 @@ pub const QuicSessionRuntime = struct {
     /// One-shot liveness probe stream (PING). Pumped like the other
     /// control senders; nulled on completion.
     ping_sender: ?quic_streams.ControlStreamSender = null,
+    ping_sender_token: u64 = 0,
+    pong_sender: ?quic_streams.ControlStreamSender = null,
+    goaway_sender: ?quic_streams.ControlStreamSender = null,
+    pending_pongs: [8]u64 = undefined,
+    pending_pong_count: usize = 0,
+    pong_deadline_us: ?u64 = null,
+    drain_deadline_us: ?u64 = null,
+    received_goaway: ?control.Goaway = null,
+    goaway_notified: bool = false,
+    pings_received: usize = 0,
+    pongs_received: usize = 0,
+    mismatched_pongs: usize = 0,
+    unknown_optional_frames: usize = 0,
     /// Wall clock of the most recent `tickHeartbeat` call; inbound
     /// progress during `pump` stamps activity with it.
     heartbeat_now_us: u64 = 0,
@@ -136,6 +149,9 @@ pub const QuicSessionRuntime = struct {
         if (self.control_sender) |*sender| sender.deinit();
         if (self.control_flush_sender) |*sender| sender.deinit();
         if (self.ping_sender) |*sender| sender.deinit();
+        if (self.pong_sender) |*sender| sender.deinit();
+        if (self.goaway_sender) |*sender| sender.deinit();
+        if (self.received_goaway) |*frame| frame.deinit();
         if (self.control_receiver) |*receiver| receiver.deinit();
 
         var senders = self.reliable_senders.valueIterator();
@@ -201,14 +217,22 @@ pub const QuicSessionRuntime = struct {
     /// times out.
     pub fn tickHeartbeat(self: *QuicSessionRuntime, now_us: u64, transport: anytype) !HeartbeatOutcome {
         self.heartbeat_now_us = now_us;
-        if (self.ping_sender) |*sender| {
-            if (try sender.pump(transport) == .complete) {
-                sender.deinit();
-                self.ping_sender = null;
+        _ = try self.pumpControlSenders(transport);
+        if (self.pong_deadline_us) |deadline| {
+            if (now_us >= deadline) {
+                self.beginClosing();
+                return .timed_out;
             }
         }
+        if (self.drain_deadline_us) |deadline| {
+            if (now_us >= deadline) {
+                self.beginClosing();
+                return .timed_out;
+            }
+            return .none;
+        }
         if (self.state() != .ready) return .none;
-        const interval_us = self.heartbeatInterval() * std.time.us_per_ms;
+        const interval_us = self.heartbeatInterval() *| std.time.us_per_ms;
         if (interval_us == 0) return .none;
         if (self.last_activity_us == 0) self.last_activity_us = now_us;
 
@@ -222,12 +246,16 @@ pub const QuicSessionRuntime = struct {
         }
 
         if (now_us -| self.last_activity_us >= interval_us) {
-            // Replace-only: a previous sender must have completed (pumped
-            // to null above) or something is wrong with the sweep cadence.
-            // Checked before the uni id is reserved, and the id is reserved
-            // last: a reserved id that never opens is a stream the peer
-            // counts as open for the life of the connection.
-            if (self.ping_sender != null) return error.InvalidState;
+            // Other valid traffic may satisfy a probe while its sender still
+            // waits for uni credit. Retry that sender on the next timer without
+            // reserving another ID or treating ordinary pressure as failure.
+            if (self.ping_sender != null) {
+                // The original probe was satisfied while its bytes waited for
+                // stream credit. Reuse its token and bound renewed silence;
+                // reserving another stream here would skip the blocked ID.
+                self.outstanding_ping = .{ .token = self.ping_sender_token, .deadline_us = now_us +| @max(2 *| interval_us, std.time.us_per_s) };
+                return .none;
+            }
             const frames = [_]control.Frame{.{ .ping = .{ .token = now_us } }};
             var sender = try quic_streams.ControlStreamSender.init(
                 self.allocator,
@@ -244,15 +272,13 @@ pub const QuicSessionRuntime = struct {
             // The runtime owns the sender from here; a failed pump below
             // leaves it for the next sweep.
             self.ping_sender = sender;
+            self.ping_sender_token = now_us;
             // Flush now. The PING is on the wire, or it waits for the
             // peer's uni window (the pump returns `.pending`); the probe
             // deadline runs in both cases.
-            if (try self.ping_sender.?.pump(transport) == .complete) {
-                self.ping_sender.?.deinit();
-                self.ping_sender = null;
-            }
-            const deadline_margin = @max(2 * interval_us, std.time.us_per_s);
-            self.outstanding_ping = .{ .token = now_us, .deadline_us = now_us + deadline_margin };
+            _ = try self.pumpControlSenders(transport);
+            const deadline_margin = @max(2 *| interval_us, std.time.us_per_s);
+            self.outstanding_ping = .{ .token = now_us, .deadline_us = now_us +| deadline_margin };
             return .ping_sent;
         }
         return .none;
@@ -269,6 +295,117 @@ pub const QuicSessionRuntime = struct {
     }
 
     pub const HeartbeatOutcome = enum { none, ping_sent, timed_out };
+
+    pub fn isDraining(self: *const QuicSessionRuntime) bool {
+        return self.drain_deadline_us != null;
+    }
+
+    /// Absolute owner-clock deadline. Foreign embedders include this alongside
+    /// QUIC's timers, set heartbeat_now_us before ingress, then tick after it.
+    pub fn nextLifecycleTimer(self: *const QuicSessionRuntime) ?u64 {
+        if (self.isClosingOrClosed()) return null;
+        var deadline = self.drain_deadline_us;
+        if (self.pong_deadline_us) |pong| deadline = if (deadline) |d| @min(d, pong) else pong;
+        if (self.state() != .ready or self.heartbeatInterval() == 0 or self.isDraining()) return deadline;
+        const interval_us = self.heartbeatInterval() *| std.time.us_per_ms;
+        const heartbeat = if (self.outstanding_ping) |probe| probe.deadline_us else if (self.ping_sender != null) self.heartbeat_now_us +| interval_us else self.last_activity_us +| interval_us;
+        return if (deadline) |d| @min(d, heartbeat) else heartbeat;
+    }
+
+    /// Start a fixed drain interval. Existing request streams remain usable,
+    /// including deferred ReplyHandles; no queue-emptiness heuristic closes early.
+    pub fn goaway(self: *QuicSessionRuntime, code: u64, reason: []const u8, now_us: u64, timeout_us: u64) !void {
+        try self.ensureReadyForApplicationData();
+        if (self.isDraining()) return error.EndpointClosed;
+        self.goaway_sender = try self.makeControlSender(&.{.{ .goaway = .{ .code = code, .reason = reason } }});
+        self.heartbeat_now_us = now_us;
+        self.drain_deadline_us = now_us +| timeout_us;
+        self.outstanding_ping = null;
+    }
+
+    /// true means the session consumed this frame; pattern controls stay with
+    /// the owner. PONG tokens are strict; an unrelated PONG is not activity.
+    pub fn handleLifecycleFrame(self: *QuicSessionRuntime, frame: control.Frame) !bool {
+        switch (frame) {
+            .ping => |ping| {
+                if (self.pending_pong_count == self.pending_pongs.len) return error.ExcessiveLoad;
+                self.pending_pongs[self.pending_pong_count] = ping.token;
+                self.pending_pong_count += 1;
+                if (self.pong_deadline_us == null) self.pong_deadline_us = self.heartbeat_now_us +| @max(2 *| self.heartbeatInterval() *| std.time.us_per_ms, std.time.us_per_s);
+                self.pings_received += 1;
+                self.noteInboundActivity(self.heartbeat_now_us);
+            },
+            .pong => |pong| {
+                const probe = self.outstanding_ping orelse {
+                    self.mismatched_pongs += 1;
+                    return true;
+                };
+                if (probe.token == pong.token) {
+                    self.pongs_received += 1;
+                    self.noteInboundActivity(self.heartbeat_now_us);
+                } else self.mismatched_pongs += 1;
+            },
+            .goaway => |goaway_frame| {
+                if (self.received_goaway == null) {
+                    const reason = try self.allocator.dupe(u8, goaway_frame.reason);
+                    self.received_goaway = .{ .allocator = self.allocator, .code = goaway_frame.code, .reason = reason };
+                    const deadline = self.heartbeat_now_us +| (self.session.options.drain_timeout_ms *| std.time.us_per_ms);
+                    self.drain_deadline_us = if (self.drain_deadline_us) |old| @min(old, deadline) else deadline;
+                    self.outstanding_ping = null;
+                }
+            },
+            else => return false,
+        }
+        return true;
+    }
+
+    fn makeControlSender(self: *QuicSessionRuntime, frames: []const control.Frame) !quic_streams.ControlStreamSender {
+        var sender = try quic_streams.ControlStreamSender.init(self.allocator, self.stream_ids.next_uni, frames, self.session.options.control_codec, .{});
+        errdefer sender.deinit();
+        _ = try self.stream_ids.nextUni();
+        return sender;
+    }
+
+    /// All uni senders share one ordered pump so stream-window pressure cannot
+    /// open a later reserved ID while an earlier control stream is still pending.
+    fn pumpControlSenders(self: *QuicSessionRuntime, transport: anytype) !usize {
+        if (self.pong_sender == null and self.pending_pong_count > 0) {
+            var frames: [8]control.Frame = undefined;
+            for (self.pending_pongs[0..self.pending_pong_count], 0..) |token, i| frames[i] = .{ .pong = .{ .token = token } };
+            self.pong_sender = try self.makeControlSender(frames[0..self.pending_pong_count]);
+            self.pending_pong_count = 0;
+        }
+        var flushes: usize = 0;
+        while (true) {
+            var best: ?usize = null;
+            var best_id: u64 = std.math.maxInt(u64);
+            inline for (.{ "control_sender", "control_flush_sender", "ping_sender", "pong_sender", "goaway_sender" }, 0..) |field, i| {
+                if (@field(self, field)) |sender| {
+                    const stream_id = if (comptime std.mem.eql(u8, field, "control_flush_sender")) sender.sender.stream_id else sender.stream_id;
+                    if (stream_id < best_id) {
+                        best = i;
+                        best_id = stream_id;
+                    }
+                }
+            }
+            const selected = best orelse {
+                if (self.pending_pong_count == 0) self.pong_deadline_us = null;
+                return flushes;
+            };
+            inline for (.{ "control_sender", "control_flush_sender", "ping_sender", "pong_sender", "goaway_sender" }, 0..) |field, i| {
+                if (selected == i) {
+                    const sender = &@field(self, field).?;
+                    if (try sender.pump(transport) == .pending) return flushes;
+                    sender.deinit();
+                    @field(self, field) = null;
+                    if (comptime std.mem.eql(u8, field, "pong_sender")) {
+                        if (self.pending_pong_count == 0) self.pong_deadline_us = null;
+                    }
+                    if (comptime std.mem.eql(u8, field, "control_flush_sender")) flushes += 1;
+                }
+            }
+        }
+    }
 
     /// Effective liveness interval for this session: `min(local, peer)`
     /// when BOTH sides advertised a nonzero `HELLO.heartbeat_interval_ms`,
@@ -331,6 +468,7 @@ pub const QuicSessionRuntime = struct {
     /// so a refusal must not use one up.
     pub fn queueReliable(self: *QuicSessionRuntime, outgoing: message.OutgoingMessage) !u64 {
         try self.ensureReadyForApplicationData();
+        if (self.isDraining()) return error.EndpointClosed;
         const expects_reply = !outgoing.flags.no_reply;
         const limits = self.session.options;
 
@@ -371,6 +509,7 @@ pub const QuicSessionRuntime = struct {
         options: quic_streams.ReliableWriteOptions,
     ) !void {
         try self.ensureReadyForApplicationData();
+        if (self.isDraining() and options.open_bidi) return error.EndpointClosed;
         if (self.reliable_senders.contains(stream_id)) return error.StreamAlreadyOpen;
         const limits = self.session.options;
         if (self.reliable_senders.count() >= limits.max_queued_messages) return error.QueueFull;
@@ -421,6 +560,7 @@ pub const QuicSessionRuntime = struct {
 
     pub fn acceptReliableStream(self: *QuicSessionRuntime, stream_id: u64) !void {
         try self.ensureReadyForApplicationData();
+        if (self.isDraining()) return error.EndpointClosed;
         if (self.reliable_receivers.contains(stream_id)) return error.StreamAlreadyOpen;
         try self.checkReceiverCapacity();
 
@@ -550,6 +690,7 @@ pub const QuicSessionRuntime = struct {
         options: DatagramSendOptions,
     ) !DatagramSendResult {
         try self.ensureReadyForApplicationData();
+        if (self.isDraining()) return error.EndpointClosed;
         if (!self.session.session.datagram_enabled) {
             if (quic_datagram.shouldUseReliableFallback(error.DatagramUnavailable, options.fallback)) {
                 return .use_reliable_fallback;
@@ -608,6 +749,11 @@ pub const QuicSessionRuntime = struct {
             // ever-growing application set of completed IDs is necessary.
             const receive = conn.streamRecvState(stream_id) orelse continue;
             if (receive.terminal) continue;
+            if (self.isDraining()) {
+                conn.streamReset(stream_id, 0x51_06) catch {};
+                conn.streamStopSending(stream_id, 0x51_06) catch {};
+                continue;
+            }
             try stream_ids.append(self.allocator, stream_id);
         }
 
@@ -632,20 +778,7 @@ pub const QuicSessionRuntime = struct {
         var result: PumpResult = .{};
         var inbound_progress = false;
 
-        if (self.control_sender) |*sender| {
-            if (try sender.pump(transport) == .complete) {
-                sender.deinit();
-                self.control_sender = null;
-            }
-        }
-
-        if (self.control_flush_sender) |*sender| {
-            if (try sender.pump(transport) == .complete) {
-                sender.deinit();
-                self.control_flush_sender = null;
-                result.control_flush_complete += 1;
-            }
-        }
+        result.control_flush_complete += try self.pumpControlSenders(transport);
 
         if (self.control_receiver) |*receiver| {
             var frames: std.ArrayList(control.Frame) = .empty;
@@ -2064,6 +2197,7 @@ const HeartbeatFakeTransport = struct {
     opened_uni: ?u64 = null,
     /// The peer's uni window is full: every open is refused.
     refuse_uni: bool = false,
+    max_uni: ?u64 = null,
     /// Every write fails with OutOfMemory.
     fail_write: bool = false,
 
@@ -2076,6 +2210,7 @@ const HeartbeatFakeTransport = struct {
     pub fn streamFinish(_: *HeartbeatFakeTransport, _: u64) !void {}
     pub fn openUni(self: *HeartbeatFakeTransport, stream_id: u64) !void {
         if (self.refuse_uni) return error.StreamLimitExceeded;
+        if (self.max_uni) |maximum| if (stream_id > maximum) return error.StreamLimitExceeded;
         self.opened_uni = stream_id;
     }
 };
@@ -2129,6 +2264,87 @@ test "heartbeat sweep pings on idle and times out unanswered probes" {
     try testing.expect(rt.outstanding_ping == null);
 }
 
+test "lifecycle: PONG tokens match exactly and ingress wins at the probe deadline" {
+    var rt = try heartbeatTestRuntime(testing.allocator);
+    defer rt.deinit();
+    var io = HeartbeatFakeTransport{};
+    defer io.written.deinit(testing.allocator);
+    _ = try rt.tickHeartbeat(1_000_000, &io);
+    _ = try rt.tickHeartbeat(2_000_000, &io);
+    const token = rt.outstanding_ping.?.token;
+    const deadline = rt.outstanding_ping.?.deadline_us;
+    rt.heartbeat_now_us = deadline;
+    try testing.expect(try rt.handleLifecycleFrame(.{ .pong = .{ .token = token + 1 } }));
+    try testing.expectEqual(token, rt.outstanding_ping.?.token);
+    try testing.expectEqual(@as(usize, 1), rt.mismatched_pongs);
+    try testing.expect(try rt.handleLifecycleFrame(.{ .pong = .{ .token = token } }));
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.none, try rt.tickHeartbeat(deadline, &io));
+    try testing.expectEqual(quic.State.ready, rt.state());
+    try testing.expectEqual(@as(usize, 1), rt.pongs_received);
+    try testing.expectEqual(deadline + std.time.us_per_s, rt.nextLifecycleTimer().?);
+}
+
+test "lifecycle: PONG responses are bounded and resume in stream order under pressure" {
+    var rt = try heartbeatTestRuntime(testing.allocator);
+    defer rt.deinit();
+    var io = HeartbeatFakeTransport{ .refuse_uni = true };
+    defer io.written.deinit(testing.allocator);
+    rt.heartbeat_now_us = 1_000_000;
+    for (0..8) |token| _ = try rt.handleLifecycleFrame(.{ .ping = .{ .token = token } });
+    try testing.expectError(error.ExcessiveLoad, rt.handleLifecycleFrame(.{ .ping = .{ .token = 9 } }));
+    _ = try rt.tickHeartbeat(1_000_000, &io);
+    try testing.expect(rt.pong_sender != null);
+    const pong_stream = rt.pong_sender.?.stream_id;
+    try testing.expectEqual(@as(usize, 0), rt.pending_pong_count);
+    try rt.goaway(9, "draining", 1_000_000, 5_000_000);
+    const goaway_stream = rt.goaway_sender.?.stream_id;
+    try testing.expect(goaway_stream > pong_stream);
+    _ = try rt.tickHeartbeat(1_100_000, &io);
+    try testing.expect(io.opened_uni == null);
+    io.refuse_uni = false;
+    io.max_uni = pong_stream;
+    _ = try rt.tickHeartbeat(1_200_000, &io);
+    try testing.expect(rt.pong_sender == null);
+    try testing.expect(rt.goaway_sender != null);
+    try testing.expectEqual(@as(?u64, pong_stream), io.opened_uni);
+    try testing.expectEqual(@as(u64, 6_000_000), rt.nextLifecycleTimer().?);
+    io.max_uni = null;
+    _ = try rt.tickHeartbeat(1_300_000, &io);
+    try testing.expect(rt.goaway_sender == null);
+    try testing.expectEqual(@as(?u64, goaway_stream), io.opened_uni);
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.timed_out, try rt.tickHeartbeat(6_000_000, &io));
+}
+
+test "lifecycle: a flow-controlled PONG has a deadline even with heartbeat disabled" {
+    var rt = try heartbeatTestRuntime(testing.allocator);
+    defer rt.deinit();
+    rt.session.options.heartbeat_interval_ms = 0;
+    rt.heartbeat_now_us = 1_000_000;
+    _ = try rt.handleLifecycleFrame(.{ .ping = .{ .token = 12 } });
+    try testing.expectEqual(@as(u64, 2_000_000), rt.nextLifecycleTimer().?);
+    var io = HeartbeatFakeTransport{ .refuse_uni = true };
+    defer io.written.deinit(testing.allocator);
+    _ = try rt.tickHeartbeat(1_100_000, &io);
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.timed_out, try rt.tickHeartbeat(2_000_000, &io));
+}
+
+test "lifecycle: a blocked PING whose probe was satisfied schedules a future retry" {
+    var rt = try heartbeatTestRuntime(testing.allocator);
+    defer rt.deinit();
+    var io = HeartbeatFakeTransport{ .refuse_uni = true };
+    defer io.written.deinit(testing.allocator);
+    _ = try rt.tickHeartbeat(1_000_000, &io);
+    _ = try rt.tickHeartbeat(3_000_000, &io);
+    rt.noteInboundActivity(3_500_000);
+    const reserved = rt.stream_ids.next_uni;
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.none, try rt.tickHeartbeat(4_600_000, &io));
+    try testing.expect(rt.nextLifecycleTimer().? > 4_600_000);
+    try testing.expectEqual(reserved, rt.stream_ids.next_uni);
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.none, try rt.tickHeartbeat(5_600_000, &io));
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.timed_out, try rt.tickHeartbeat(6_600_000, &io));
+    try testing.expectEqual(reserved, rt.stream_ids.next_uni);
+}
+
 test "inbound activity resets the probe and defers the next ping" {
     const allocator = testing.allocator;
     var rt = try heartbeatTestRuntime(allocator);
@@ -2168,16 +2384,17 @@ test "a ping that cannot start reserves no uni stream id" {
     // The peer is alive, the interval passes again, and the old ping
     // still waits: no second ping, and no uni id used up for it.
     rt.noteInboundActivity(3_500_000);
-    try testing.expectError(error.InvalidState, rt.tickHeartbeat(4_600_000, &transport));
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.none, try rt.tickHeartbeat(4_600_000, &transport));
     try testing.expectEqual(next_uni, rt.stream_ids.next_uni);
 
-    // The window opens: the waiting ping completes first, then the next
-    // ping takes the next id. No id was skipped.
+    // The window opens: the waiting ping completes with the same token and
+    // the renewed probe remains bounded. No extra id was reserved.
     transport.refuse_uni = false;
-    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.ping_sent, try rt.tickHeartbeat(4_700_000, &transport));
+    try testing.expectEqual(QuicSessionRuntime.HeartbeatOutcome.none, try rt.tickHeartbeat(4_700_000, &transport));
     try testing.expect(rt.ping_sender == null);
-    try testing.expectEqual(@as(?u64, next_uni), transport.opened_uni);
-    try testing.expectEqual(next_uni + 4, rt.stream_ids.next_uni);
+    try testing.expectEqual(@as(?u64, next_uni - 4), transport.opened_uni);
+    try testing.expectEqual(next_uni, rt.stream_ids.next_uni);
+    try testing.expectEqual(@as(u64, 3_000_000), rt.outstanding_ping.?.token);
 }
 
 test "a ping whose first write fails stays with the runtime" {

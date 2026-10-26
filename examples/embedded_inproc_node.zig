@@ -190,7 +190,7 @@ fn handleEvent(
         .message_dropped => |ev| {
             std.debug.print("message dropped: {d} bytes\n", .{ev.bytes});
         },
-        .quic_request, .quic_reply, .quic_delivery, .quic_request_failed, .connected, .closed => {},
+        .quic_request, .quic_reply, .quic_delivery, .quic_request_failed, .session_goaway, .connected, .closed => {},
     }
 }
 

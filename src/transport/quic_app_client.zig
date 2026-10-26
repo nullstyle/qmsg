@@ -54,7 +54,7 @@ pub fn ClientDispatch(comptime Owner: type) type {
 
         pub fn service(self: *Self, now_us: u64) !void {
             self.app.dispatch.setHeartbeatClock(now_us);
-            try self.app.dispatch.serviceSeat(&self.driver.state.seat.?, self.driver.conn);
+            try self.app.dispatch.prepareSeat(&self.driver.state.seat.?, self.driver.conn);
             // queueReliable reserves local IDs before opening the wire stream.
             // Register readable streams only after the protocol pump opens them.
             const runtime = Owner.driverSessionRuntime(self.app.sess);

@@ -127,6 +127,16 @@ Every request/reply outcome is a poll event or a synchronous error:
 - `connected` / `closed` — endpoint/session lifecycle bookkeeping. Use
   `sessionStatus(id).state == .ready` to check QUIC usability after TLS and
   HELLO, or `findReadySessionSupporting` to find a verified peer session.
+- `session_goaway` — the QUIC peer requested draining; `session_id` and
+  `code` identify the session and application reason code. The event owns
+  its `reason` bytes, released by `Event.deinit`.
+
+For QUIC shutdown, `goawayQuicSession(id, code, reason, now_us, timeout_us)`
+starts a bounded drain interval; keep ticking and polling to finish existing
+requests and deferred replies. `closeQuicSession(id)` still aborts immediately.
+`nextTimer()` includes heartbeat and drain deadlines. Foreign-driver clock
+requirements and event compatibility are in
+[MIGRATION.md](MIGRATION.md#quic-heartbeat-and-graceful-shutdown).
 
 ## Backpressure and observability
 

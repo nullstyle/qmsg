@@ -172,11 +172,14 @@ pub const ControlStreamOptions = struct {
     codec: control.CodecOptions = .{},
     max_buffered_bytes: usize = 64 * 1024,
     scratch_size: usize = 4096,
+    /// Only follow-up streams may ignore explicitly optional unknown tags.
+    skip_unknown_optional: bool = false,
 };
 
 pub const ControlReadResult = struct {
     bytes_read: usize = 0,
     frames_read: usize = 0,
+    unknown_optional_frames: usize = 0,
     stream_complete: bool = false,
 };
 
@@ -186,6 +189,7 @@ pub const ControlStreamReceiver = struct {
     options: ControlStreamOptions = .{},
     bytes: std.ArrayList(u8) = .empty,
     stream_type_seen: bool = false,
+    unknown_optional_frames: usize = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -228,7 +232,9 @@ pub const ControlStreamReceiver = struct {
             self.bytes.appendSliceAssumeCapacity(scratch[0..n]);
         }
 
+        const skipped_before = self.unknown_optional_frames;
         result.frames_read = try self.parseAvailable(out);
+        result.unknown_optional_frames = self.unknown_optional_frames - skipped_before;
         result.stream_complete = try self.streamComplete(transport);
         if (result.stream_complete and (!self.stream_type_seen or self.bytes.items.len != 0)) {
             return error.MalformedFrame;
@@ -251,10 +257,12 @@ pub const ControlStreamReceiver = struct {
     fn parseAvailable(self: *ControlStreamReceiver, out: *std.ArrayList(control.Frame)) !usize {
         const initial_len = out.items.len;
         const initial_type_seen = self.stream_type_seen;
+        const initial_skipped = self.unknown_optional_frames;
         errdefer {
             for (out.items[initial_len..]) |*frame| frame.deinit();
             out.shrinkRetainingCapacity(initial_len);
             self.stream_type_seen = initial_type_seen;
+            self.unknown_optional_frames = initial_skipped;
         }
         var consumed: usize = 0;
         var frames_read: usize = 0;
@@ -284,7 +292,18 @@ pub const ControlStreamReceiver = struct {
             if (reader.remaining() < payload_len) break;
 
             const payload = reader.bytes[reader.index..][0..payload_len];
-            var frame = try control.decode(self.allocator, payload, self.options.codec);
+            var frame = control.decode(self.allocator, payload, self.options.codec) catch |err| {
+                if (err == error.UnknownControlFrame and self.options.skip_unknown_optional) {
+                    var tag_reader: Reader = .{ .bytes = payload };
+                    const tag = try tag_reader.readVarInt();
+                    if (tag & control.optional_tag_bit != 0) {
+                        self.unknown_optional_frames += 1;
+                        consumed = reader.index + payload_len;
+                        continue;
+                    }
+                }
+                return err;
+            };
             errdefer frame.deinit();
             try out.append(self.allocator, frame);
 
@@ -836,6 +855,45 @@ test "control receiver parses frames across partial reads" {
     try std.testing.expectEqual(@as(usize, 2), out.items.len);
     try std.testing.expectEqualStrings("server-a", out.items[0].hello.peer_id);
     try std.testing.expectEqualStrings("bye", out.items[1].goaway.reason);
+}
+
+test "lifecycle: optional unknown controls skip only on follow-up streams and preserve framing" {
+    const allocator = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    try appendVarInt(allocator, &bytes, control_stream_type);
+    try appendVarInt(allocator, &bytes, 11);
+    try appendVarInt(allocator, &bytes, control.optional_tag_bit | 63);
+    try bytes.appendSlice(allocator, "xyz");
+    try appendControlFrame(allocator, &bytes, .{ .pong = .{ .token = 42 } }, .{});
+    for ([_]bool{ false, true }) |skip| {
+        var io: FakeStream = .{ .allocator = allocator, .incoming = bytes.items, .readable_len = bytes.items.len, .final_size = bytes.items.len, .read_limit = 1 };
+        defer io.deinit();
+        var receiver = ControlStreamReceiver.init(allocator, 7, .{ .skip_unknown_optional = skip });
+        defer receiver.deinit();
+        var frames: std.ArrayList(control.Frame) = .empty;
+        defer {
+            for (frames.items) |*frame| frame.deinit();
+            frames.deinit(allocator);
+        }
+        if (!skip) {
+            try std.testing.expectError(error.UnknownControlFrame, receiver.pump(&io, &frames));
+        } else {
+            const result = try receiver.pump(&io, &frames);
+            try std.testing.expect(result.stream_complete);
+            try std.testing.expectEqual(@as(usize, 1), result.unknown_optional_frames);
+            try std.testing.expectEqual(@as(usize, 1), frames.items.len);
+            try std.testing.expectEqual(@as(u64, 42), frames.items[0].pong.token);
+        }
+    }
+    // Unknown mandatory tags remain fatal, even with follow-up policy enabled.
+    var io: FakeStream = .{ .allocator = allocator, .incoming = "\x40\x51\x01\x3f", .readable_len = 4, .final_size = 4 };
+    defer io.deinit();
+    var receiver = ControlStreamReceiver.init(allocator, 7, .{ .skip_unknown_optional = true });
+    defer receiver.deinit();
+    var frames: std.ArrayList(control.Frame) = .empty;
+    defer frames.deinit(allocator);
+    try std.testing.expectError(error.UnknownControlFrame, receiver.pump(&io, &frames));
 }
 
 test "control receiver rejects bad stream type and truncated final frame" {

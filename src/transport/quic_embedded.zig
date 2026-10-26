@@ -291,6 +291,7 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
         pub fn onStreamOpen(self: *Self, seat: *Seat, stream_id: u64, bidi: bool) !void {
             const sess = seat.sess orelse return;
             const rt = Owner.driverSessionRuntime(sess);
+            if (bidi and rt.isDraining() and !rt.reliable_receivers.contains(stream_id)) return;
             // Ended streams may still wait for HELLO or decoder capacity after
             // QUIC replenishes its stream credit. Bound these retained records
             // independently of the driver's currently live receive entries.
@@ -353,6 +354,11 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
         pub fn onStreamDataConsumed(self: *Self, seat: *Seat, conn: *quic_zig.Connection, stream_id: u64, chunk: []const u8) !usize {
             const sess = seat.sess orelse return chunk.len;
             const rt = Owner.driverSessionRuntime(sess);
+            if ((stream_id & 2) == 0 and quic_session_runtime.isPeerBidiStreamId(rt.session.role, stream_id) and rt.isDraining() and !rt.reliable_receivers.contains(stream_id)) {
+                conn.streamReset(stream_id, 0x51_06) catch {};
+                conn.streamStopSending(stream_id, 0x51_06) catch {};
+                return chunk.len;
+            }
             // Locally initiated request receivers disappear on cancellation.
             // Drain any already-arrived late bytes without recreating a buffer.
             if ((stream_id & 2) == 0 and !quic_session_runtime.isPeerBidiStreamId(rt.session.role, stream_id) and !rt.reliable_receivers.contains(stream_id)) return chunk.len;
@@ -440,6 +446,10 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
             const sess = seat.sess orelse return;
             const rt = Owner.driverSessionRuntime(sess);
             if (!rt.appSession().datagram_enabled) return;
+            if (rt.isDraining()) {
+                try self.owner.driverDatagramDropped(sess, data.len);
+                return;
+            }
 
             var received = quic_datagram.decodeIncomingDatagram(
                 self.allocator,
@@ -493,8 +503,29 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
         pub fn serviceSeat(self: *Self, seat: *Seat, conn: *quic_zig.Connection) !void {
             try self.pumpSeat(seat, conn);
             if (seat.sess) |sess| {
+                const rt = Owner.driverSessionRuntime(sess);
+                // pumpSeat contains protocol/stream errors on this peer.
+                // Do not repump its retained senders after it starts closing.
+                if (rt.isClosingOrClosed()) return;
                 try self.owner.driverSessionPass(sess, conn);
+                if (self.heartbeat_now_us != 0) {
+                    var adapter = quic_streams.QuicConnectionAdapter.init(conn);
+                    const outcome = rt.tickHeartbeat(self.heartbeat_now_us, &adapter) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => {
+                            rt.beginClosing();
+                            conn.close(false, quic.protocol_error_code, "qmsg lifecycle error");
+                            return;
+                        },
+                    };
+                    if (outcome == .timed_out) conn.close(false, 0, "qmsg lifecycle timeout");
+                }
             }
+        }
+
+        /// Send/read staging before driver ingress, without expiring timers.
+        pub fn prepareSeat(self: *Self, seat: *Seat, conn: *quic_zig.Connection) !void {
+            try self.pumpSeat(seat, conn);
         }
 
         /// Drains pending accepts (once the session is ready) and
@@ -512,12 +543,9 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
             const sess = seat.sess orelse return;
             const rt = Owner.driverSessionRuntime(sess);
 
-            // Liveness sweep on the owner-supplied clock, before the
-            // pump: a PING emitted here flushes in the same pass.
-            if (self.heartbeat_now_us != 0) {
-                var adapter: quic_streams.QuicConnectionAdapter = .{ .conn = conn };
-                _ = rt.tickHeartbeat(self.heartbeat_now_us, &adapter) catch {};
-            }
+            // Stamp ingress before decoding; timeout evaluation is after the
+            // driver's ingress pass in serviceSeat, never in stream callbacks.
+            rt.heartbeat_now_us = self.heartbeat_now_us;
 
             if (rt.state() == .ready and seat.pending_accepts.items.len > 0) {
                 var pending_index: usize = 0;
@@ -583,11 +611,17 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
                     },
                     else => return err,
                 };
+                if (seat.sess) |sess| Owner.driverSessionRuntime(sess).unknown_optional_frames += result.unknown_optional_frames;
 
                 if (frames.items.len > 0) {
                     // Frames are BORROWED by the owner; this defer
                     // remains their single owner.
-                    try self.owner.driverControlFramesReceived(seat.sess.?, frames.items);
+                    for (frames.items, 0..) |frame, frame_index| {
+                        const rt = Owner.driverSessionRuntime(seat.sess.?);
+                        if (try rt.handleLifecycleFrame(frame)) continue;
+                        rt.noteInboundActivity(rt.heartbeat_now_us);
+                        try self.owner.driverControlFramesReceived(seat.sess.?, frames.items[frame_index..][0..1]);
+                    }
                 }
 
                 if (result.stream_complete) {
@@ -616,7 +650,7 @@ pub fn EmbeddedDispatch(comptime Owner: type) type {
                 .receiver = quic_streams.ControlStreamReceiver.init(
                     seat.allocator,
                     stream_id,
-                    .{ .codec = rt.session.options.control_codec },
+                    .{ .codec = rt.session.options.control_codec, .skip_unknown_optional = true },
                 ),
             }) catch {
                 // Allocation failure: leave the stream unread; the

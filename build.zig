@@ -3,6 +3,8 @@ const std = @import("std");
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const test_filter = b.option([]const u8, "test-filter", "Run tests whose names contain this text");
+    const test_filters: []const []const u8 = if (test_filter) |filter| &.{filter} else &.{};
 
     const paseto_dep = b.dependency("paseto", .{
         .target = target,
@@ -75,7 +77,7 @@ pub fn build(b: *std.Build) !void {
         });
         codec_mod.addImport("capnpc-zig", capnp_mod);
 
-        const codec_tests = b.addTest(.{ .root_module = codec_mod });
+        const codec_tests = b.addTest(.{ .root_module = codec_mod, .filters = test_filters });
         const run_codec_tests = b.addRunArtifact(codec_tests);
         const codec_test_step = b.step("capnp-test", "Run the optional capnp body codec tests");
         codec_test_step.dependOn(&run_codec_tests.step);
@@ -88,7 +90,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(lib);
 
-    const unit_tests = b.addTest(.{ .root_module = qmsg_mod });
+    const unit_tests = b.addTest(.{ .root_module = qmsg_mod, .filters = test_filters });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     const quic_tests_mod = b.createModule(.{
@@ -97,7 +99,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
     });
     quic_tests_mod.addImport("quic", quic_mod);
-    const quic_tests = b.addTest(.{ .root_module = quic_tests_mod });
+    const quic_tests = b.addTest(.{ .root_module = quic_tests_mod, .filters = test_filters });
     const run_quic_tests = b.addRunArtifact(quic_tests);
     const quic_test_step = b.step("quic-test", "Run qmsg QUIC transport skeleton tests");
     quic_test_step.dependOn(&run_quic_tests.step);
@@ -111,7 +113,7 @@ pub fn build(b: *std.Build) !void {
     });
     pair_tests_mod.addImport("quic", quic_mod);
     pair_tests_mod.addImport("paseto", paseto_mod);
-    const pair_tests = b.addTest(.{ .root_module = pair_tests_mod });
+    const pair_tests = b.addTest(.{ .root_module = pair_tests_mod, .filters = test_filters });
     const run_pair_tests = b.addRunArtifact(pair_tests);
     const pair_test_step = b.step("node-pair-test", "Run the two-node live UDP tests");
     pair_test_step.dependOn(&run_pair_tests.step);

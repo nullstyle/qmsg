@@ -236,6 +236,9 @@ pub const QuicOptions = struct {
     datagram_enabled: bool = false,
     max_datagram_frame_size: u64 = 0,
     heartbeat_interval_ms: u64 = 0,
+    /// Bounded grace interval after receiving GOAWAY. Existing requests may
+    /// finish; new requests are refused. Driven by the embedder's clock.
+    drain_timeout_ms: u64 = 5_000,
     auth: control.AuthProperties = .{},
     auth_config: auth.AuthConfig = .{},
     /// Listener template for channel binding: when set, each accepted

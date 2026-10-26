@@ -50,7 +50,7 @@ and embedded or App-driven consumption. The public root module exports:
 The inproc socket examples build and run against the current public API. The
 App facade can now serve inproc REP routes through `runOnce`, and can prepare
 QUIC listener/session runtime plumbing. QUIC has a pinned released
-`quic-zig` dependency (URL+hash tarball, v0.32.0), option wrappers, transport-parameter
+`quic-zig` dependency (URL+hash tarball, v0.37.2), option wrappers, transport-parameter
 mapping, socket-free runtime wrappers around `quic_zig.Server`/`Client`,
 Node-embeddable UDP socket owners, per-session QUIC drivers, socket QUIC
 attachment callbacks, App dispatch for already-decoded QUIC messages,
@@ -72,6 +72,12 @@ terminal-outcome capacity separately from ordinary events. Configured message
 authorization runs before application delivery. See
 [docs/MIGRATION.md](docs/MIGRATION.md) for ownership, limits, verified peer
 readiness, and explicit compatibility options for older inbox consumers.
+
+Negotiated heartbeats run on the owner clock. For shutdown,
+`Node.goawayQuicSession(id, code, reason, now_us, timeout_us)` drains existing
+work for a bounded interval; `closeQuicSession(id)` remains an immediate
+abort. Remote GOAWAY produces an owned `session_goaway` event. See the
+[lifecycle contract](docs/MIGRATION.md#quic-heartbeat-and-graceful-shutdown).
 
 ## Package Use
 

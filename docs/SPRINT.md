@@ -17,72 +17,28 @@ recorded here; progress tracked per item.
   HANDOFF §1c with a reproduce script. Not a qmsg bug; do not work around.
 - ROADMAP status table refreshed (phase 9 = Partial: capnp codec shipped).
 
-## S2 — Liveness and graceful shutdown: IN PROGRESS
+## S2 — Liveness and graceful shutdown: Sprint 1 qualification
 
-Landed so far (additive, all green — currently 410/410):
+The 2026-10-26 cross-project sprint completes the runtime wiring that was
+previously left open here. The additive interface is:
 
-- `PING` (tag 6) / `PONG` (tag 7) control-frame codec — token round-trip
-  tested, validation arms added, `Tag.fromInt` mapped. Not yet emitted or
-  consumed by any runtime.
-- **Sweep slice**: `QuicSessionRuntime.tickHeartbeat(now_us, transport)`
-  — the full probe state machine. Idle past the negotiated interval with
-  no outstanding probe → PING emitted on a one-shot uni control stream
-  (flushed before returning `.ping_sent`); outstanding probe past its
-  deadline (2x interval, 1s floor) → `beginClosing()` + `.timed_out`;
-  inbound progress during `pump` stamps activity via `heartbeat_now_us`
-  and satisfies any outstanding probe (`noteInboundActivity`). Tested
-  with a recording fake transport (wire bytes captured, timing edges
-  asserted). NOT yet called from Node tick paths — that plus PONG
-  reply/match is the remaining wiring.
-- **Negotiation slice**: `acceptHello` captures the peer's
-  `HELLO.heartbeat_interval_ms` onto `Session.peer_heartbeat_interval_ms`;
-  `QuicSessionRuntime.heartbeatInterval()` computes the effective
-  `min(local, peer)`, zero when either side opts out. Tested end-to-end
-  through a real HELLO exchange plus the opt-out arm.
+- negotiated PING/PONG handling in the shared session runtime;
+- bounded pending lifecycle responses under flow control;
+- `Node.goawayQuicSession(id, code, reason, now_us, timeout_us)`;
+- received `session_goaway` events with owned reason bytes;
+- explicit drain intervals that preserve existing streams and deferred replies;
+- owner-visible heartbeat and drain deadlines;
+- optional unknown follow-up tags (bit 61), with strict startup and required tags.
 
-### Remaining wiring (design settled; anchors verified 2026-09-04)
+`closeQuicSession(id)` retains immediate-abort behavior. Public dependencies
+remain QUIC v0.37.2 and Zig 0.17.0. The coordinated QUIC candidate is tested
+separately; no dependency upgrade or publication is implied by source changes.
 
-1. ~~Negotiation~~ **DONE**: see above. The effective value is computed
-   lazily by `heartbeatInterval()` — no eager computation needed.
-2. ~~State~~ **DONE** (part of the sweep slice above).
-3. ~~Sweep~~ **DONE** including call sites: `tickQuicClients` sweeps
-   each dial session (connection wrapped in `QuicConnectionAdapter`);
-   listener sessions sweep via the owner clock — `Node.tickQuicListeners`
-   calls `ServerDispatch.setHeartbeatClock(now_us)`, `service` threads it
-   into the stateless `EmbeddedDispatch`, and `pumpSeat` runs
-   `tickHeartbeat` before the pump. Foreign embedders using
-   `EmbeddedDispatch` directly get the same public
-   `setHeartbeatClock`; zero (default) means no sweep — sessions live at
-   the embedder's pleasure. Remaining in S2: PONG reply/match at the two
-   control-frame application points, GOAWAY both directions, the
-   `.session_goaway` event, and the unknown-tag tolerance check.
-4. **Inbound PING → PONG**: intercept in the two control-frame
-   application points BEFORE registry apply — the embedded path
-   `pumpControlReads` (`src/transport/quic_embedded.zig`) and the
-   node-owned path that feeds `driverControlFramesReceived`
-   (`src/node.zig:1908` → `quic_control.State.applyReceivedFrames`).
-   Reply with a one-shot uni PONG stream (same sender shape as the PING).
-   Inbound PONG: match `outstanding_ping.token`, clear it, bump activity.
-5. **GOAWAY wiring**: outbound — `Node.closeQuicSession(id, code, reason)`
-   queues a GOAWAY frame via the `control_flush_sender` path
-   (`flushQueuedControl`), marks the session draining, closes the
-   connection after the flush completes. Inbound — handle `goaway` at the
-   same two application points as ping/pong: set a
-   `session.goaway_received {code, reason}`, transition to draining, and
-   surface a `.session_goaway` poll event (new `Event` variant — note for
-   downstream exhaustive switches, same as past additions).
-6. **Tests**: control codec (done); runtime-level with the existing fake
-   transport pumps (idle → ping_sent; pong withheld → timed_out;
-   ping→pong echo); one live-UDP integration with a short negotiated
-   interval. WIRE.md: move PING/PONG and GOAWAY sections from "sketch" to
-   documented behavior; keep `wire_version = 1` (additive frames).
-
-### Forward-compat note
-
-`Tag.fromInt` errors `UnknownControlFrame` on unknown tags — check whether
-the follow-up-stream application paths SKIP unknown frames or kill the
-session before shipping any peer that might send newer frames; if they
-kill, add skip-with-counter before freezing qmsg/1.
+See [MIGRATION.md](MIGRATION.md#quic-heartbeat-and-graceful-shutdown) for
+ownership and clocks, and [WIRE.md](../WIRE.md#control-frames) for wire behavior.
+See [Sprint 1 lifecycle qualification](SPRINT_1_LIFECYCLE.md) for regression
+coverage, toolchain identity, and retained gate evidence. Earlier 410-test
+counts described an intermediate September tree, not this sprint.
 
 ## S3 — Public QUIC socket surface: NOT STARTED
 

@@ -10,18 +10,18 @@ phase.
 
 | Phase | Status | Notes |
 | --- | --- | --- |
-| 0 Decisions and spikes | Complete enough to proceed | Package, ALPN, envelope, inproc, auth boundary, released `quic-zig` tarball pin (v0.32.0, see build.zig.zon), transport-parameter mapping, QUIC HELLO, reliable stream, DATAGRAM, and cancellation spikes exist. |
+| 0 Decisions and spikes | Complete enough to proceed | Package, ALPN, envelope, inproc, auth boundary, released `quic-zig` tarball pin (v0.37.2, see build.zig.zon), transport-parameter mapping, QUIC HELLO, reliable stream, DATAGRAM, and cancellation spikes exist. |
 | 1 Core package skeleton | Complete | Core message, envelope, subject, queue, transport boundary, and inproc transport are implemented and tested. |
 | 2 Pair and req/rep over inproc | Complete for inproc MVP | Pair and req/rep work over inproc with ids, deadlines, cancellation, queue pressure tests, and error replies. |
 | 2b Embedded inproc Node | Complete for inproc MVP | Socketless embedder contract (`tick`/`poll`, node-owned sockets, event-complete req/rep + pub/sub, `RequestFailure` classification, bounded events, `Stats`) is implemented, tested, and documented in docs/EMBEDDING.md with examples/embedded_inproc_node.zig as the executable contract. Inbound attach shipped in 0.1.4 (docs/QUIC_EMBED_SEAM.md) and dial-side deadline/cancellation outcomes in 0.1.6 (docs/QUIC_REQUEST_OUTCOMES.md). |
-| 3 QUIC transport MVP | In progress | `quic-zig` is pinned (v0.32.0 tarball, see build.zig.zon). qmsg has socket-free runtime wrappers, Node-embeddable UDP socket owners, qmsg HELLO over control streams, a per-session QUIC driver, Node listener/client tick wiring, socket attachment helpers, reliable stream pumps with queueReliable-armed reply receivers, req/rep over hermetic QUIC runtime tests, hermetic QUIC App dispatch examples, an opt-in Node/App localhost smoke example, and — as of 0.1.4 — the inbound embed seam (`EmbeddedDispatch`): qmsg sessions on a foreign embedder's listener/Driver by ALPN, pull-consumed through poll events (docs/QUIC_EMBED_SEAM.md, built and consumer-approved). Public QUIC socket convenience APIs remain. |
+| 3 QUIC transport MVP | In progress | `quic-zig` is pinned (v0.37.2 tarball, see build.zig.zon). qmsg has socket-free runtime wrappers, Node-embeddable UDP socket owners, qmsg HELLO over control streams, a per-session QUIC driver, Node listener/client tick wiring, socket attachment helpers, reliable stream pumps with queueReliable-armed reply receivers, req/rep over hermetic QUIC runtime tests, hermetic QUIC App dispatch examples, an opt-in Node/App localhost smoke example, and — as of 0.1.4 — the inbound embed seam (`EmbeddedDispatch`): qmsg sessions on a foreign embedder's listener/Driver by ALPN, pull-consumed through poll events (docs/QUIC_EMBED_SEAM.md, built and consumer-approved). Public QUIC socket convenience APIs remain. |
 | 4 App facade | Partial | Route registration, `Context`, in-memory dispatch, inproc REP `runOnce`, auth checks, default REP error replies, QUIC listener/session lifecycle hooks, decoded QUIC message/datagram dispatch, socket hook examples, and an initial live Node/App localhost example exist. Full socket-attached App-over-live-UDP examples remain. |
 | 5 Pub/sub reliable | Partial | Inproc pub/sub, source-side subscription registry, replay/update, slow-consumer behavior, transport-agnostic SUBSCRIBE/UNSUBSCRIBE helpers, and QUIC control-frame queue/apply state are implemented. Automatic live-session emission shipped in 0.2.0: node-level subscriptions re-emit per session (docs/QUIC_PUBSUB.md), registry-aware datagram fan-out with shed-and-count, and inbound SUBSCRIBE on the listener/embedded seam. Replay wiring and reliable-stream publication remain. |
 | 6 QUIC datagrams | Partial | HELLO carries datagram capability and qmsg has compact datagram envelope plus send/receive/error-mapping helpers. Node queues decoded datagrams and dispatches them through App handlers; live UDP datagram examples plus ack/loss reconciliation remain. |
 | 7 Push/pull | Partial | Inproc push/pull has fair selection, puller credit, queue policy handling, at-most-once semantics, transport-agnostic CREDIT helpers, and QUIC control-frame queue/apply state. Automatic live-session emission remains. |
 | 8 Survey/respondent and bus | Not started | No public API or state machines yet. |
 | 9 Typed codecs and ergonomics | Partial | Raw bytes remain first-class. The first typed codec shipped in 0.4.0: an optional Cap'n Proto body codec behind `-Dcapnp=true` (lazy dependency, `qmsg-codec-capnp` module; the standard packed encoding, interoperable with any Cap'n Proto implementation). JSON/protobuf/msgpack helpers and `app.rpcTyped` remain future work. |
-| 10 PASETO/PASERK auth kit | Partial | `paseto-zig` 0.3.0 is wired, v4.public verification, PASERK id lookup, qmsg claim parsing, replay hook, key rotation example, HELLO implicit assertion binding, bounded HELLO challenge propagation, listener-side challenge config helpers, and audience/purpose policy exist. Per-connection challenge minting in the QUIC listener loop shipped in 0.3.0 (`QuicOptions.hello_challenge` template + dial-side `credential_provider`); replay cache wiring at the listener seam remains. |
+| 10 PASETO/PASERK auth kit | Partial | `paseto-zig` 0.4.0 is wired, v4.public verification, PASERK id lookup, qmsg claim parsing, replay hook, key rotation example, HELLO implicit assertion binding, bounded HELLO challenge propagation, listener-side challenge config helpers, and audience/purpose policy exist. Per-connection challenge minting in the QUIC listener loop shipped in 0.3.0 (`QuicOptions.hello_challenge` template + dial-side `credential_provider`); replay cache wiring at the listener seam remains. |
 
 ## Phase 0: Decisions and Spikes
 
@@ -43,7 +43,7 @@ Tasks:
   - optional datagram send/receive probe.
 - Wire the local `quic-zig` package into qmsg builds and keep the public qmsg
   API behind qmsg-owned wrapper types.
-- Track `paseto-zig` `0.3.0` as the PASETO/PASERK dependency target and keep
+- Track `paseto-zig` `0.4.0` as the PASETO/PASERK dependency target and keep
   qmsg's auth boundary aligned with its release API.
 
 Exit criteria:
@@ -276,7 +276,7 @@ core of qmsg.
 
 Tasks:
 
-- Add `paseto-zig` `0.3.0` as the optional auth-kit dependency.
+- Add `paseto-zig` `0.4.0` as the optional auth-kit dependency.
 - Support PASETO v4.public verification for HELLO credentials via
   `paseto.v4.Public.verifyToken`.
 - Support typed PASERK `pid` key-id lookup using keys generated or parsed by

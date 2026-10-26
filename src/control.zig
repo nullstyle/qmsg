@@ -1,6 +1,9 @@
 const std = @import("std");
 
 pub const default_wire_version: u64 = 1;
+/// Unknown tags with this bit set are optional on follow-up control streams.
+/// Mandatory tags, the initial HELLO stream, and decode() remain strict.
+pub const optional_tag_bit: u64 = 1 << 61;
 
 pub const CodecOptions = struct {
     max_frame_size: usize = 64 * 1024,
@@ -21,9 +24,7 @@ pub const Tag = enum(u64) {
     credit = 5,
     /// Liveness probe: sent on a follow-up control stream when a session
     /// has been idle for the negotiated heartbeat interval. The peer MUST
-    /// answer with `pong` carrying the same token. Not yet emitted or
-    /// consumed by the runtime (the wire shape is landed ahead of the
-    /// session behavior; see docs/SPRINT.md).
+    /// answer with `pong` carrying the same token.
     ping = 6,
     /// Liveness answer: echoes the `ping` token verbatim.
     pong = 7,

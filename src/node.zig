@@ -202,9 +202,22 @@ pub const QuicRequestFailedEvent = struct {
     failure: RequestFailure,
 };
 
+pub const SessionGoawayEvent = struct {
+    allocator: std.mem.Allocator,
+    session_id: QuicSessionId,
+    code: u64,
+    reason: []const u8,
+
+    pub fn deinit(self: *SessionGoawayEvent) void {
+        self.allocator.free(self.reason);
+        self.* = undefined;
+    }
+};
+
 pub const Event = union(enum) {
     connected: session.SessionId,
     closed: session.SessionId,
+    session_goaway: SessionGoawayEvent,
     message_dropped: MessageDropped,
     request: RequestEvent,
     reply: ReplyEvent,
@@ -225,6 +238,7 @@ pub const Event = union(enum) {
             .quic_request => |*ev| ev.deinit(),
             .quic_reply => |*ev| ev.deinit(),
             .quic_delivery => |*ev| ev.deinit(),
+            .session_goaway => |*ev| ev.deinit(),
             .connected, .closed, .message_dropped, .request_failed, .quic_request_failed => {},
         }
     }
@@ -519,6 +533,9 @@ pub const QuicSessionRuntime = struct {
     /// the node's registry). Null only before createQuicSession
     /// finishes.
     control_state: ?transport.quic_control.State = null,
+    /// Released QUIC versions without ConnectionDriver need the same bounded
+    /// follow-up control readers on the dial side.
+    dial_control_reads: std.ArrayList(transport.quic_streams.ControlStreamReceiver) = .empty,
     /// True once the node's full subscription set has been queued
     /// for this session (per redial-generation session).
     subscriptions_synced: bool = false,
@@ -604,6 +621,8 @@ pub const QuicSessionRuntime = struct {
     }
 
     pub fn queueDatagram(self: *QuicSessionRuntime, outgoing: message.OutgoingMessage) !void {
+        try self.runtime.ensureOpen();
+        if (self.runtime.isDraining()) return error.EndpointClosed;
         const limits = self.runtime.session.options;
         if (self.datagram_outbox.items.len >= @min(self.node.options.quic_datagram_outbox_max, limits.max_queued_messages)) return error.QueueFull;
         var bytes: usize = outgoing.subject.len + outgoing.body.len;
@@ -668,6 +687,8 @@ pub const QuicSessionRuntime = struct {
     }
 
     fn deinit(self: *QuicSessionRuntime) void {
+        for (self.dial_control_reads.items) |*reader| reader.deinit();
+        self.dial_control_reads.deinit(self.runtime.allocator);
         self.socket_requests.deinit(self.runtime.allocator);
         if (self.reply_target) |target| {
             target.invalidate();
@@ -930,7 +951,7 @@ pub const Node = struct {
     pub fn sessionStatus(self: *Node, id: QuicSessionId) ?SessionStatus {
         const runtime = self.quicSession(id) orelse return null;
         return .{
-            .state = if (runtime.runtime.isClosingOrClosed()) .closing else if (runtime.state() == .ready) .ready else .connecting,
+            .state = if (runtime.runtime.isClosingOrClosed() or runtime.runtime.isDraining()) .closing else if (runtime.state() == .ready) .ready else .connecting,
             .peer_cert_spki = runtime.appSession().peer_cert_spki,
             .supported_patterns = runtime.appSession().peer_supported_patterns,
         };
@@ -991,6 +1012,14 @@ pub const Node = struct {
         // Cleanup precedes best-effort lifecycle notification. A full queue or
         // allocation failure cannot leave a dangling connection/session behind.
         self.destroyQuicSession(runtime);
+    }
+
+    /// Send GOAWAY and drain for an explicit interval on the caller's clock.
+    /// Keep ticking/polling; accepted requests and retained replies may finish.
+    /// closeQuicSession remains the immediate-abort operation.
+    pub fn goawayQuicSession(self: *Node, id: QuicSessionId, code: u64, reason: []const u8, now_us: u64, timeout_us: u64) !void {
+        const runtime = self.quicSession(id) orelse return error.EndpointNotFound;
+        try runtime.runtime.goaway(code, reason, now_us, timeout_us);
     }
 
     fn failSessionRequests(self: *Node, session_id: QuicSessionId) void {
@@ -1674,7 +1703,7 @@ pub const Node = struct {
         var delivered: usize = 0;
         for (matches.items) |match| {
             const runtime = self.quicSession(@intCast(match.peer_id)) orelse continue;
-            if (runtime.runtime.state() != .ready) continue;
+            if (runtime.runtime.state() != .ready or runtime.runtime.isDraining()) continue;
             runtime.appSession().admit(.{ .pattern = .sub, .subject = outgoing.subject, .datagram = true, .message_size = outgoingMessageBytes(outgoing) }) catch {
                 self.counters.dropped += 1;
                 continue;
@@ -2173,6 +2202,9 @@ pub const Node = struct {
         for (self.requests.items) |pending| {
             if (pending.deadlineUs()) |at_us| bestTimer(&best, at_us);
         }
+        for (self.quic_sessions.items) |runtime| {
+            if (runtime.runtime.nextLifecycleTimer()) |at_us| bestTimer(&best, at_us);
+        }
         return best;
     }
 
@@ -2181,7 +2213,7 @@ pub const Node = struct {
     /// (freeing any payload it owns, counting message drops and
     /// `Stats.events_dropped`) instead of growing without limit.
     pub fn emit(self: *Node, event: Event) !void {
-        const bytes = if (eventMessage(event)) |msg| queue.messageByteSize(msg) else 0;
+        const bytes = eventBytes(event);
         if (self.events.items.len >= self.options.max_events or !self.eventBytesFit(bytes)) {
             self.counters.events_dropped += 1;
             if (eventCarriesMessage(event)) self.counters.dropped += 1;
@@ -2200,9 +2232,7 @@ pub const Node = struct {
 
     fn eventBytesFit(self: *Node, incoming: usize) bool {
         var bytes = incoming;
-        for (self.events.items) |event| if (eventMessage(event)) |msg| {
-            bytes +|= queue.messageByteSize(msg);
-        };
+        for (self.events.items) |event| bytes +|= eventBytes(event);
         return bytes <= self.options.max_event_bytes;
     }
 
@@ -2296,7 +2326,7 @@ pub const Node = struct {
         sess: DriverSession,
         conn: *transport.quic_runtime.Connection,
     ) !void {
-        _ = self;
+        try self.emitSessionGoaway(sess);
         _ = try sess.pumpDatagramOutbox(conn);
     }
 
@@ -2306,6 +2336,11 @@ pub const Node = struct {
         received: transport.quic_datagram.ReceivedDatagram,
     ) !void {
         var owned = received;
+        if (sess.runtime.isDraining()) {
+            owned.deinit();
+            self.counters.dropped += 1;
+            return;
+        }
         sess.appSession().admit(.{ .subject = owned.message.subject, .datagram = true, .message_size = queue.messageByteSize(owned.message) }) catch {
             owned.deinit();
             self.counters.dropped += 1;
@@ -2339,16 +2374,27 @@ pub const Node = struct {
         sess: DriverSession,
         frames: []@import("control.zig").Frame,
     ) !void {
-        _ = self;
-        if (sess.appSession().authorization != null) {
-            for (frames) |frame| switch (frame) {
+        for (frames) |frame| {
+            if (try sess.runtime.handleLifecycleFrame(frame)) {
+                try self.emitSessionGoaway(sess);
+                continue;
+            }
+            sess.runtime.noteInboundActivity(sess.runtime.heartbeat_now_us);
+            if (sess.appSession().authorization != null) switch (frame) {
                 .subscribe => try sess.appSession().requirePattern(.sub),
                 .credit => try sess.appSession().requirePattern(.pull),
                 else => {},
             };
+            if (sess.control_state) |*state| _ = try state.applyReceived(quicRegistryPeer(sess.id()), frame);
         }
-        const state = &(sess.control_state orelse return);
-        _ = try state.applyReceivedFrames(quicRegistryPeer(sess.id()), frames);
+    }
+
+    fn emitSessionGoaway(self: *Node, sess: DriverSession) !void {
+        const frame = sess.runtime.received_goaway orelse return;
+        if (sess.runtime.goaway_notified) return;
+        const reason = try self.allocator.dupe(u8, frame.reason);
+        sess.runtime.goaway_notified = true;
+        try self.emit(.{ .session_goaway = .{ .allocator = self.allocator, .session_id = sess.id(), .code = frame.code, .reason = reason } });
     }
 
     fn tickQuicListeners(self: *Node, now_us: u64) !void {
@@ -2390,6 +2436,7 @@ pub const Node = struct {
             if (client.client.runtime.connection().isClosed()) continue;
             try self.ensureClientReady(client);
             if (!client.runtime.runtime.isClosingOrClosed()) {
+                client.runtime.runtime.heartbeat_now_us = now_us;
                 try self.pumpClientSession(client);
                 // Liveness sweep: dial sessions heartbeat on the node
                 // clock. Errors are classified by the sweep itself
@@ -2397,7 +2444,8 @@ pub const Node = struct {
                 // surface via the pump.
                 const hb_conn = client.client.runtime.connection();
                 var hb_adapter = transport.quic_streams.QuicConnectionAdapter.init(hb_conn);
-                _ = client.runtime.runtime.tickHeartbeat(now_us, &hb_adapter) catch {};
+                const outcome = client.runtime.runtime.tickHeartbeat(now_us, &hb_adapter) catch .none;
+                if (outcome == .timed_out) hb_conn.close(false, 0, "qmsg lifecycle timeout");
             }
             try client.client.tick(now_us);
             // tick may close it (idle timeout, the end of draining).
@@ -2496,10 +2544,64 @@ pub const Node = struct {
         }
         _ = try runtime.runtime.pumpConnection(conn);
         if (runtime.runtime.state() == .ready) {
+            self.pumpDialControl(runtime, conn) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    runtime.runtime.beginClosing();
+                    conn.close(false, transport.quic.protocol_error_code, "qmsg control frame error");
+                    return;
+                },
+            };
             _ = try runtime.runtime.acceptPeerBidiStreamsConnection(conn);
             _ = try runtime.runtime.pumpConnection(conn);
             try self.receiveDatagrams(runtime, conn);
             _ = try runtime.pumpDatagramOutbox(conn);
+        }
+    }
+
+    fn pumpDialControl(self: *Node, runtime: *QuicSessionRuntime, conn: *transport.quic_runtime.Connection) !void {
+        var it = conn.streams.iterator();
+        const peer_uni: u64 = if (runtime.runtime.session.role == .client) 3 else 2;
+        while (it.next()) |entry| {
+            const id = entry.key_ptr.*;
+            if (id & 3 != peer_uni or id == transport.quic_streams.peerControlStreamId(runtime.runtime.session.role)) continue;
+            const receive = conn.streamRecvState(id) orelse continue;
+            if (receive.terminal) continue;
+            var tracked = false;
+            for (runtime.dial_control_reads.items) |reader| if (reader.stream_id == id) {
+                tracked = true;
+                break;
+            };
+            if (tracked) continue;
+            if (runtime.dial_control_reads.items.len >= runtime.runtime.session.options.max_queued_messages) return error.ExcessiveLoad;
+            try runtime.dial_control_reads.append(self.allocator, transport.quic_streams.ControlStreamReceiver.init(self.allocator, id, .{
+                .codec = runtime.runtime.session.options.control_codec,
+                .skip_unknown_optional = true,
+            }));
+        }
+        var adapter = transport.quic_streams.QuicConnectionAdapter.init(conn);
+        var index: usize = 0;
+        while (index < runtime.dial_control_reads.items.len) {
+            const reader = &runtime.dial_control_reads.items[index];
+            var frames: std.ArrayList(@import("control.zig").Frame) = .empty;
+            defer {
+                for (frames.items) |*frame| frame.deinit();
+                frames.deinit(self.allocator);
+            }
+            const result = reader.pump(&adapter, &frames) catch |err| switch (err) {
+                error.StreamNotFound, error.StreamReset => {
+                    reader.deinit();
+                    _ = runtime.dial_control_reads.orderedRemove(index);
+                    continue;
+                },
+                else => return err,
+            };
+            runtime.runtime.unknown_optional_frames += result.unknown_optional_frames;
+            try self.driverControlFramesReceived(runtime, frames.items);
+            if (result.stream_complete) {
+                reader.deinit();
+                _ = runtime.dial_control_reads.orderedRemove(index);
+            } else index += 1;
         }
     }
 
@@ -2627,6 +2729,14 @@ fn quicRegistryPeer(id: QuicSessionId) protocol.pubsub.PeerId {
 
 const peerQueueDefaults: queue.QueueOptions = .{};
 
+fn eventBytes(event: Event) usize {
+    if (eventMessage(event)) |msg| return queue.messageByteSize(msg);
+    return switch (event) {
+        .session_goaway => |ev| ev.reason.len,
+        else => 0,
+    };
+}
+
 fn eventMessage(event: Event) ?message.Message {
     return switch (event) {
         .request => |ev| ev.msg,
@@ -2642,7 +2752,7 @@ fn eventMessage(event: Event) ?message.Message {
 fn eventCarriesMessage(event: Event) bool {
     return switch (event) {
         .request, .reply, .delivery, .quic_request, .quic_reply, .quic_delivery => true,
-        .connected, .closed, .message_dropped, .request_failed, .quic_request_failed => false,
+        .connected, .closed, .session_goaway, .message_dropped, .request_failed, .quic_request_failed => false,
     };
 }
 
@@ -4094,6 +4204,75 @@ test "foreign embedder drives qmsg sessions through its own Driver end to end" {
     // fall off the end with the connection live; the defers tear the
     // listener down first (hook -> onDisconnect -> session destroyed
     // exactly once), then the driver, then the node's leftovers.
+}
+
+test "lifecycle: foreign embedder answers PING and receives GOAWAY on its explicit clock" {
+    const allocator = std.testing.allocator;
+    const opts: transport.quic.QuicOptions = .{ .peer_id = "foreign-lifecycle", .heartbeat_interval_ms = 20 };
+    var node = try Node.init(allocator, .{});
+    defer node.deinit();
+    var peers: EmbedTestPeers = undefined;
+    try embedPeersInit(&peers, allocator, &node, opts, opts);
+    defer peers.embedder.destroy();
+    defer peers.listener.deinit();
+    defer peers.client.deinit();
+    const client = try node.openQuicSession(.{ .role = .client, .transport = opts });
+    const server = try embedPeersUntilReady(&peers, &node, client);
+    const server_id = server.id();
+    for (0..1500) |_| {
+        client.runtime.heartbeat_now_us = peers.now_us;
+        try node.pumpQuicSessionConnection(client, peers.client.connection());
+        var adapter = transport.quic_streams.QuicConnectionAdapter.init(peers.client.connection());
+        _ = try client.runtime.tickHeartbeat(peers.now_us, &adapter);
+        peers.embedder.dispatch.setHeartbeatClock(peers.now_us);
+        try peers.drive();
+        try std.testing.expectEqual(transport.quic.State.ready, server.state());
+    }
+    try std.testing.expect(server.runtime.pings_received > 0);
+    try std.testing.expect(client.runtime.pings_received > 0);
+    try node.goawayQuicSession(client.id(), 7, "foreign drain", peers.now_us, 200_000);
+    var got_goaway = false;
+    for (0..100) |_| {
+        client.runtime.heartbeat_now_us = peers.now_us;
+        try node.pumpQuicSessionConnection(client, peers.client.connection());
+        peers.embedder.dispatch.setHeartbeatClock(peers.now_us);
+        try peers.drive();
+        var events: [8]Event = undefined;
+        const count = try node.poll(&events);
+        defer for (events[0..count]) |*event| event.deinit();
+        for (events[0..count]) |event| if (event == .session_goaway) {
+            try std.testing.expect(!got_goaway);
+            got_goaway = true;
+            try std.testing.expectEqual(server_id, event.session_goaway.session_id);
+            try std.testing.expectEqualStrings("foreign drain", event.session_goaway.reason);
+        };
+    }
+    try std.testing.expect(got_goaway);
+    try std.testing.expect(server.runtime.isDraining());
+    try std.testing.expect(server.runtime.nextLifecycleTimer() != null);
+}
+
+test "lifecycle: Node timer includes heartbeat and drain and bounded GOAWAY frees its reason" {
+    var node = try Node.init(std.testing.allocator, .{ .max_event_bytes = 1 });
+    defer node.deinit();
+    const runtime = try node.openQuicSession(.{ .role = .client, .transport = .{ .heartbeat_interval_ms = 100, .datagram_enabled = true } });
+    try readyQuicRuntimeForTest(runtime, "peer", true);
+    runtime.runtime.session.session.peer_heartbeat_interval_ms = 100;
+    runtime.runtime.last_activity_us = 500_000;
+    try std.testing.expectEqual(@as(u64, 600_000), node.nextTimer().?);
+    try node.goawayQuicSession(runtime.id(), 1, "drain", 510_000, 200_000);
+    try std.testing.expectEqual(@as(u64, 710_000), node.nextTimer().?);
+    const control = @import("control.zig");
+    var frames = [_]control.Frame{.{ .goaway = .{ .code = 2, .reason = "larger than event cap" } }};
+    try node.driverControlFramesReceived(runtime, &frames);
+    try std.testing.expectEqual(@as(usize, 1), node.stats().events_dropped);
+    try std.testing.expect(runtime.runtime.goaway_notified);
+    try node.driverControlFramesReceived(runtime, &frames);
+    try std.testing.expectEqual(@as(usize, 1), node.stats().events_dropped);
+    const incoming = try message.Message.init(std.testing.allocator, .{ .subject = "new.datagram", .body = "during drain", .flags = .{ .unreliable = true } });
+    try node.driverDatagramReceived(runtime, .{ .message = incoming });
+    try std.testing.expectEqual(@as(usize, 0), runtime.datagram_inbox.items.len);
+    try std.testing.expectEqual(@as(usize, 1), node.stats().dropped);
 }
 
 test "foreign embedder: reply deferred past the poll loop still reaches the requester" {

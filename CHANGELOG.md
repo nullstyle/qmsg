@@ -7,6 +7,22 @@ changes.
 
 ## [Unreleased]
 
+- Finish negotiated PING/PONG handling across owned, accepted, and foreign
+  QUIC sessions. Lifecycle responses have bounded state under flow control;
+  heartbeat and drain wakeups are exposed to the owner loop.
+- Add `Node.goawayQuicSession(id, code, reason, now_us, timeout_us)` for an
+  explicit drain interval, and the owned `Event.session_goaway` notification.
+  Existing streams and deferred replies keep running while new work is
+  refused. Remote GOAWAY uses `QuicOptions.drain_timeout_ms` (default 5000).
+  `closeQuicSession(id)` retains its immediate-abort behavior. Exhaustive
+  event switches must account for the new variant.
+- Skip bounded unknown optional control frames (tag bit 61) on follow-up
+  streams while retaining strict startup, required-tag, and malformed-frame
+  handling. ALPN `qmsg/1` and HELLO wire version 1 are unchanged.
+- Refresh current dependency and lifecycle documentation. Public package
+  pins remain QUIC v0.37.2, PASETO 0.4.0, and Zig 0.17.0; Sprint 1 candidate
+  qualification is recorded separately from released-package evidence.
+
 ## [0.8.5] - 2026-10-08
 
 The quic-zig v0.37.2 release: the pin moves, nothing else changes

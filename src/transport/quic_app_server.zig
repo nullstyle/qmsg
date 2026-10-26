@@ -46,6 +46,7 @@ pub fn ServerDispatch(comptime Owner: type) type {
             allocator: std.mem.Allocator,
             owner: *Owner,
             transport_options: quic.QuicOptions,
+            heartbeat_now_us: u64 = 0,
 
             pub const ConnState = struct {
                 /// Absent until the handshake delegates the connection
@@ -160,6 +161,7 @@ pub fn ServerDispatch(comptime Owner: type) type {
         /// means no sweep runs.
         pub fn setHeartbeatClock(self: *Self, now_us: u64) void {
             self.heartbeat_now_us = now_us;
+            self.app.heartbeat_now_us = now_us;
         }
 
         fn embedded(self: *Self) Embedded {
@@ -169,7 +171,9 @@ pub fn ServerDispatch(comptime Owner: type) type {
         // ---- Driver hooks: delegate to the embedded dispatch ------
 
         fn embeddedFor(app: *App) Embedded {
-            return Embedded.init(app.allocator, app.owner, app.transport_options, .dispatch);
+            var dispatch = Embedded.init(app.allocator, app.owner, app.transport_options, .dispatch);
+            dispatch.setHeartbeatClock(app.heartbeat_now_us);
+            return dispatch;
         }
 
         fn onHandshake(app: *App, s: *D.Session) anyerror!void {

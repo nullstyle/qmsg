@@ -46,7 +46,7 @@ auth_properties
   key_id_hint: optional PASERK ID string
 ```
 
-The intended first auth scheme is PASETO, using `paseto-zig` once it has a
+The implemented auth scheme is PASETO, using the pinned `paseto-zig`
 release. PASERK key identifiers are strings such as `k4.pid...` and are used
 only as lookup hints into a trusted local key store. See [AUTH.md](AUTH.md).
 
@@ -209,27 +209,35 @@ may be counted.
 
 ## Control Frames
 
-Candidate control frames:
+Implemented control tags use QUIC varints:
 
-```text
-HELLO
-PING
-PONG
-GOAWAY
-SUBSCRIBE
-UNSUBSCRIBE
-CREDIT
-RESET_PATTERN
-SESSION_ERROR
-```
+| Tag | Frame | Payload |
+| --- | --- | --- |
+| 1 | HELLO | Session offers and credentials described above |
+| 2 | GOAWAY | Application code and length-prefixed reason bytes |
+| 3 | SUBSCRIBE | Filter and subscription options |
+| 4 | UNSUBSCRIBE | Filter |
+| 5 | CREDIT | Filter, message credit, byte credit |
+| 6 | PING | Opaque varint token |
+| 7 | PONG | The corresponding PING token |
 
-MVP needs:
+Each control stream begins with the qmsg stream marker. Each frame is a
+length-prefixed payload, bounded by `CodecOptions.max_frame_size`. Startup
+requires a valid HELLO. Later one-shot unidirectional control streams carry
+lifecycle and subscription updates and end with FIN.
 
-- `HELLO`
-- `GOAWAY`
-- `SUBSCRIBE`
-- `UNSUBSCRIBE`
-- `CREDIT` if push/pull is in MVP, otherwise later
+Both HELLOs must offer a nonzero `heartbeat_interval_ms` to enable heartbeats.
+The effective interval is the smaller offer. An idle runtime sends PING;
+the peer answers with the same token in PONG. The probe timeout is twice the
+interval, with a one-second floor. Callers supply the monotonic clock; the
+runtime exposes its lifecycle deadline for event-loop waiting.
+
+Unknown tags with bit 61 set (`1 << 61`) are optional extensions. On follow-up
+control streams, a receiver skips their bounded length-delimited payloads.
+Unknown tags without that bit are required and fail the session. Startup
+HELLO validation and standalone `control.decode` remain strict; malformed or
+oversized frames are never accepted as optional extensions. RESET_PATTERN
+and SESSION_ERROR remain unimplemented proposals.
 
 ## Stream Lifetime
 
@@ -258,6 +266,14 @@ Connection close:
 
 - transport-level close for protocol violations and hard session failures;
 - application-level close for graceful node shutdown.
+
+`GOAWAY(code, reason)` begins application draining. New requests are refused;
+existing streams and deferred replies continue for an explicit bounded
+interval. The local initiator chooses the interval; a receiver uses its local
+`drain_timeout_ms` policy (default five seconds). The interval is not a wire
+field, and no empty-queue heuristic closes it early. At its deadline, the
+connection closes and unfinished requests receive their normal terminal
+failure. The immediate-abort library operation remains available separately.
 
 Stream reset:
 

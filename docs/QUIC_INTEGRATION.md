@@ -1,14 +1,14 @@
 # qmsg QUIC Integration Plan
 
-This plan maps qmsg's transport boundary onto the current `quic-zig`
-checkout at `/Users/nullstyle/prj/ai-workspace/quic-zig`. It intentionally
-ignores HTTP/3. qmsg owns the application protocol: ALPN `qmsg/1`, qmsg
+This plan maps qmsg's transport interface onto the released `quic-zig`
+dependency pinned in `build.zig.zon`. HTTP/3 remains outside qmsg. qmsg owns the application protocol: ALPN `qmsg/1`, qmsg
 control frames, qmsg message envelopes, pattern state, auth policy, and
 backpressure semantics.
 
 ## Current quic-zig Surface
 
-Use the public module name `quic_zig`.
+Import the public module as `quic`. The source examples below use
+`quic_zig` as a local alias for that import.
 
 Relevant entry points:
 
@@ -29,7 +29,7 @@ loop without requiring an extra app thread.
 
 ## Current qmsg Status
 
-The repository already has the local `quic_zig` dependency wired through
+The repository has the released `quic` dependency wired through
 `build.zig.zon` and `build.zig`. The current QUIC implementation is split
 across qmsg-owned transport modules:
 
@@ -61,7 +61,9 @@ This is still not the final network transport. qmsg has the low-level UDP and
 session-driver pieces and `Node` now owns listener/client tick wiring, socket
 attachment helpers, reliable message dispatch, and decoded datagram queues.
 It does not yet expose public QUIC socket convenience APIs or automatically
-flush SUBSCRIBE/CREDIT state over live sessions.
+flush CREDIT state over live sessions. SUBSCRIBE/UNSUBSCRIBE emission is
+implemented. Heartbeat and GOAWAY runtime behavior is described in
+[MIGRATION.md](MIGRATION.md#quic-heartbeat-and-graceful-shutdown).
 
 ## Current Embedding Examples
 
@@ -106,7 +108,7 @@ Sockets own pattern state, deadlines, queues, and request correlation.
 ## Build Integration
 
 qmsg pins a quic-zig release tarball (`build.zig.zon`, URL + hash; today
-v0.32.0, module `quic`, with its BoringSSL as module `boringssl`). Its floor
+v0.37.2, module `quic`, with its BoringSSL as module `boringssl`). Its floor
 is the tagged Zig 0.17.0, and `mise.toml` pins the same Zig. Move the two
 together: quic-zig's `build.zig` refuses a Zig older than its floor.
 
