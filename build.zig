@@ -128,6 +128,7 @@ pub fn build(b: *std.Build) !void {
     addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "quic-socket-hooks", "examples/quic_socket_hooks.zig");
     addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "quic-app-dispatch", "examples/quic_app_dispatch.zig");
     addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "quic-node-localhost", "examples/quic_node_localhost.zig");
+    addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "quic-owned-reqrep", "examples/quic_owned_reqrep.zig");
 
     const test_step = b.step("test", "Run qmsg unit tests");
     test_step.dependOn(&run_unit_tests.step);

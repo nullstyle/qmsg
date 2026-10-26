@@ -39,6 +39,10 @@ pub const NodeOptions = struct {
     max_event_bytes: usize = 16 * 1024 * 1024,
     delivery: enum { events, legacy } = .events,
     event_format: enum { canonical, legacy_transport } = .canonical,
+    /// Admission for new peer-initiated reliable streams. Replies to local
+    /// requests still use the canonical tracker. Owned typed QUIC sockets set
+    /// this profile; ordinary Nodes retain request/reply behavior.
+    quic_inbound: enum { requests, pair, refuse } = .requests,
     io: std.Io = std.Io.Threaded.global_single_threaded.io(),
 };
 
@@ -423,10 +427,9 @@ pub const QuicListenOptions = struct {
 ///
 /// `transport.supported_patterns` is ANNOUNCED in the qmsg HELLO and
 /// is meaningful on dials: announce the patterns the dial will
-/// actually use — a req/rep dial announces `req | rep` (see the
-/// examples). A req-only announcement looks plausible but tells the
-/// peer this client will not accept replies, which the peer's policy
-/// may enforce.
+/// actually use. A general bidirectional request/reply Node announces
+/// `req | rep`; a typed request-only endpoint announces `req` and requires
+/// the peer's `rep`. HELLO compatibility pairs complementary roles.
 pub const QuicDialOptions = struct {
     /// Require the authenticated server key to match the intended peer.
     expected_peer_spki: ?[32]u8 = null,
@@ -947,6 +950,29 @@ pub const Node = struct {
         return null;
     }
 
+    pub fn quicListenerAddress(self: *const Node, id: QuicListenerId) !std.Io.net.IpAddress {
+        if (id >= self.quic_listeners.items.len) return error.EndpointNotFound;
+        return self.quic_listeners.items[id].localAddress();
+    }
+
+    /// Borrow every UDP readiness handle without exposing session ownership.
+    /// The list is complete or BufferTooSmall leaves out untouched. Handles
+    /// remain borrowed only until the next operation that may close a socket.
+    pub fn readableSockets(self: *const Node, out: []std.Io.net.Socket.Handle) !usize {
+        const count = self.quic_listeners.items.len + self.quic_clients.items.len;
+        if (out.len < count) return error.BufferTooSmall;
+        var index: usize = 0;
+        for (self.quic_listeners.items) |listener| {
+            out[index] = listener.listener.socket.handle;
+            index += 1;
+        }
+        for (self.quic_clients.items) |client| {
+            out[index] = client.client.socket.handle;
+            index += 1;
+        }
+        return count;
+    }
+
     /// Allocation/dialing is not readiness: ready requires verified TLS and HELLO.
     pub fn sessionStatus(self: *Node, id: QuicSessionId) ?SessionStatus {
         const runtime = self.quicSession(id) orelse return null;
@@ -1174,6 +1200,16 @@ pub const Node = struct {
             .quic => |id| _ = try self.requestQuic(id, outgoing),
         }
         return self.requests.items[self.requests.items.len - 1].request_id;
+    }
+
+    /// A reliable one-way message. It owns no request reservation; the peer
+    /// closes the unused reply half after consuming the message.
+    pub fn sendQuic(self: *Node, id: QuicSessionId, outgoing: message.OutgoingMessage) !void {
+        const runtime = self.quicSession(id) orelse return error.EndpointNotFound;
+        var configured = outgoing;
+        configured.flags.no_reply = true;
+        _ = try runtime.queueReliable(configured);
+        self.counters.sent += 1;
     }
 
     pub fn cancelRequest(self: *Node, id: RequestId) !bool {
@@ -1452,7 +1488,7 @@ pub const Node = struct {
                     received.deinit();
                     continue;
                 }
-                endpoint.session.admit(.{ .pattern = .rep, .subject = received.message.subject, .message_size = bytes }) catch |err| {
+                endpoint.session.admit(.{ .pattern = .req, .subject = received.message.subject, .message_size = bytes }) catch |err| {
                     self.rejectRequest(received.message, err);
                     received.deinit();
                     continue;
@@ -1517,17 +1553,33 @@ pub const Node = struct {
                 );
                 const incoming_bytes = queue.messageByteSize(runtime.runtime.inbox.items[0].message);
                 const oversized = incoming_bytes > self.options.max_event_bytes;
-                if (is_request and !oversized and (self.events.items.len >= self.options.max_events or !self.eventBytesFit(incoming_bytes))) break;
-                if (is_request) try runtime.attachReplyHandle(&runtime.runtime.inbox.items[0].message, stream_id);
+                if (is_request and self.options.quic_inbound != .refuse and !oversized and (self.events.items.len >= self.options.max_events or !self.eventBytesFit(incoming_bytes))) break;
+                if (is_request and self.options.quic_inbound == .requests) try runtime.attachReplyHandle(&runtime.runtime.inbox.items[0].message, stream_id);
                 var received = runtime.runtime.recvReliable() orelse break;
                 var incoming = received.takeMessage();
                 if (is_request) {
+                    if (self.options.quic_inbound == .refuse) {
+                        self.refuseQuicStream(runtime, stream_id, incoming);
+                        continue;
+                    }
+                    if (self.options.quic_inbound == .pair) {
+                        if (oversized or !incoming.flags.no_reply) {
+                            self.refuseQuicStream(runtime, stream_id, incoming);
+                            continue;
+                        }
+                        runtime.appSession().admit(.{ .pattern = .pair, .subject = incoming.subject, .message_size = incoming_bytes }) catch {
+                            self.refuseQuicStream(runtime, stream_id, incoming);
+                            continue;
+                        };
+                        try self.emit(.{ .delivery = .{ .session_id = runtime.id(), .msg = incoming } });
+                        continue;
+                    }
                     if (oversized) {
                         self.rejectRequest(incoming, error.MessageTooLarge);
                         incoming.deinit();
                         continue;
                     }
-                    runtime.appSession().admit(.{ .pattern = .rep, .subject = incoming.subject, .message_size = queue.messageByteSize(incoming) }) catch |err| {
+                    runtime.appSession().admit(.{ .pattern = .req, .subject = incoming.subject, .message_size = queue.messageByteSize(incoming) }) catch |err| {
                         self.rejectRequest(incoming, err);
                         incoming.deinit();
                         continue;
@@ -1562,6 +1614,16 @@ pub const Node = struct {
                     .msg = incoming,
                 } });
             }
+        }
+    }
+
+    fn refuseQuicStream(self: *Node, runtime: *QuicSessionRuntime, stream_id: u64, incoming: message.Message) void {
+        var owned = incoming;
+        owned.deinit();
+        self.counters.dropped += 1;
+        if (runtime.connection) |conn| {
+            conn.streamReset(stream_id, 0x51_07) catch {};
+            conn.streamStopSending(stream_id, 0x51_07) catch {};
         }
     }
 
@@ -2059,7 +2121,7 @@ pub const Node = struct {
             const stream_id = received.stream_id;
             var incoming = received.takeMessage();
             if (transport.quic_session_runtime.isPeerBidiStreamId(runtime.runtime.session.role, stream_id)) {
-                runtime.appSession().admit(.{ .pattern = .rep, .subject = incoming.subject, .message_size = queue.messageByteSize(incoming) }) catch |err| {
+                runtime.appSession().admit(.{ .pattern = .req, .subject = incoming.subject, .message_size = queue.messageByteSize(incoming) }) catch |err| {
                     self.rejectRequest(incoming, err);
                     incoming.deinit();
                     continue;
@@ -6694,6 +6756,38 @@ test "canonical inproc admission denies before surfacing a request" {
     try std.testing.expect(outcome.reply.msg.flags.err);
     try std.testing.expectEqualStrings("Unauthorized", outcome.reply.msg.body);
     for (n.events.items) |event| try std.testing.expect(event != .request);
+}
+
+test "owned QUIC canonical inbound profiles authorize pair and refuse requests on req" {
+    var pair = try Node.init(std.testing.allocator, .{ .quic_inbound = .pair });
+    defer pair.deinit();
+    const sess = try pair.openQuicSession(.{ .role = .server });
+    try readyQuicRuntimeForTest(sess, "peer", false);
+    try sess.appSession().replaceAuthorization(std.testing.allocator, .{ .subject = "peer", .issuer = "test", .allowed_patterns = auth.PatternSet.init(&.{.rep}) });
+    try queueReliableForTest(sess, 0, .{ .subject = "pair", .flags = .{ .no_reply = true } });
+    var events: [8]Event = undefined;
+    var count = try pair.poll(&events);
+    for (events[0..count]) |*event| {
+        defer event.deinit();
+        try std.testing.expect(event.* != .delivery and event.* != .request);
+    }
+    try std.testing.expectEqual(@as(usize, 1), pair.stats().dropped);
+    try sess.appSession().replaceAuthorization(std.testing.allocator, .{ .subject = "peer", .issuer = "test", .allowed_patterns = auth.PatternSet.init(&.{.pair}) });
+    try queueReliableForTest(sess, 4, .{ .subject = "pair", .flags = .{ .no_reply = true } });
+    count = try pair.poll(&events);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    defer events[0].deinit();
+    try std.testing.expect(events[0] == .delivery);
+    try std.testing.expect(events[0].delivery.msg.reply_handle == null);
+
+    var req = try Node.init(std.testing.allocator, .{ .quic_inbound = .refuse, .max_events = 0 });
+    defer req.deinit();
+    const malicious = try req.openQuicSession(.{ .role = .server });
+    try readyQuicRuntimeForTest(malicious, "peer", false);
+    try queueReliableForTest(malicious, 0, .{ .subject = "illegal request" });
+    count = try req.poll(&events);
+    try std.testing.expectEqual(@as(usize, 0), count);
+    try std.testing.expectEqual(@as(usize, 1), req.stats().dropped);
 }
 
 test "ready session lookup skips older incompatible peers" {

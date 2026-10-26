@@ -33,6 +33,9 @@ and embedded or App-driven consumption. The public root module exports:
   session driving, stream, cancellation, datagram, and live control-frame
   surfaces over `quic-zig`;
 - `App`, `Context`, and `Session`;
+- `QuicSocket(.pair/.req/.rep)`, an owned QUIC facade with explicit
+  `pump(now_us)`, canonical `poll` events, deadlines, and borrowed readiness
+  handles; see [the owned socket guide](docs/SPRINT_2_QUIC_SOCKETS.md);
 - an embeddable socketless `Node` surface: the embedder owns the
   loop and clock (`tick`/`poll`), the Node owns every inproc socket,
   and all outcomes render from poll events — requests with
@@ -60,9 +63,9 @@ handshake, qmsg HELLO, and reliable req/rep over QUIC streams. Wiring these
 pieces into `Node.listenQuic`/`dialQuic` runtime loops is implemented: `Node`
 owns UDP listener/client sockets, per-session drivers, socket attachment
 helpers, tick-driven reliable stream pumping, and decoded datagram dispatch
-queues. An opt-in Node/App localhost example exercises the live UDP loop by
-queuing a reliable message directly on the current session runtime. Public
-`Socket.listen(.quic)`/`dial(.quic)` convenience APIs remain future work.
+queues. Public `QuicSocket` instances own the listener/client runtime and use
+the Node request/outcome engine. Node, App, and owned-socket localhost examples
+drive those public interfaces with an explicit caller clock.
 
 Standalone `Node` defaults to canonical events for both transports. Use
 `request(.{ .inproc = dial_id }, outgoing)` or
@@ -158,6 +161,44 @@ std.debug.assert(reply.id == id);
 
 See [examples/inproc_reqrep.zig](examples/inproc_reqrep.zig) for the pair and
 req/rep example shape.
+
+## Owned QUIC Socket Style
+
+Use `QuicSocket` when the application wants qmsg to own its UDP sockets and
+session state. Supply TLS options to `listen` or `dial`, then drive `pump` with
+monotonic microseconds and consume canonical events through `poll`:
+
+```zig
+var client = try qmsg.QuicSocket(.req).init(allocator, .{});
+defer client.deinit();
+const session_id = try client.dial("127.0.0.1:4433", .{
+    .server_name = "service.example",
+    .ca_pem = trusted_ca,
+});
+var request_id: ?qmsg.RequestId = null;
+// In the owner loop:
+try client.pump(now_us);
+if (client.sessionStatus(session_id)) |status| {
+    if (status.state == .ready and request_id == null) {
+        request_id = try client.request(session_id, .{
+            .subject = "user.get",
+            .body = "42",
+            .deadline_ms = 250,
+        });
+    }
+}
+```
+
+The serving `QuicSocket(.rep)` receives request events and replies through their
+`ReplyHandle`. `QuicSocket(.pair)` sends reliable messages and receives delivery
+events. `nextTimer` and `readableSockets` let the owner wait on deadlines and
+UDP readiness. See [the complete ownership and loop contract](docs/SPRINT_2_QUIC_SOCKETS.md).
+The runnable [owned req/rep example](examples/quic_owned_reqrep.zig) includes
+the owner clock, readiness wait, and deferred reply.
+
+The lower-level `Socket` retains inproc and foreign-driver attachment use.
+Its address-only `.quic` endpoint has no TLS/runtime configuration; owned
+connections use the explicitly configured `QuicSocket` interface.
 
 ## App Facade Style
 
@@ -284,13 +325,11 @@ The decoded App dispatch smoke stays hermetic as well:
 ./zig-out/bin/quic-app-dispatch
 ```
 
-The live localhost smoke uses `App.listenQuic`, `Node.dialQuic`, and the
-Node-owned UDP tick loop. It is opt-in because some CI/sandboxed environments
-do not permit UDP binds. When enabled, it queues one reliable message directly
-on the session runtime and lets `App.runOnce` dispatch the server-side request.
-`App.init` selects inbox delivery for that dispatcher; this low-level example
-consumes its client reply directly. Standalone Nodes use canonical poll events
-by default, as shown in `embedded-quic-attach`.
+The live localhost smoke uses the public Node/App request and dispatch
+interfaces with the Node-owned UDP tick loop. It is opt-in because some
+CI/sandboxed environments do not permit UDP binds. `App.init` selects inbox
+delivery for its `runOnce` dispatcher; standalone Nodes and owned sockets use
+canonical poll events.
 
 ```sh
 QMSG_RUN_LIVE_UDP=1 ./zig-out/bin/quic-node-localhost
@@ -303,8 +342,8 @@ socket:
 ./zig-out/bin/quic-node-localhost
 ```
 
-The public socket convenience APIs still stay explicit about unsupported
-direct `.quic` endpoints.
+Owned pair/req/rep connections use `QuicSocket` with explicit TLS options and
+owner-driven pumping. See [the owned socket guide](docs/SPRINT_2_QUIC_SOCKETS.md).
 
 ## Design Tenets
 

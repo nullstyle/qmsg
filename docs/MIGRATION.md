@@ -169,6 +169,25 @@ malformed frames, and invalid startup HELLOs remain errors. The standalone
 control decoder remains strict. ALPN and the HELLO wire version remain
 `qmsg/1` and `1`.
 
+## Owned QUIC facade and peer-role grants
+
+`QuicSocket(.pair/.req/.rep)` provides owned listen/dial with explicit
+`pump(now_us)` and canonical poll events. It owns one heap-stable Node; configure
+limits through its `node` options and use its `nextTimer` / `readableSockets`
+methods in the owner loop. Its selected inbound profile and canonical delivery
+are fixed by the socket type. See [the Sprint 2 guide](SPRINT_2_QUIC_SOCKETS.md).
+
+Automatic authorization now consistently checks the peer action accepted at
+HELLO: REP handlers admit REQ peers, PULL handlers admit PUSH peers, SUB handlers
+admit PUB peers, and PAIR remains PAIR. Previously request admission checked the
+local REP role after authenticating a REQ peer, making minimal REQ grants
+unusable. Change local-receiver-only grants to peer-action grants when migrating.
+Explicit `requirePattern` checks remain literal; `requireRouteAccess` maps the
+local handler to its peer action. Subject restrictions and anonymous policy
+are unchanged.
+If an explicit handler check used `requirePattern(.rep)` to mean "may issue
+requests", change that check to `.req` or use `requireRouteAccess`.
+
 ## Explicit compatibility mode
 
 Older direct-inbox integrations can opt into:

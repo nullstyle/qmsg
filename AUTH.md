@@ -78,6 +78,25 @@ operations. `qmsg` should still start with v4.public session credentials and
 use the rest of the dependency as operational tooling until a specific runtime
 need appears.
 
+## Peer roles and automatic route admission
+
+Pattern grants describe what the authenticated **peer** may do, matching the
+roles in its HELLO. A client making RPC requests needs `req`; a service answering
+them needs `rep`. A receiver's automatic admission checks the complementary
+peer role: REP requires `req`, PULL requires `push`, SUB requires `pub`, and
+PAIR requires `pair`. The subject restriction still applies to the incoming
+message's subject. HELLO rejects advertised roles missing from the peer's grant.
+
+`Context.pattern` describes the local route. `Context.requireRouteAccess()` maps
+that route to its peer role automatically. Explicit `requirePattern(.req)` is a
+literal peer-role check and performs no mapping. Subscriber and credit controls
+likewise check the peer's `sub` and `pull` roles directly.
+
+For example, an RPC caller credential scoped to `user.*` uses
+`"patterns": ["req"]`; granting the local handler's `rep` role alone does not
+authorize that caller. A service worker advertising `rep` and `pull`, as below,
+continues to use those two grants for its own roles.
+
 ## HELLO Authentication
 
 `qmsg/1` already has a `HELLO` control frame. Add optional auth fields:
@@ -496,7 +515,7 @@ Handler:
 ```zig
 fn getUser(ctx: *qmsg.Context, msg: qmsg.Message) !void {
     try ctx.requireSubject("user.get");
-    try ctx.requirePattern(.rep);
+    try ctx.requirePattern(.req); // The authenticated caller makes requests.
     // Authorization has already been validated and cached on session.
 }
 ```

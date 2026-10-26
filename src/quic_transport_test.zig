@@ -350,7 +350,9 @@ test "qmsg QUIC sessions exchange HELLO over real QUIC uni streams" {
     var server = try quic.QuicSession.init(allocator, 21, .server, .{
         .peer_id = "server-a",
         .role_flags = control.RoleFlags.server,
-        .supported_patterns = control.PatternBits.req,
+        // The server serves the complementary REP role, rather than the
+        // same REQ role the original overlap-only fixture advertised.
+        .supported_patterns = control.PatternBits.rep,
         .datagram_enabled = true,
         .max_message_size = 4096,
     });

@@ -12,16 +12,21 @@ pub const Pattern = enum(u8) {
     push,
     pull,
 
-    pub fn canSendTo(self: Pattern, peer: Pattern) bool {
+    /// The peer role that can exchange messages with this local role.
+    pub fn counterpart(self: Pattern) Pattern {
         return switch (self) {
-            .pair => peer == .pair,
-            .req => peer == .rep,
-            .rep => peer == .req,
-            .@"pub" => peer == .sub,
-            .sub => peer == .@"pub",
-            .push => peer == .pull,
-            .pull => peer == .push,
+            .pair => .pair,
+            .req => .rep,
+            .rep => .req,
+            .@"pub" => .sub,
+            .sub => .@"pub",
+            .push => .pull,
+            .pull => .push,
         };
+    }
+
+    pub fn canSendTo(self: Pattern, peer: Pattern) bool {
+        return peer == self.counterpart();
     }
 
     pub fn expectsReplies(self: Pattern) bool {

@@ -179,11 +179,13 @@ pub const Context = struct {
         try sess.requireSubject(subject_name);
     }
 
+    /// Check the authenticated peer role complementary to this local route.
+    /// Explicit requirePattern remains a literal peer-role check.
     pub fn requireRouteAccess(self: *const Context) auth.Error!void {
         const sess = self.session orelse return auth.Error.AuthenticationRequired;
         const datagram = self.route_kind == .datagram;
         try sess.check(.{
-            .pattern = if (self.pattern) |pattern| authPattern(pattern) else null,
+            .pattern = if (self.pattern) |pattern| authPattern(pattern.counterpart()) else null,
             .subject = if (self.request_subject.len == 0) null else self.request_subject,
             .datagram = datagram,
             .message_size = self.request_message_size,
@@ -479,7 +481,7 @@ pub const App = struct {
 
         if (options.session) |sess| {
             sess.admit(.{
-                .pattern = if (kind.pattern()) |pattern| authPattern(pattern) else null,
+                .pattern = if (kind.pattern()) |pattern| authPattern(pattern.counterpart()) else null,
                 .subject = owned.subject,
                 .datagram = kind == .datagram,
                 .message_size = messageSize(owned),
@@ -566,6 +568,19 @@ pub const App = struct {
             .client_ca_pem = tls.client_ca_pem,
             .transport = tls.quic,
         });
+    }
+
+    pub fn quicListenerAddress(self: *const App, id: node.QuicListenerId) !std.Io.net.IpAddress {
+        return self.node.quicListenerAddress(id);
+    }
+
+    /// Borrowed descriptors and absolute monotonic deadline for the owner's wait.
+    pub fn readableSockets(self: *const App, out: []std.Io.net.Socket.Handle) !usize {
+        return self.node.readableSockets(out);
+    }
+
+    pub fn nextTimer(self: *const App) ?u64 {
+        return self.node.nextTimer();
     }
 
     pub fn dialQuic(self: *App, addr: []const u8, options: node.QuicDialOptions) !node.QuicSessionId {
@@ -905,7 +920,7 @@ test "App dispatchQuic routes REP reply with session auth" {
     sess.setAuthorization(.{
         .subject = "service:users",
         .issuer = "test",
-        .allowed_patterns = auth.PatternSet.init(&.{.rep}),
+        .allowed_patterns = auth.PatternSet.init(&.{.req}),
         .allowed_subjects = .{ .filters = &.{"user.*"} },
     });
 
@@ -1494,7 +1509,7 @@ test "App runOnce serves real req rep through inproc facade with handler auth ch
     sess.setAuthorization(.{
         .subject = "service:users",
         .issuer = "test",
-        .allowed_patterns = auth.PatternSet.init(&.{.rep}),
+        .allowed_patterns = auth.PatternSet.init(&.{.req}),
         .allowed_subjects = .{ .filters = &.{"user.*"} },
     });
 
@@ -1575,8 +1590,35 @@ test "App enforces session policy before an ungated handler" {
         .id = 1,
         .transport = .inproc,
         .auth_state = .authenticated,
-        .authorization = .{ .subject = "peer", .issuer = "test", .allowed_patterns = .{ .rep = true }, .allowed_subjects = .deny_all },
+        .authorization = .{ .subject = "peer", .issuer = "test", .allowed_patterns = .{ .req = true }, .allowed_subjects = .deny_all },
     };
     const incoming = try message.Message.init(allocator, .{ .subject = "private.work", .body = "must not dispatch" });
     try std.testing.expectError(error.Unauthorized, application.dispatchRep(incoming, .{ .session = &restricted }));
+}
+
+test "automatic route authorization checks counterpart peer roles literally" {
+    const Handler = struct {
+        fn run(ctx: *Context, incoming: message.Message) !void {
+            var msg = incoming;
+            defer msg.deinit();
+            try ctx.requireRouteAccess();
+            try ctx.requirePattern(authPattern(ctx.pattern.?.counterpart()));
+        }
+    };
+    var application = try App.init(std.testing.allocator, .{});
+    defer application.deinit();
+    try application.rep("allowed", Handler.run);
+    try application.pull("allowed", Handler.run);
+    try application.sub("allowed", Handler.run);
+    inline for (.{ RouteKind.rep, RouteKind.pull, RouteKind.sub }) |kind| {
+        var peer: session.Session = .{ .id = 1, .transport = .inproc };
+        peer.setAuthorization(.{ .subject = "peer", .issuer = "fixture", .allowed_patterns = auth.PatternSet.init(&.{authPattern(kind.pattern().?.counterpart())}) });
+        var result = try application.dispatchOutgoing(kind, .{ .subject = "allowed" }, .{ .session = &peer });
+        result.deinit();
+        // A grant for the local receiver role must not authorize its peer.
+        peer.setAuthorization(.{ .subject = "peer", .issuer = "fixture", .allowed_patterns = auth.PatternSet.init(&.{authPattern(kind.pattern().?)}) });
+        try std.testing.expectError(error.Unauthorized, application.dispatchOutgoing(kind, .{ .subject = "allowed" }, .{ .session = &peer }));
+        try peer.requirePattern(authPattern(kind.pattern().?));
+        try std.testing.expectError(error.Unauthorized, peer.requirePattern(authPattern(kind.pattern().?.counterpart())));
+    }
 }

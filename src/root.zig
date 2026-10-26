@@ -13,6 +13,7 @@ pub const envelope = @import("envelope.zig");
 pub const queue = @import("queue.zig");
 pub const transport = @import("transport/root.zig");
 pub const socket = @import("socket.zig");
+pub const quic_socket = @import("quic_socket.zig");
 pub const auth = @import("auth.zig");
 pub const auth_paseto = @import("auth_paseto.zig");
 pub const session = @import("session.zig");
@@ -32,6 +33,8 @@ pub const SubjectRouter = subject.Router;
 
 pub const Pattern = socket.Pattern;
 pub const Socket = socket.Socket;
+pub const QuicSocket = quic_socket.Socket;
+pub const QuicSocketOptions = quic_socket.Options;
 pub const SocketOptions = socket.SocketOptions;
 pub const Request = socket.Request;
 pub const ErrorReply = socket.ErrorReply;

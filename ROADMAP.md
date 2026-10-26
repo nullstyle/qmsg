@@ -14,8 +14,8 @@ phase.
 | 1 Core package skeleton | Complete | Core message, envelope, subject, queue, transport boundary, and inproc transport are implemented and tested. |
 | 2 Pair and req/rep over inproc | Complete for inproc MVP | Pair and req/rep work over inproc with ids, deadlines, cancellation, queue pressure tests, and error replies. |
 | 2b Embedded inproc Node | Complete for inproc MVP | Socketless embedder contract (`tick`/`poll`, node-owned sockets, event-complete req/rep + pub/sub, `RequestFailure` classification, bounded events, `Stats`) is implemented, tested, and documented in docs/EMBEDDING.md with examples/embedded_inproc_node.zig as the executable contract. Inbound attach shipped in 0.1.4 (docs/QUIC_EMBED_SEAM.md) and dial-side deadline/cancellation outcomes in 0.1.6 (docs/QUIC_REQUEST_OUTCOMES.md). |
-| 3 QUIC transport MVP | In progress | `quic-zig` is pinned (v0.37.2 tarball, see build.zig.zon). qmsg has socket-free runtime wrappers, Node-embeddable UDP socket owners, qmsg HELLO over control streams, a per-session QUIC driver, Node listener/client tick wiring, socket attachment helpers, reliable stream pumps with queueReliable-armed reply receivers, req/rep over hermetic QUIC runtime tests, hermetic QUIC App dispatch examples, an opt-in Node/App localhost smoke example, and — as of 0.1.4 — the inbound embed seam (`EmbeddedDispatch`): qmsg sessions on a foreign embedder's listener/Driver by ALPN, pull-consumed through poll events (docs/QUIC_EMBED_SEAM.md, built and consumer-approved). Public QUIC socket convenience APIs remain. |
-| 4 App facade | Partial | Route registration, `Context`, in-memory dispatch, inproc REP `runOnce`, auth checks, default REP error replies, QUIC listener/session lifecycle hooks, decoded QUIC message/datagram dispatch, socket hook examples, and an initial live Node/App localhost example exist. Full socket-attached App-over-live-UDP examples remain. |
+| 3 QUIC transport MVP | Complete for owned pair/req/rep | Released QUIC v0.37.2, Node-owned and foreign embedding, canonical request outcomes, and explicit-pump `QuicSocket(.pair/.req/.rep)` listen/dial are implemented. TLS options, bounded lifecycle, borrowed socket readiness and public application examples are documented in docs/SPRINT_2_QUIC_SOCKETS.md. |
+| 4 App facade | Partial | Route registration, Context, inproc REP dispatch, authorization, default errors and Node/App QUIC lifecycle are implemented. Public live-UDP Node/App and owned-socket examples use the request/outcome interface. Additional messaging patterns remain separate milestones. |
 | 5 Pub/sub reliable | Partial | Inproc pub/sub, source-side subscription registry, replay/update, slow-consumer behavior, transport-agnostic SUBSCRIBE/UNSUBSCRIBE helpers, and QUIC control-frame queue/apply state are implemented. Automatic live-session emission shipped in 0.2.0: node-level subscriptions re-emit per session (docs/QUIC_PUBSUB.md), registry-aware datagram fan-out with shed-and-count, and inbound SUBSCRIBE on the listener/embedded seam. Replay wiring and reliable-stream publication remain. |
 | 6 QUIC datagrams | Partial | HELLO carries datagram capability and qmsg has compact datagram envelope plus send/receive/error-mapping helpers. Node queues decoded datagrams and dispatches them through App handlers; live UDP datagram examples plus ack/loss reconciliation remain. |
 | 7 Push/pull | Partial | Inproc push/pull has fair selection, puller credit, queue policy handling, at-most-once semantics, transport-agnostic CREDIT helpers, and QUIC control-frame queue/apply state. Automatic live-session emission remains. |
@@ -151,8 +151,8 @@ Tasks:
   - `onConnect`;
   - `onClose`.
 - Implement `Context`.
-- Add QUIC listener/session lifecycle hooks and initial UDP tick wiring without
-  promising the final public socket convenience API.
+- Add QUIC listener/session lifecycle hooks, public explicit-clock pumping,
+  and typed owned socket convenience alongside the foreign embedding interface.
 - Add app-owned scratch allocator or per-handler temporary arena option.
 - Add default error handling policy.
 - Add auth hooks and session authorization plumbing, initially independent of
@@ -331,8 +331,8 @@ Integration tests:
 - datagram envelope/error-mapping tests;
 - opt-in real-UDP localhost App/Node req/rep smoke example once the environment
   permits UDP binds;
-- future public socket convenience tests for direct `listen(.quic)` /
-  `dial(.quic)`.
+- owned `QuicSocket` public listen/dial, event ownership, role negotiation,
+  concurrent requests, cancellation/deadlines, pressure, and teardown tests.
 
 Fuzz/property tests:
 

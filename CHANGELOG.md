@@ -7,6 +7,19 @@ changes.
 
 ## [Unreleased]
 
+- Add owned `QuicSocket(.pair/.req/.rep)` with explicit pumping, canonical Node
+  outcomes, TLS-configured listen/dial, readiness, borrowed socket handles,
+  lifecycle controls, and stable interior ownership. Public Node/App examples
+  use the request/outcome interface.
+- Fix HELLO compatibility to match complementary roles. Typed sockets advertise
+  their selected role and require the counterpart, rejecting same-role-only
+  REQ/REQ or REP/REP peers.
+- Align automatic pattern authorization with peer roles already enforced at
+  HELLO. Request callers need REQ grants rather than the receiver's REP grant;
+  PULL/SUB receivers similarly check PUSH/PUB peers. Explicit `requirePattern`
+  stays literal. This corrects admission policy for minimal grants; see the
+  Sprint 2 guide and migration notes.
+
 - Finish negotiated PING/PONG handling across owned, accepted, and foreign
   QUIC sessions. Lifecycle responses have bounded state under flow control;
   heartbeat and drain wakeups are exposed to the owner loop.

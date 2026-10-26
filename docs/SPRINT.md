@@ -40,15 +40,22 @@ See [Sprint 1 lifecycle qualification](SPRINT_1_LIFECYCLE.md) for regression
 coverage, toolchain identity, and retained gate evidence. Earlier 410-test
 counts described an intermediate September tree, not this sprint.
 
-## S3 — Public QUIC socket surface: NOT STARTED
+## S3 — Public QUIC socket surface: Sprint 2
 
-Design risk is the driving model (tenet: no hidden runtime). Proposal:
-`Socket(.req).listen(.quic, addr, .{tls})` owns a private `Node` and
-exposes an explicit `pump(now_us)` / documented opt-in run thread; the
-socket-level `UnsupportedTransport` arms at `src/socket.zig:883,890` are
-the entry points. Settle the ownership contract in the first hour; crib
-the Node/App machinery that already works (see
-capnp-qmsg-demo/src/full_stack_l3_test.zig for the complete driving loop).
+`QuicSocket(.pair/.req/.rep)` owns one heap-stable Node and exposes explicit
+`pump(now_us)`, canonical `poll` events, TLS-configured listen/dial, borrowed
+readable socket handles, and absolute deadlines. Request correlation and
+terminal outcomes use the existing Node engine. The typed facade announces
+its selected role and requires its counterpart at HELLO.
+
+The existing address-only `Socket(.quic)` endpoint remains the low-level
+unsupported convenience spelling; it does not carry TLS or runtime options.
+Inproc sockets and foreign-driver attachments retain their contracts.
+
+See [the Sprint 2 socket guide](SPRINT_2_QUIC_SOCKETS.md) for the interface,
+ownership, and local qualification records. Public Node/App examples use the
+same request/outcome methods. Reliable pub/sub and live CREDIT stay in the
+next messaging-pattern milestone.
 
 ## Stretch
 

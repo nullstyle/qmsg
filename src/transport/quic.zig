@@ -1,4 +1,5 @@
 const std = @import("std");
+const qmsg_protocol = @import("../protocol/root.zig");
 const quic_zig = @import("quic");
 
 const auth = @import("../auth.zig");
@@ -538,7 +539,7 @@ pub const QuicSession = struct {
         if (hello.supported_patterns == 0) return error.InvalidPattern;
         if ((hello.supported_patterns & self.options.required_peer_patterns) != self.options.required_peer_patterns) return error.UnsupportedPattern;
         if ((hello.supported_patterns & ~control.PatternBits.all) != 0) return error.InvalidPattern;
-        if ((hello.supported_patterns & self.options.supported_patterns) == 0) return error.InvalidPattern;
+        if ((hello.supported_patterns & compatiblePeerPatterns(self.options.supported_patterns)) == 0) return error.InvalidPattern;
         // The announced id must answer to the identity the handshake
         // authenticated. Off unless the embedder opts in; see
         // `auth.CertBinding`.
@@ -578,6 +579,28 @@ pub const QuicSession = struct {
         }
     }
 };
+
+/// HELLO describes each endpoint's roles. Communication requires a compatible
+/// counterpart, rather than the same bit at both ends (REQ talks to REP).
+fn compatiblePeerPatterns(local: u64) u64 {
+    var peers: u64 = 0;
+    inline for (std.meta.tags(qmsg_protocol.Pattern)) |role| {
+        if (local & patternBit(role) != 0) peers |= patternBit(role.counterpart());
+    }
+    return peers;
+}
+
+fn patternBit(role: qmsg_protocol.Pattern) u64 {
+    return switch (role) {
+        .pair => control.PatternBits.pair,
+        .req => control.PatternBits.req,
+        .rep => control.PatternBits.rep,
+        .@"pub" => control.PatternBits.pub_,
+        .sub => control.PatternBits.sub,
+        .push => control.PatternBits.push,
+        .pull => control.PatternBits.pull,
+    };
+}
 
 pub fn localControlStreamId(role: Role) u64 {
     return switch (role) {
@@ -1092,6 +1115,36 @@ test "QUIC session rejects HELLO with no compatible pattern" {
 
     try std.testing.expectError(error.InvalidPattern, sess.acceptPeerControl(bytes));
     try std.testing.expectEqual(State.quic_ready, sess.state());
+}
+
+test "HELLO compatible roles are counterparts and required capabilities remain mandatory" {
+    const allocator = std.testing.allocator;
+    const bits = control.PatternBits;
+    const local_roles = [_]u64{ bits.pair, bits.req, bits.rep, bits.pub_, bits.sub, bits.push, bits.pull };
+    const peer_roles = [_]u64{ bits.pair, bits.rep, bits.req, bits.sub, bits.pub_, bits.pull, bits.push };
+    for (local_roles, peer_roles) |local, peer| {
+        var sess = try QuicSession.init(allocator, 1, .client, .{ .supported_patterns = local, .required_peer_patterns = peer });
+        defer sess.deinit();
+        try sess.onQuicReady();
+        const encoded = try encodeHelloControlStream(allocator, .{ .supported_patterns = peer });
+        defer allocator.free(encoded);
+        try sess.acceptPeerControl(encoded);
+        try std.testing.expect(sess.peer_hello_received);
+        if (local != peer) {
+            var invalid = try QuicSession.init(allocator, 2, .client, .{ .supported_patterns = local });
+            defer invalid.deinit();
+            try invalid.onQuicReady();
+            const same_role = try encodeHelloControlStream(allocator, .{ .supported_patterns = local });
+            defer allocator.free(same_role);
+            try std.testing.expectError(error.InvalidPattern, invalid.acceptPeerControl(same_role));
+        }
+    }
+    var generic = try QuicSession.init(allocator, 3, .client, .{});
+    defer generic.deinit();
+    try generic.onQuicReady();
+    const encoded = try encodeHelloControlStream(allocator, .{ .supported_patterns = bits.req });
+    defer allocator.free(encoded);
+    try generic.acceptPeerControl(encoded);
 }
 
 test "QUIC session rejects HELLO when auth is required but absent" {
