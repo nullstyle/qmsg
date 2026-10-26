@@ -65,6 +65,14 @@ reconcile on replacement sessions, including both listen/dial topologies.
 Datagram publication remains the default existing API. See
 [the Sprint 3 contract and qualification](SPRINT_3_RELIABLE_PUBSUB.md).
 
+## S5 — Public application fault acceptance: Sprint 4
+
+The public Req/Rep workload combines overload, authorization denial, reserved
+terminal outcomes, late application reply attempts, unilateral remote loss,
+reconnect and bounded GOAWAY with independent healthy-session progress. It
+adds qualification rather than new messaging features. See
+[the Sprint 4 contract and evidence entrypoint](SPRINT_4_PUBLIC_FAULTS.md).
+
 ## Deferred
 
 Live CREDIT/push-pull, new typed patterns, survey/bus, retained replay, extra

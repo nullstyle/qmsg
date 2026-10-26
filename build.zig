@@ -118,7 +118,15 @@ pub fn build(b: *std.Build) !void {
     const pair_test_step = b.step("node-pair-test", "Run the two-node live UDP tests");
     pair_test_step.dependOn(&run_pair_tests.step);
 
+    const fault_mod = b.createModule(.{ .root_source_file = b.path("examples/public_fault_workload_test.zig"), .target = target, .optimize = optimize });
+    fault_mod.addImport("qmsg", qmsg_mod);
+    const fault_tests = b.addTest(.{ .root_module = fault_mod, .filters = test_filters });
+    const run_fault_tests = b.addRunArtifact(fault_tests);
+    const fault_step = b.step("public-fault-test", "Run bounded public fault acceptance (fixed QUIC candidate required)");
+    fault_step.dependOn(&run_fault_tests.step);
+
     const examples_step = b.step("examples", "Build qmsg examples");
+    addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "quic-public-faults", "examples/quic_public_faults.zig");
     addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "quic-pubsub-localhost", "examples/quic_pubsub_localhost.zig");
     addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "inproc-reqrep", "examples/inproc_reqrep.zig");
     addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "embedded-inproc-node", "examples/embedded_inproc_node.zig");

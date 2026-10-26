@@ -7,6 +7,13 @@ changes.
 
 ## [Unreleased]
 
+- Add a bounded public application fault workload, dedicated
+  `public-fault-test` target and opt-in JSON CLI. Acceptance covers admission
+  pressure, peer-role/subject denial, reserved cancellation/deadline outcomes,
+  unilateral remote close, reconnect, healthy-session isolation, retained reply
+  ownership and GOAWAY drain. The released QUIC idle-cache negative stays
+  separate from positive fixed-candidate qualification; pins remain unchanged.
+
 - Add source-filtered `Node.publishQuicReliable`, per-peer bounded unsent
   publication queues, pressure/drop results and queue statistics. Opt-in
   reliable subscribers receive canonical deliveries or App SUB dispatch with

@@ -82,6 +82,14 @@ work for a bounded interval; `closeQuicSession(id)` remains an immediate
 abort. Remote GOAWAY produces an owned `session_goaway` event. See the
 [lifecycle contract](docs/MIGRATION.md#quic-heartbeat-and-graceful-shutdown).
 
+## Public application fault acceptance
+
+The reusable [public fault workload](examples/public_fault_workload.zig) exercises
+bounded admission, authorization failures, deadline/cancel outcomes, unilateral
+peer loss, reconnect and deferred replies during GOAWAY. It uses public APIs
+and emits machine-readable evidence through `quic-public-faults`. See
+[the acceptance contract and fixed-candidate commands](docs/SPRINT_4_PUBLIC_FAULTS.md).
+
 ## Reliable QUIC publication
 
 `Node.publishQuicReliable(outgoing)` fans out through the current subscription

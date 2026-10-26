@@ -1,0 +1,30 @@
+const std = @import("std");
+const faults = @import("public_fault_workload.zig");
+test "public faults preserve admission authorization outcomes reconnect and drain" {
+    const report = try faults.run(std.testing.allocator, std.testing.io, .{});
+    try std.testing.expect(report.completed);
+    try std.testing.expectEqual(@as(usize, 15), report.accepted);
+    try std.testing.expectEqual(report.accepted, report.terminal);
+    try std.testing.expectEqual(@as(usize, 10), report.succeeded);
+    try std.testing.expectEqual(@as(usize, 1), report.authorization_denied);
+    try std.testing.expectEqual(@as(usize, 2), report.canceled);
+    try std.testing.expectEqual(@as(usize, 1), report.deadline_exceeded);
+    try std.testing.expectEqual(@as(usize, 1), report.peer_closed);
+    try std.testing.expect(report.remote_close_observed);
+    try std.testing.expect(report.remote_loss_us < report.loss_request_deadline_ms * 1000);
+    try std.testing.expectEqual(@as(usize, 6), report.healthy_succeeded);
+    try std.testing.expect(report.queue_refused > 0 and report.inflight_refused == 2);
+    try std.testing.expectEqual(@as(usize, 1), report.role_rejected);
+    try std.testing.expect(report.role_positive_control_ready);
+    try std.testing.expectEqual(@as(usize, 1), report.goaway_events);
+    try std.testing.expectEqual(@as(usize, 1), report.goaway_refused);
+    try std.testing.expectEqual(@as(usize, 4), report.handles_retained);
+    try std.testing.expectEqual(report.handles_retained, report.handles_released);
+    try std.testing.expectEqual(report.events_received, report.events_deinitialized);
+    try std.testing.expectEqual(@as(usize, 0), report.pending_at_end);
+    try std.testing.expectEqual(@as(usize, 0), report.duplicate_terminals);
+    try std.testing.expect(report.reconnected and report.drain_closed);
+    try std.testing.expect(report.peak_outstanding_per_client <= report.max_requests_per_client);
+    try std.testing.expect(report.peak_server_sessions <= report.max_sessions_per_actor);
+    try std.testing.expect(report.peak_retained_handles <= report.handle_capacity);
+}
