@@ -664,6 +664,11 @@ const RuntimeDispatcher = struct {
         return self.app.dispatchQuicReliable(kind, incoming, sess, .{});
     }
 
+    /// Optional Node dispatcher hook; existing REP-only callbacks stay narrow.
+    pub fn dispatchQuicPublication(self: *@This(), incoming: message.Message, sess: *session.Session) !DispatchResult {
+        return self.app.dispatchQuicReliable(.sub, incoming, sess, .{});
+    }
+
     pub fn dispatchQuicDatagram(
         self: *@This(),
         incoming: message.Message,
@@ -1621,4 +1626,28 @@ test "automatic route authorization checks counterpart peer roles literally" {
         try peer.requirePattern(authPattern(kind.pattern().?));
         try std.testing.expectError(error.Unauthorized, peer.requirePattern(authPattern(kind.pattern().?.counterpart())));
     }
+}
+
+test "reliable pubsub: App dispatches opt-in publications to SUB with literal PUB grant" {
+    const Handler = struct {
+        fn run(ctx: *Context, incoming: message.Message) !void {
+            var msg = incoming;
+            defer msg.deinit();
+            try std.testing.expectEqual(RouteKind.sub, ctx.route_kind.?);
+            try std.testing.expect(msg.flags.no_reply);
+            try std.testing.expect(msg.reply_handle == null);
+            try ctx.requireRouteAccess();
+            try ctx.requirePattern(.@"pub");
+        }
+    };
+    var application = try App.init(std.testing.allocator, .{ .node = .{ .quic_inbound = .publications } });
+    defer application.deinit();
+    try application.sub("news.*", Handler.run);
+    try application.node.subscribeQuic("news.*", .{});
+    const peer = try application.node.openQuicSession(.{ .role = .server });
+    try readyQuicRuntimeForTest(peer, "publisher", false);
+    try peer.appSession().replaceAuthorization(std.testing.allocator, .{ .subject = "publisher", .issuer = "test", .allowed_patterns = auth.PatternSet.init(&.{.@"pub"}) });
+    try peer.runtime.inbox.append(std.testing.allocator, .{ .stream_id = 0, .message = try message.Message.init(std.testing.allocator, .{ .subject = "news.one", .flags = .{ .no_reply = true } }) });
+    const result = try application.runOnce();
+    try std.testing.expectEqual(@as(usize, 1), result.messages);
 }

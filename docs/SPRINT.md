@@ -54,11 +54,20 @@ Inproc sockets and foreign-driver attachments retain their contracts.
 
 See [the Sprint 2 socket guide](SPRINT_2_QUIC_SOCKETS.md) for the interface,
 ownership, and local qualification records. Public Node/App examples use the
-same request/outcome methods. Reliable pub/sub and live CREDIT stay in the
-next messaging-pattern milestone.
+same request/outcome methods. Reliable pub/sub is covered by Sprint 3 below.
 
-## Stretch
+## S4 — Reliable QUIC pub/sub: Sprint 3
 
-- S4: CREDIT live-session re-emission (mirror 0.2.0's SUBSCRIBE re-emit);
-  reliable-stream publication option.
-- S5: survey pattern (phase 8 start).
+Source-filtered reliable publications use bounded per-peer pre-admission FIFOs
+and canonical delivery ownership. A slow peer reports pressure or sheds by
+policy without stopping healthy fanout. Existing node-level subscriptions
+reconcile on replacement sessions, including both listen/dial topologies.
+Datagram publication remains the default existing API. See
+[the Sprint 3 contract and qualification](SPRINT_3_RELIABLE_PUBSUB.md).
+
+## Deferred
+
+Live CREDIT/push-pull, new typed patterns, survey/bus, retained replay, extra
+codecs, dynamic endpoint advertisements, and evented backend adoption remain
+outside this sprint. Application-state snapshot reconciliation across gossip
+retention boundaries belongs to the optional qmesh composition layer.

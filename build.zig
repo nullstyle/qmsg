@@ -119,6 +119,7 @@ pub fn build(b: *std.Build) !void {
     pair_test_step.dependOn(&run_pair_tests.step);
 
     const examples_step = b.step("examples", "Build qmsg examples");
+    addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "quic-pubsub-localhost", "examples/quic_pubsub_localhost.zig");
     addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "inproc-reqrep", "examples/inproc_reqrep.zig");
     addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "embedded-inproc-node", "examples/embedded_inproc_node.zig");
     addExample(b, examples_step, qmsg_mod, paseto_mod, quic_mod, target, optimize, "embedded-quic-attach", "examples/embedded_quic_attach.zig");

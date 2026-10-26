@@ -1,103 +1,103 @@
-# QUIC pub/sub across the process wall — design note
+# QUIC pub/sub across sessions
 
-Status: design recorded before implementation, at the mruby-quic
-consumer's request (swarm item 2: "make the process wall transparent
-to SUBSCRIBE and publish"). This is ROADMAP phase 5's "automatic
-live-session emission," plus its two companions.
+Node owns the desired subscription set and the source-side registry. Wire
+subscriptions belong to individual sessions; their desired filters survive
+reconnect. The current default is canonical `delivery` events. Direct inbox
+consumption requires explicit legacy delivery and must have a single owner.
 
-The current Node defaults use canonical `delivery` events on both dialed and
-embedded sessions. See [MIGRATION.md](MIGRATION.md) for compatibility options
-when upgrading an older direct-inbox consumer.
+## Subscription lifecycle and source filtering
 
-## What exists (surveyed, not rebuilt)
+`Node.subscribeQuic(filter, QueueOptions)` and `unsubscribeQuic(filter)` update
+the node-level desired set. Every ready session reconciles its queued snapshot:
+new sessions receive the complete set, existing sessions receive deltas, and
+bounded control-queue pressure defers reconciliation until a later tick. One
+session's failure does not unwind the set. A busy control flush preserves its
+queued prefix and subsequent updates.
 
-- `protocol/pubsub.Registry` — peer-keyed subscription registry;
-  `subscribe` auto-adds peers, `applyControlFrame` maps inbound
-  SUBSCRIBE/UNSUBSCRIBE frames onto it, `collectMatches(subject)`
-  enumerates matching peers in subscription order, `removePeer`
-  drops a dead subscriber whole.
-- `transport/quic_control.State` — per-session control-frame queue +
-  apply state. Queue side: `queueSubscribe`/`queueUnsubscribe` then
-  `flushQueuedControl` (a follow-up uni control stream via
-  `FlushSender`, pumped by the existing session pump). Apply side:
-  `applyReceivedFrames` into the registry.
-- `QuicSessionRuntime.queueDatagram` / `datagram_outbox` — pumped
-  for dial clients in `tick` and for embedded sessions through
-  `driverSessionPass`.
-- Inbound datagrams surface as `delivery` events by default.
+SUBSCRIBE/UNSUBSCRIBE frames ride bounded follow-up unidirectional control
+streams. Both dialed and accepted sessions use the shared EmbeddedDispatch
+reader and `Node.driverControlFramesReceived`; the older dial-side inbound
+limitation no longer applies. Source matching yields each subscribed peer once,
+even if several filters match. Closing a session removes its registry entries. `NodeOptions.max_quic_subscriptions`
+bounds both the local desired set and remote filter count per peer. At capacity,
+updates to an existing filter and unsubscribe still work; a new remote filter
+fails through the existing per-peer protocol error path, containing the offending
+connection while preserving healthy peers.
 
-What was missing: nothing wires these to session lifecycle.
+## Choose datagrams or reliable streams
 
-## Contract
+`publishQuicSubscribed(outgoing)!usize` retains its datagram behavior and returns
+the number of queued recipients. It requires DATAGRAM negotiation. Slow
+subscribers shed according to their policy and the local byte/count bounds.
 
-**One registry per node; peer id = session id.** Subscriptions are
-SESSION-scoped on the wire but NODE-owned on both sides: the node's
-outbound set (what WE want from peers) and the registry (what PEERS
-want from us).
+`publishQuicReliable(outgoing)!ReliablePublishResult` uses the same source
+registry and requires PUB/SUB roles without DATAGRAM. Its result has:
 
-**Ask 1 — node-level subscriptions that survive sessions.**
-`Node.subscribeQuic(filter, options)` / `unsubscribeQuic(filter)`
-mutate a node-level `SubscriptionSet`. Emission is tick-driven state
-sync, not edge hooks: each tick, for every QUIC session —
-`state == .ready` and not yet synced — queues the FULL node set
-(one follow-up control stream) and marks it; sessions already synced
-get only deltas; a busy flush sender leaves frames queued for the
-next tick. A redial's NEW session starts unsynced, so the full set
-re-emits on its first ready tick — subscriptions outlive sessions by
-construction. Per-session queueing failures are contained: one
-session's failure never unwinds the loop or the node set.
+- `matched`: registry peers matching the subject;
+- `queued`: new publications retained in per-peer pre-admission FIFOs;
+- `backpressured`: peers whose block/fail policy refused this publication;
+- `dropped`: publications shed by policy or refused by role, authorization,
+  size, readiness, or closing state. Drop-oldest may shed an earlier publication
+  while queuing this one, so these fields are not a partition of `matched`.
 
-**Ask 2 — registry-aware fan-out.** `Node.publishQuicSubscribed(
-outgoing) !usize` sends the datagram to every session whose registry
-entry matches the subject — dial peers and embedded qmsg/1 clients
-alike, one registry. Sessions without `datagram_enabled` and
-over-budget outboxes are skipped-and-counted (`message_dropped`,
-`Stats.dropped`); a subscriber's `on_full` queue policy decides
-drop-newest vs drop-oldest at its outbox bound. Slow consumers shed;
-the fan-out loop never blocks.
+Fanout visits healthy peers even when another peer is full. This call never
+waits. Invalid envelope input is checked before fanout. Allocation or other
+fallible per-peer work can fail after earlier peers accepted the publication;
+retrying an entire failed fanout may therefore duplicate those deliveries.
 
-**Ask 3 — inbound SUBSCRIBE on the listener/embedded seam.**
-Control frames beyond HELLO ride FOLLOW-UP uni streams (the HELLO
-stream is HELLO-only by the session state machine's contract). The
-embedded seat now tracks peer-initiated uni streams as control
-receivers, decodes frames incrementally against its buffered bytes,
-and hands complete frames to the owner, which applies them through
-the session's control state into the node registry. Because
-`ServerDispatch` delegates to `EmbeddedDispatch`, the qmsg-owned
-listener gets this for free: an external qmsg client's SUBSCRIBE
-registers. On ANY session death — reaper close, explicit
-`closeQuicSession`, embedded will-close teardown —
-`Registry.removePeer` runs: dying subscribers do not linger in the
-fan-out set.
+The publisher's `NodeOptions.quic_reliable_publications` bounds each unsent FIFO
+by count and message bytes. Limits are also capped by the local session's
+transport queue bounds. SUBSCRIBE transmits the `on_full` policy only; a remote
+subscriber cannot enlarge publisher limits. Block/fail reports pressure,
+drop-newest sheds the incoming publication, and drop-oldest evicts only
+publications still in that FIFO. Already admitted transport streams are never
+evicted by a later publication's queue policy. The existing transport sender
+queue has its own count/byte bounds, in addition to the unsent FIFO.
 
-## Scope decisions
+`Node.publicationStats()` exposes pending FIFO count/bytes, aggregate FIFO high
+water marks, stream-admitted publications, policy/teardown drops, and pressure.
+High water marks aggregate all current peers, rather than describing one peer.
 
-- Both ends announce `pub_ | sub` and `datagram_enabled` in their
-  transport options; a session negotiated without the bits silently
-  carries no pub/sub (no error, no drop).
-- Dialed and embedded sessions produce `delivery` events under the default
-  Node settings. Direct `recvDatagram` / `recvReliable` consumers require
-  `.delivery = .legacy` and must not compete with event consumption.
-  A publication racing a reborn subscriber's re-sync is a lost datagram by
-  design.
-- Datagram-first; reliable-stream publication is future work.
-- Replay/update machinery stays unwired (live-only subscriptions).
-- No subscription-changed event; the registry stays invisible to
-  embedders.
-- Dial-side INBOUND control frames (a remote subscribing TO the
-  dialer) are not wired this release: nothing in the consumer's
-  model subscribes server-side. The seat-side machinery is where it
-  would attach.
-- `PeerId` (usize) vs `SessionId` (u64): cast at the registry
-  boundary; ids are small and both are 64-bit on target platforms.
+## Receive and authorize
 
-## Acceptance
+A reliable subscriber selects `NodeOptions.quic_inbound = .publications`,
+announces SUB and requires PUB in its QUIC options, and calls `subscribeQuic`.
+The publisher announces PUB and requires SUB. Reliable publications force
+`no_reply` and clear `unreliable`; the receiver emits owned canonical `delivery`
+events without reply handles or request tracker reservations. The explicit
+profile rejects request-shaped traffic. App's same profile dispatches `.sub`
+handlers through the additive optional `dispatchQuicPublication` dispatcher
+hook. Existing REP dispatcher signatures and request/pair profiles retain their
+contracts.
 
-- Live two-node: dial-side `subscribeQuic`, listener-side
-  `publishQuicSubscribed`, delivery as `delivery`; kill /
-  same-key reborn / redial; delivery resumes with NO new subscribe
-  call (the redial re-emission contract — tested hardest).
-- Slow subscriber: bounded outbox sheds and counts instead of
-  blocking.
-- Hermetic: registry apply/removePeer lifecycle, node-set emission
-  batching, fan-out matching and policy.
+The source checks each authenticated peer's SUB grant and subject permission.
+The receiver checks the publisher's PUB grant and subject scope, plus its own
+current desired filters. Unsubscribing therefore rejects already-in-flight
+messages that arrive after local interest was removed. Literal pattern checks
+use peer roles, as described in [AUTH.md](../AUTH.md).
+
+## Pump, pressure and closure
+
+Continue pumping after queuing publications. `nextTimer()` exposes immediate
+work when the FIFO or newly admitted transport senders need another owner
+pass. A full transport queue disarms that local wake; transport readiness and
+transport/lifecycle deadlines drive later retry. Foreign owners continue to
+call their driver's service and qmsg service hooks. No qmsg thread or hidden
+loop is created.
+
+GOAWAY stops new admission and discards/counts the pre-admission FIFO when
+local drain begins or remote GOAWAY is observed. It does not open new streams
+to flush that FIFO during drain. Already admitted streams retain the bounded
+Sprint 1 lifecycle contract. Immediate session close discards/counts remaining
+FIFO entries and frees all owned messages.
+
+Each publication uses its own stream. Bytes within a stream retain transport
+ordering; deliveries across publication streams may arrive out of order.
+Transport reliability applies after stream admission while the connection
+remains usable. Queuing is not a delivery acknowledgment. There is no durable
+storage, application acknowledgment, exactly-once guarantee, retained replay,
+or automatic replay across reconnect. A reconnect restores subscription
+interest; publications racing that synchronization may find no subscriber.
+
+See [Sprint 3 qualification](SPRINT_3_RELIABLE_PUBSUB.md) and the reusable
+[public workload](../examples/reliable_pubsub_workload.zig).

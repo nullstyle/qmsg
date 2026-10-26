@@ -22,9 +22,10 @@ pub const NodeOptions = struct {
     /// first `dialInprocSub`/`subscribeInproc` call. Its receive-queue
     /// policy is the slow-consumer policy for embedded deliveries.
     inproc_sub: socket.SocketOptions(.sub) = .{},
-    /// Bound on node-level QUIC subscriptions (`subscribeQuic`).
-    /// Further subscribes fail with `error.QueueFull` instead of
-    /// growing without limit.
+    /// Bound on desired local subscriptions and remote filters per peer.
+    /// New filters fail with QueueFull at capacity; updates and unsubscribe
+    /// remain permitted. A remote violation follows the per-peer protocol
+    /// error path, so it cannot grow the registry or abort healthy siblings.
     max_quic_subscriptions: usize = 64,
     /// Per-session bound on datagram publications queued for the
     /// wire. At the bound, a subscriber's `on_full` queue policy
@@ -32,6 +33,9 @@ pub const NodeOptions = struct {
     /// `message_dropped` and count in `Stats.dropped`. Slow
     /// consumers shed; fan-out never blocks.
     quic_datagram_outbox_max: usize = 64,
+    /// Local per-session unsent publication budget. SUBSCRIBE selects only
+    /// on_full; a remote peer cannot enlarge these count/byte limits.
+    quic_reliable_publications: queue.QueueOptions = .{ .max_messages = 64, .max_bytes = 1024 * 1024 },
     /// Terminal outcomes consume the same reservation as pending requests.
     max_requests: usize = 1024,
     max_request_bytes: usize = 16 * 1024 * 1024,
@@ -42,7 +46,7 @@ pub const NodeOptions = struct {
     /// Admission for new peer-initiated reliable streams. Replies to local
     /// requests still use the canonical tracker. Owned typed QUIC sockets set
     /// this profile; ordinary Nodes retain request/reply behavior.
-    quic_inbound: enum { requests, pair, refuse } = .requests,
+    quic_inbound: enum { requests, pair, refuse, publications } = .requests,
     io: std.Io = std.Io.Threaded.global_single_threaded.io(),
 };
 
@@ -256,6 +260,18 @@ pub const Event = union(enum) {
 /// already ended, message events dropped by the event-queue bound).
 /// `queue_high_water` is the deepest any node-owned receive queue
 /// has been.
+pub const ReliablePublishResult = struct { matched: usize = 0, queued: usize = 0, backpressured: usize = 0, dropped: usize = 0 };
+
+pub const PublicationStats = struct {
+    pending_messages: usize = 0,
+    pending_bytes: usize = 0,
+    high_water_messages: usize = 0,
+    high_water_bytes: usize = 0,
+    stream_admitted: usize = 0,
+    dropped: usize = 0,
+    backpressured: usize = 0,
+};
+
 pub const Stats = struct {
     sent: usize = 0,
     recv: usize = 0,
@@ -274,6 +290,7 @@ const Counters = struct {
     recv: usize = 0,
     dropped: usize = 0,
     events_dropped: usize = 0,
+    publications: PublicationStats = .{},
 };
 
 pub const InprocRepId = usize;
@@ -530,6 +547,8 @@ pub const QuicSessionRuntime = struct {
     driver_owned: bool = false,
     datagram_inbox: std.ArrayList(transport.quic_datagram.ReceivedDatagram) = .empty,
     datagram_outbox: std.ArrayList(message.Message) = .empty,
+    publication_outbox: ?queue.Queue = null,
+    publication_wake: bool = false,
     /// Per-session control-frame state: the queue this session's
     /// SUBSCRIBE/UNSUBSCRIBE emission flushes onto a follow-up uni
     /// control stream, and the apply path for inbound frames (into
@@ -705,6 +724,7 @@ pub const QuicSessionRuntime = struct {
             received.deinit();
         }
         self.datagram_inbox.deinit(self.runtime.allocator);
+        if (self.publication_outbox) |*pending| pending.deinit();
         self.runtime.deinit();
         // After the runtime: a pending flush sender references the
         // control state's queued frames until it completes.
@@ -843,6 +863,7 @@ pub const Node = struct {
 
     pub fn tick(self: *Node, now_us: u64) !void {
         self.now_us = now_us;
+        for (self.quic_sessions.items) |runtime| try self.pumpPublicationOutbox(runtime);
         try self.tickQuicListeners(now_us);
         try self.tickQuicClients(now_us);
         try self.sweepQuicPending(self.nowMs());
@@ -1046,6 +1067,7 @@ pub const Node = struct {
     pub fn goawayQuicSession(self: *Node, id: QuicSessionId, code: u64, reason: []const u8, now_us: u64, timeout_us: u64) !void {
         const runtime = self.quicSession(id) orelse return error.EndpointNotFound;
         try runtime.runtime.goaway(code, reason, now_us, timeout_us);
+        self.discardPublicationOutbox(runtime);
     }
 
     fn failSessionRequests(self: *Node, session_id: QuicSessionId) void {
@@ -1562,6 +1584,14 @@ pub const Node = struct {
                         self.refuseQuicStream(runtime, stream_id, incoming);
                         continue;
                     }
+                    if (self.options.quic_inbound == .publications) {
+                        if (oversized or !incoming.flags.no_reply or !self.acceptsPublication(runtime, incoming)) {
+                            self.refuseQuicStream(runtime, stream_id, incoming);
+                            continue;
+                        }
+                        try self.emit(.{ .delivery = .{ .session_id = runtime.id(), .msg = incoming } });
+                        continue;
+                    }
                     if (self.options.quic_inbound == .pair) {
                         if (oversized or !incoming.flags.no_reply) {
                             self.refuseQuicStream(runtime, stream_id, incoming);
@@ -1615,6 +1645,14 @@ pub const Node = struct {
                 } });
             }
         }
+    }
+
+    fn acceptsPublication(self: *Node, runtime: *QuicSessionRuntime, incoming: message.Message) bool {
+        if (runtime.runtime.session.options.supported_patterns & @import("control.zig").PatternBits.sub == 0) return false;
+        if (runtime.appSession().peer_supported_patterns & @import("control.zig").PatternBits.pub_ == 0) return false;
+        runtime.appSession().admit(.{ .pattern = .@"pub", .subject = incoming.subject, .message_size = queue.messageByteSize(incoming) }) catch return false;
+        for (self.quic_subscriptions.entries.items) |entry| if (entry.filter.matches(incoming.subject) catch false) return true;
+        return false;
     }
 
     fn refuseQuicStream(self: *Node, runtime: *QuicSessionRuntime, stream_id: u64, incoming: message.Message) void {
@@ -1804,6 +1842,132 @@ pub const Node = struct {
         }
         self.counters.sent += 1;
         return delivered;
+    }
+
+    /// Source-filtered one-way reliable publications. Each peer has its own
+    /// bounded pre-admission FIFO: block/fail reports pressure without stopping
+    /// sibling fanout, and drop policies affect only this FIFO. Transport
+    /// reliability begins when queueReliable admits a stream. OOM/encoding
+    /// errors can follow partial fanout: retrying the whole call may duplicate.
+    pub fn publishQuicReliable(self: *Node, outgoing: message.OutgoingMessage) !ReliablePublishResult {
+        var configured = outgoing;
+        configured.flags.no_reply = true;
+        configured.flags.unreliable = false;
+        _ = try @import("envelope.zig").encodedSize(configured, .{ .max_message_size = std.math.maxInt(usize) });
+        var matches: std.ArrayList(protocol.pubsub.Match) = .empty;
+        defer matches.deinit(self.allocator);
+        try self.quic_registry.collectMatches(configured.subject, &matches);
+        var result: ReliablePublishResult = .{ .matched = matches.items.len };
+        for (matches.items) |match| {
+            const runtime = self.quicSession(@intCast(match.peer_id)) orelse {
+                result.dropped += 1;
+                continue;
+            };
+            const sub_bit = @import("control.zig").PatternBits.sub;
+            const pub_bit = @import("control.zig").PatternBits.pub_;
+            if (runtime.runtime.session.options.supported_patterns & pub_bit == 0 or runtime.state() != .ready or runtime.runtime.isDraining() or runtime.appSession().peer_supported_patterns & sub_bit == 0) {
+                result.dropped += 1;
+                self.recordPublicationDrop(1);
+                continue;
+            }
+            runtime.appSession().admit(.{ .pattern = .sub, .subject = configured.subject, .message_size = outgoingMessageBytes(configured) }) catch {
+                result.dropped += 1;
+                self.recordPublicationDrop(1);
+                continue;
+            };
+            _ = @import("envelope.zig").encodedSize(configured, runtime.runtime.envelope_codec) catch |err| switch (err) {
+                error.MessageTooLarge => {
+                    result.dropped += 1;
+                    self.recordPublicationDrop(1);
+                    continue;
+                },
+                else => return err,
+            };
+            if (runtime.publication_outbox == null) {
+                var options = self.options.quic_reliable_publications;
+                options.max_messages = @min(options.max_messages, runtime.runtime.session.options.max_queued_messages);
+                options.max_bytes = @min(options.max_bytes, runtime.runtime.session.options.max_queued_bytes);
+                runtime.publication_outbox = try queue.Queue.init(self.allocator, options);
+            }
+            const pending = &runtime.publication_outbox.?;
+            pending.options.on_full = match.queue_options.on_full;
+            var owned = try message.Message.init(self.allocator, configured);
+            const pushed = pending.push(owned) catch |err| {
+                owned.deinit();
+                switch (err) {
+                    error.FlowControlled, error.QueueFull => {
+                        result.backpressured += 1;
+                        self.counters.publications.backpressured += 1;
+                    },
+                    error.MessageTooLarge => {
+                        result.dropped += 1;
+                        self.recordPublicationDrop(1);
+                    },
+                    else => return err,
+                }
+                continue;
+            };
+            result.dropped += pushed.droppedCount();
+            self.recordPublicationDrop(pushed.droppedCount());
+            if (pushed.didEnqueue()) {
+                result.queued += 1;
+                runtime.publication_wake = true;
+            }
+            const stats_now = self.publicationStats();
+            self.counters.publications.high_water_messages = @max(self.counters.publications.high_water_messages, stats_now.pending_messages);
+            self.counters.publications.high_water_bytes = @max(self.counters.publications.high_water_bytes, stats_now.pending_bytes);
+        }
+        self.counters.sent += 1;
+        return result;
+    }
+
+    pub fn publicationStats(self: *const Node) PublicationStats {
+        var result = self.counters.publications;
+        for (self.quic_sessions.items) |runtime| if (runtime.publication_outbox) |pending| {
+            result.pending_messages += pending.len();
+            result.pending_bytes += pending.bytes();
+        };
+        return result;
+    }
+
+    fn recordPublicationDrop(self: *Node, count: usize) void {
+        self.counters.publications.dropped += count;
+        self.counters.dropped += count;
+    }
+
+    fn discardPublicationOutbox(self: *Node, runtime: *QuicSessionRuntime) void {
+        runtime.publication_wake = false;
+        if (runtime.publication_outbox) |*pending| {
+            self.recordPublicationDrop(pending.len());
+            pending.clear();
+        }
+    }
+
+    fn pumpPublicationOutbox(self: *Node, runtime: *QuicSessionRuntime) !void {
+        runtime.publication_wake = false;
+        if (runtime.runtime.isDraining() or runtime.runtime.isClosingOrClosed()) {
+            self.discardPublicationOutbox(runtime);
+            return;
+        }
+        if (runtime.publication_outbox == null) return;
+        const pending = &runtime.publication_outbox.?;
+        while (pending.peek()) |head| {
+            _ = runtime.queueReliable(head.outgoing()) catch |err| switch (err) {
+                error.QueueFull, error.FlowControlled => return,
+                error.OutOfMemory => return err,
+                else => {
+                    self.discardPublicationOutbox(runtime);
+                    return;
+                },
+            };
+            var sent = pending.popOrNull().?;
+            sent.deinit();
+            self.counters.publications.stream_admitted += 1;
+            // For a foreign owner serviceSeat pumps senders before this hook.
+            // Wake once to flush newly admitted streams, then wait on transport
+            // readiness/deadlines if its send queue is still full.
+            runtime.publication_wake = true;
+        }
     }
 
     /// Makes room per the subscriber's queue policy at the outbox
@@ -2094,7 +2258,8 @@ pub const Node = struct {
             const attachment = self.quicSocketAttachment(runtime.id());
             if (attachment == null and (runtime.runtime.event_delivery or self.options.delivery == .events)) continue;
             const can_dispatch_reliable = comptime dispatcherHas(@TypeOf(dispatcher), "dispatchQuicReliable");
-            if (attachment == null and !can_dispatch_reliable) continue;
+            const can_dispatch_publication = comptime dispatcherHas(@TypeOf(dispatcher), "dispatchQuicPublication");
+            if (attachment == null and !can_dispatch_reliable and !can_dispatch_publication) continue;
 
             // Messages on the session's OWN request streams are
             // replies to outbound requests, not inbound requests:
@@ -2114,14 +2279,19 @@ pub const Node = struct {
             if (attachment) |endpoint| if (endpoint.can_receive) |can_receive| {
                 if (!can_receive(endpoint.context, queue.messageByteSize(runtime.runtime.inbox.items[0].message))) continue;
             };
-            if (transport.quic_session_runtime.isPeerBidiStreamId(runtime.runtime.session.role, pending_stream)) {
+            if (transport.quic_session_runtime.isPeerBidiStreamId(runtime.runtime.session.role, pending_stream) and self.options.quic_inbound != .publications) {
                 try runtime.attachReplyHandle(&runtime.runtime.inbox.items[0].message, pending_stream);
             }
             var received = runtime.runtime.recvReliable() orelse continue;
             const stream_id = received.stream_id;
             var incoming = received.takeMessage();
             if (transport.quic_session_runtime.isPeerBidiStreamId(runtime.runtime.session.role, stream_id)) {
-                runtime.appSession().admit(.{ .pattern = .req, .subject = incoming.subject, .message_size = queue.messageByteSize(incoming) }) catch |err| {
+                if (attachment == null and self.options.quic_inbound == .publications) {
+                    if (!incoming.flags.no_reply or !self.acceptsPublication(runtime, incoming)) {
+                        self.refuseQuicStream(runtime, stream_id, incoming);
+                        continue;
+                    }
+                } else runtime.appSession().admit(.{ .pattern = .req, .subject = incoming.subject, .message_size = queue.messageByteSize(incoming) }) catch |err| {
                     self.rejectRequest(incoming, err);
                     incoming.deinit();
                     continue;
@@ -2147,7 +2317,20 @@ pub const Node = struct {
                 };
             }
 
-            if (comptime dispatcherHas(@TypeOf(dispatcher), "dispatchQuicReliable")) {
+            if (self.options.quic_inbound == .publications) {
+                if (comptime can_dispatch_publication) {
+                    var result = try dispatcher.dispatchQuicPublication(incoming, runtime.appSession());
+                    defer result.deinit();
+                    if (comptime @hasField(@TypeOf(result), "publications")) {
+                        for (result.publications.items) |publication| try runtime.queueDatagram(publication.outgoing());
+                    }
+                    return .{ .messages = 1, .events_pending = self.eventCount() };
+                } else {
+                    incoming.deinit();
+                    return error.InvalidPattern;
+                }
+            }
+            if (comptime can_dispatch_reliable) {
                 var result = try dispatcher.dispatchQuicReliable(.rep, incoming, runtime.appSession());
                 defer result.deinit();
 
@@ -2265,6 +2448,8 @@ pub const Node = struct {
             if (pending.deadlineUs()) |at_us| bestTimer(&best, at_us);
         }
         for (self.quic_sessions.items) |runtime| {
+            if (runtime.publication_wake and runtime.state() == .ready and
+                !runtime.runtime.isDraining() and !runtime.runtime.isClosingOrClosed()) bestTimer(&best, self.now_us);
             if (runtime.runtime.nextLifecycleTimer()) |at_us| bestTimer(&best, at_us);
         }
         return best;
@@ -2389,6 +2574,7 @@ pub const Node = struct {
         conn: *transport.quic_runtime.Connection,
     ) !void {
         try self.emitSessionGoaway(sess);
+        try self.pumpPublicationOutbox(sess);
         _ = try sess.pumpDatagramOutbox(conn);
     }
 
@@ -2447,12 +2633,18 @@ pub const Node = struct {
                 .credit => try sess.appSession().requirePattern(.pull),
                 else => {},
             };
+            if (frame == .subscribe) {
+                const peer = quicRegistryPeer(sess.id());
+                if (!self.quic_registry.containsFilter(peer, frame.subscribe.filter) and
+                    self.quic_registry.subscriptionCount(peer) >= self.options.max_quic_subscriptions) return error.QueueFull;
+            }
             if (sess.control_state) |*state| _ = try state.applyReceived(quicRegistryPeer(sess.id()), frame);
         }
     }
 
     fn emitSessionGoaway(self: *Node, sess: DriverSession) !void {
         const frame = sess.runtime.received_goaway orelse return;
+        self.discardPublicationOutbox(sess);
         if (sess.runtime.goaway_notified) return;
         const reason = try self.allocator.dupe(u8, frame.reason);
         sess.runtime.goaway_notified = true;
@@ -2739,6 +2931,7 @@ pub const Node = struct {
     fn destroyQuicSession(self: *Node, runtime: *QuicSessionRuntime) void {
         const id = runtime.id();
         self.failSessionRequests(id);
+        self.discardPublicationOutbox(runtime);
         // A dying subscriber must not linger in the fan-out set.
         _ = self.quic_registry.removePeer(quicRegistryPeer(runtime.id()));
         for (self.quic_sessions.items, 0..) |candidate, index| {
@@ -6959,4 +7152,177 @@ test "socket inbox pressure leaves reliable QUIC input queued for retry" {
     var second = try rep.recv();
     defer second.deinit();
     try std.testing.expectEqualStrings("two", second.subject());
+}
+
+test "reliable pubsub: source filtering and slow peer policy preserve sibling admission" {
+    var n = try Node.init(std.testing.allocator, .{});
+    defer n.deinit();
+    const first = try outcomeTestSession(&n);
+    const second = try outcomeTestSession(&n);
+    const unmatched = try outcomeTestSession(&n);
+    _ = try n.quic_registry.subscribe(quicRegistryPeer(first.id()), "news.*", .{});
+    _ = try n.quic_registry.subscribe(quicRegistryPeer(second.id()), "news.*", .{});
+    _ = try n.quic_registry.subscribe(quicRegistryPeer(unmatched.id()), "other.*", .{});
+    const result = try n.publishQuicReliable(.{ .subject = "news.one", .body = "reliable" });
+    try std.testing.expectEqual(@as(usize, 2), result.matched);
+    try std.testing.expectEqual(@as(usize, 2), result.queued);
+}
+
+test "reliable pubsub: one bounded slow FIFO cannot stop healthy sibling admission" {
+    var n = try Node.init(std.testing.allocator, .{ .quic_reliable_publications = .{ .max_messages = 1, .max_bytes = 64 } });
+    defer n.deinit();
+    const slow = try outcomeTestSession(&n);
+    const healthy = try outcomeTestSession(&n);
+    _ = try n.quic_registry.subscribe(quicRegistryPeer(slow.id()), "news.*", .{ .on_full = .block });
+    _ = try n.quic_registry.subscribe(quicRegistryPeer(healthy.id()), "news.*", .{ .on_full = .block });
+    _ = try n.publishQuicReliable(.{ .subject = "news.one", .body = "first" });
+    try n.pumpPublicationOutbox(healthy);
+    const result = try n.publishQuicReliable(.{ .subject = "news.two", .body = "second" });
+    try std.testing.expectEqual(@as(usize, 2), result.matched);
+    try std.testing.expectEqual(@as(usize, 1), result.queued);
+    try std.testing.expectEqual(@as(usize, 1), result.backpressured);
+    try std.testing.expectEqualStrings("first", slow.publication_outbox.?.peek().?.body);
+    try std.testing.expectEqualStrings("second", healthy.publication_outbox.?.peek().?.body);
+    try std.testing.expectEqual(@as(usize, 1), healthy.runtime.reliable_senders.count());
+    try std.testing.expectEqual(@as(usize, 2), n.publicationStats().pending_messages);
+    try std.testing.expectEqual(@as(usize, 1), n.publicationStats().stream_admitted);
+    try std.testing.expectEqual(n.now_us, n.nextTimer().?);
+}
+
+test "reliable pubsub: policies affect only preadmission FIFO and GOAWAY discards it" {
+    inline for (.{ queue.OnFull.block, queue.OnFull.fail, queue.OnFull.drop_newest, queue.OnFull.drop_oldest }) |policy| {
+        var n = try Node.init(std.testing.allocator, .{ .quic_reliable_publications = .{ .max_messages = 1, .max_bytes = 64 } });
+        defer n.deinit();
+        const peer = try outcomeTestSession(&n);
+        _ = try n.quic_registry.subscribe(quicRegistryPeer(peer.id()), "news.*", .{ .on_full = policy });
+        _ = try n.publishQuicReliable(.{ .subject = "news.one", .body = "first" });
+        const next = try n.publishQuicReliable(.{ .subject = "news.two", .body = "second" });
+        if (policy == .block or policy == .fail) {
+            try std.testing.expectEqual(@as(usize, 1), next.backpressured);
+        } else try std.testing.expectEqual(@as(usize, 1), next.dropped);
+        const head = peer.publication_outbox.?.peek().?;
+        try std.testing.expectEqualStrings(if (policy == .drop_oldest) "second" else "first", head.body);
+        try std.testing.expect(head.flags.no_reply and !head.flags.unreliable);
+        const before = n.publicationStats().dropped;
+        try n.goawayQuicSession(peer.id(), 0, "stop", 1000, 100_000);
+        try std.testing.expectEqual(@as(usize, 0), n.publicationStats().pending_messages);
+        try std.testing.expectEqual(before + 1, n.publicationStats().dropped);
+        const refused = try n.publishQuicReliable(.{ .subject = "news.three" });
+        try std.testing.expectEqual(@as(usize, 0), refused.queued);
+        try std.testing.expectEqual(@as(usize, 1), refused.dropped);
+    }
+}
+
+test "reliable pubsub: blocked transport queue disarms local work wake without losing FIFO" {
+    var n = try Node.init(std.testing.allocator, .{ .quic_reliable_publications = .{ .max_messages = 2, .max_bytes = 256 } });
+    defer n.deinit();
+    const peer = try outcomeTestSession(&n);
+    peer.runtime.session.options.max_queued_messages = 1;
+    _ = try n.quic_registry.subscribe(quicRegistryPeer(peer.id()), "news.*", .{});
+    _ = try n.publishQuicReliable(.{ .subject = "news.one" });
+    try n.pumpPublicationOutbox(peer);
+    _ = try n.publishQuicReliable(.{ .subject = "news.two" });
+    try n.pumpPublicationOutbox(peer);
+    try std.testing.expect(!peer.publication_wake);
+    try std.testing.expectEqual(@as(usize, 1), peer.publication_outbox.?.len());
+    try std.testing.expectEqual(@as(usize, 1), peer.runtime.reliable_senders.count());
+    var ids = peer.runtime.reliable_senders.keyIterator();
+    peer.runtime.abortReliable(ids.next().?.*);
+    // Model the owner's following transport pass retiring the burned unopened
+    // id; cancellation alone intentionally does not free its open-order slot.
+    _ = peer.runtime.unopened_bidi.orderedRemove(0);
+    try n.pumpPublicationOutbox(peer);
+    try std.testing.expectEqual(@as(usize, 0), peer.publication_outbox.?.len());
+    try std.testing.expect(peer.publication_wake);
+}
+
+test "reliable pubsub: receiver grants peer PUB subject and desired filter before delivery" {
+    var n = try Node.init(std.testing.allocator, .{ .quic_inbound = .publications });
+    defer n.deinit();
+    const peer = try n.openQuicSession(.{ .role = .server });
+    try readyQuicRuntimeForTest(peer, "publisher", false);
+    try n.subscribeQuic("allowed.*", .{});
+    var events: [16]Event = undefined;
+    var count = try n.poll(&events);
+    for (events[0..count]) |*event| event.deinit();
+    const roles = [_]auth.Pattern{ .rep, .@"pub", .@"pub", .@"pub" };
+    const subjects = [_][]const u8{ "allowed.one", "denied.one", "allowed.one", "allowed.one" };
+    for (roles, subjects, 0..) |role, subject_name, index| {
+        try peer.appSession().replaceAuthorization(std.testing.allocator, .{ .subject = "publisher", .issuer = "test", .allowed_patterns = auth.PatternSet.init(&.{role}), .allowed_subjects = .{ .filters = &.{"allowed.*"} } });
+        try queueReliableForTest(peer, 4 * index, .{ .subject = subject_name, .flags = .{ .no_reply = index != 3 }, .body = "publication" });
+        count = try n.poll(&events);
+        defer for (events[0..count]) |*event| event.deinit();
+        if (index == 2) {
+            try std.testing.expectEqual(@as(usize, 1), count);
+            try std.testing.expect(events[0] == .delivery);
+            try std.testing.expect(events[0].delivery.msg.reply_handle == null);
+        } else try std.testing.expectEqual(@as(usize, 0), count);
+    }
+    n.unsubscribeQuic("allowed.*");
+    try queueReliableForTest(peer, 16, .{ .subject = "allowed.one", .flags = .{ .no_reply = true } });
+    count = try n.poll(&events);
+    defer for (events[0..count]) |*event| event.deinit();
+    try std.testing.expectEqual(@as(usize, 0), count);
+    try std.testing.expectEqual(@as(usize, 4), n.stats().dropped);
+}
+
+test "reliable pubsub: source enforces subscriber grant subjects roles and encoded size" {
+    var n = try Node.init(std.testing.allocator, .{});
+    defer n.deinit();
+    const peer = try outcomeTestSession(&n);
+    _ = try n.quic_registry.subscribe(quicRegistryPeer(peer.id()), "news.*", .{});
+    try peer.appSession().replaceAuthorization(std.testing.allocator, .{ .subject = "peer", .issuer = "test", .allowed_patterns = auth.PatternSet.init(&.{.@"pub"}) });
+    var result = try n.publishQuicReliable(.{ .subject = "news.one" });
+    try std.testing.expectEqual(@as(usize, 1), result.dropped);
+    try std.testing.expect(peer.publication_outbox == null);
+    try peer.appSession().replaceAuthorization(std.testing.allocator, .{ .subject = "peer", .issuer = "test", .allowed_patterns = auth.PatternSet.init(&.{.sub}), .allowed_subjects = .{ .filters = &.{"other.*"} } });
+    result = try n.publishQuicReliable(.{ .subject = "news.one" });
+    try std.testing.expectEqual(@as(usize, 1), result.dropped);
+    try peer.appSession().replaceAuthorization(std.testing.allocator, .{ .subject = "peer", .issuer = "test", .allowed_patterns = auth.PatternSet.init(&.{.sub}) });
+    peer.runtime.envelope_codec.max_message_size = 8;
+    result = try n.publishQuicReliable(.{ .subject = "news.one", .body = "too large" });
+    try std.testing.expectEqual(@as(usize, 1), result.dropped);
+    try std.testing.expect(peer.publication_outbox == null);
+    peer.runtime.envelope_codec.max_message_size = 4096;
+    peer.runtime.session.options.supported_patterns = @import("control.zig").PatternBits.req;
+    result = try n.publishQuicReliable(.{ .subject = "news.one" });
+    try std.testing.expectEqual(@as(usize, 1), result.dropped);
+    try std.testing.expectError(error.InvalidSubject, n.publishQuicReliable(.{ .subject = "invalid..subject" }));
+    try std.testing.expectEqual(@as(usize, 0), n.publicationStats().pending_messages);
+}
+
+test "reliable pubsub: remote filter cap permits updates unsubscribe retry and peer cleanup" {
+    var n = try Node.init(std.testing.allocator, .{ .max_quic_subscriptions = 1 });
+    defer n.deinit();
+    const first = try outcomeTestSession(&n);
+    const healthy = try outcomeTestSession(&n);
+    var frames = [_]@import("control.zig").Frame{.{ .subscribe = .{ .filter = "news.*", .options = 0 } }};
+    try n.driverControlFramesReceived(first, &frames);
+    frames[0].subscribe.options = 3;
+    try n.driverControlFramesReceived(first, &frames);
+    try std.testing.expectEqual(@as(usize, 1), n.quic_registry.subscriptionCount(quicRegistryPeer(first.id())));
+    try std.testing.expectEqual(queue.OnFull.drop_newest, n.quic_registry.peerQueueOptions(quicRegistryPeer(first.id())).?.on_full);
+    frames[0].subscribe.filter = "other.*";
+    try std.testing.expectError(error.QueueFull, n.driverControlFramesReceived(first, &frames));
+    try n.driverControlFramesReceived(healthy, &frames);
+    var remove = [_]@import("control.zig").Frame{.{ .unsubscribe = .{ .filter = "news.*" } }};
+    try n.driverControlFramesReceived(first, &remove);
+    try n.driverControlFramesReceived(first, &frames);
+    try std.testing.expectEqual(@as(usize, 1), n.quic_registry.subscriptionCount(quicRegistryPeer(first.id())));
+    try n.closeQuicSession(first.id());
+    try std.testing.expectEqual(@as(usize, 1), n.quic_registry.peerCount());
+    try std.testing.expect(n.quic_registry.containsFilter(quicRegistryPeer(healthy.id()), "other.*"));
+}
+
+test "reliable pubsub: a closing foreign session cannot keep the local work timer spinning" {
+    var n = try Node.init(std.testing.allocator, .{});
+    defer n.deinit();
+    const peer = try outcomeTestSession(&n);
+    _ = try n.quic_registry.subscribe(quicRegistryPeer(peer.id()), "news.*", .{});
+    _ = try n.publishQuicReliable(.{ .subject = "news.one" });
+    try std.testing.expectEqual(n.now_us, n.nextTimer().?);
+    // The foreign driver contains a per-peer protocol error before invoking
+    // driverSessionPass. Its owner still asks Node for the next wake deadline.
+    peer.runtime.beginClosing();
+    try std.testing.expect(n.nextTimer() == null or n.nextTimer().? > n.now_us);
 }

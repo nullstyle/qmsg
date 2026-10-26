@@ -7,6 +7,14 @@ changes.
 
 ## [Unreleased]
 
+- Add source-filtered `Node.publishQuicReliable`, per-peer bounded unsent
+  publication queues, pressure/drop results and queue statistics. Opt-in
+  reliable subscribers receive canonical deliveries or App SUB dispatch with
+  PUB/SUB role and subject checks. Desired subscriptions survive reconnect in
+  both listen/dial topologies. Datagram publication stays unchanged. GOAWAY
+  discards/counts unsent FIFO entries; live CREDIT and retained replay remain
+  deferred. Public reusable workload covers one paused and two healthy peers.
+
 - Add owned `QuicSocket(.pair/.req/.rep)` with explicit pumping, canonical Node
   outcomes, TLS-configured listen/dial, readiness, borrowed socket handles,
   lifecycle controls, and stable interior ownership. Public Node/App examples

@@ -72,6 +72,8 @@ pub const NodeOptions = node.NodeOptions;
 pub const SessionStatus = node.SessionStatus;
 pub const NodeEvent = node.Event;
 pub const NodeStats = node.Stats;
+pub const ReliablePublishResult = node.ReliablePublishResult;
+pub const PublicationStats = node.PublicationStats;
 pub const NodeServerDispatch = node.NodeServerDispatch;
 pub const RequestFailure = node.RequestFailure;
 pub const RequestId = node.RequestId;
@@ -182,4 +184,8 @@ pub const Limits = struct {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test {
+    _ = @import("reliable_pubsub_test.zig");
 }

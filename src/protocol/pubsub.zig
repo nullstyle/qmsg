@@ -290,6 +290,12 @@ pub const Registry = struct {
         return self.peers.items.len;
     }
 
+    /// Exact filter identity (not subject matching), for bounded control admission.
+    pub fn containsFilter(self: Registry, peer_id: PeerId, filter: []const u8) bool {
+        const peer = self.findPeerConst(peer_id) orelse return false;
+        return peer.subscriptions.contains(filter);
+    }
+
     pub fn subscriptionCount(self: Registry, peer_id: PeerId) usize {
         const peer = self.findPeerConst(peer_id) orelse return 0;
         return peer.subscriptions.len();

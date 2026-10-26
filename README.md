@@ -82,6 +82,21 @@ work for a bounded interval; `closeQuicSession(id)` remains an immediate
 abort. Remote GOAWAY produces an owned `session_goaway` event. See the
 [lifecycle contract](docs/MIGRATION.md#quic-heartbeat-and-graceful-shutdown).
 
+## Reliable QUIC publication
+
+`Node.publishQuicReliable(outgoing)` fans out through the current subscription
+registry with bounded per-peer pending queues and explicit admission/pressure
+results. Subscribers select `.quic_inbound = .publications`, announce SUB,
+require PUB, and use the existing `subscribeQuic` set. Deliveries use canonical
+owned events or App SUB dispatch. The existing `publishQuicSubscribed` API
+continues to send datagrams. See [the delivery and closure contract](docs/QUIC_PUBSUB.md)
+and [the reusable public workload](examples/reliable_pubsub_workload.zig).
+
+```sh
+mise exec -- zig build examples -j2
+QMSG_RUN_LIVE_UDP=1 ./zig-out/bin/quic-pubsub-localhost
+```
+
 ## Package Use
 
 From another Zig package, import the module as `qmsg` and start with plain byte
